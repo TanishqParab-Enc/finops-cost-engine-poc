@@ -1,0 +1,77 @@
+{
+  "currency": "USD",
+  "projects": [
+    {
+      "finops_results": [],
+      "path": "azure-baseline.json",
+      "project_name": "azure-baseline.json",
+      "resources": [
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "7.592",
+              "monthly_carbon_savings_grams_co2e": "900.1258356999999",
+              "monthly_water_savings_liters": "4.9029793",
+              "name": "Instance usage (Linux, pay as you go, Standard_B1s)",
+              "price": "0.0104",
+              "quantity": "730",
+              "total_monthly_cost": "7.592",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "e772d29a0293ab79"
+          },
+          "name": "azurerm_linux_virtual_machine.app[0]",
+          "subresources": [
+            {
+              "cost_components": [
+                {
+                  "base_monthly_cost": "2.4",
+                  "monthly_carbon_savings_grams_co2e": "111.1831127",
+                  "monthly_water_savings_liters": "0.26732981",
+                  "name": "Storage (E4, LRS)",
+                  "price": "2.4",
+                  "quantity": "1",
+                  "total_monthly_cost": "2.4",
+                  "unit": "months",
+                  "usage_monthly_cost": "0"
+                }
+              ],
+              "is_free": false,
+              "is_supported": false,
+              "metadata": {},
+              "name": "os_disk",
+              "type": ""
+            }
+          ],
+          "supports_tags": true,
+          "tags": {
+            "Environment": "Dev",
+            "Service": "finops-poc"
+          },
+          "type": "azurerm_linux_virtual_machine"
+        }
+      ],
+      "tagging_results": [
+        {
+          "failing_resources": [],
+          "message": "This example Tagging policy shows how you can enforce required FinOps tag keys/values in pull requests. This example checks for the tags 'Service' (can have any value) and 'Environment' (must be Dev/Stage/Prod) on all taggable resources being changed in the pull request. You can adjust it from https://dashboard.infracost.io > Governance > Tagging policies. You have a 14 day trial of this feature as it's part of Infracost Cloud.",
+          "policy_id": "d9d6a664-485f-4851-adb0-3fb150eb0aa9",
+          "policy_name": "FinOps tags"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "costed_resources": 1,
+    "free_resources": 0,
+    "projects": 1,
+    "resources": 1,
+    "tagging_policies": 1,
+    "total_monthly_cost": "9.992"
+  }
+}

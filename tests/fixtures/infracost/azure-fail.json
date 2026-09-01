@@ -1,0 +1,207 @@
+{
+  "currency": "USD",
+  "projects": [
+    {
+      "finops_results": [],
+      "path": "azure-fail.json",
+      "project_name": "azure-fail.json",
+      "resources": [
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "135.17",
+              "monthly_carbon_savings_grams_co2e": "3557.82724819",
+              "monthly_water_savings_liters": "8.55447627",
+              "name": "Storage (P30, LRS)",
+              "price": "135.17",
+              "quantity": "1",
+              "total_monthly_cost": "135.17",
+              "unit": "months",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "c1b03d77b3ae7897"
+          },
+          "name": "azurerm_managed_disk.data[0]",
+          "supports_tags": true,
+          "tags": {
+            "Environment": "Dev",
+            "Service": "finops-poc"
+          },
+          "type": "azurerm_managed_disk"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "135.17",
+              "monthly_carbon_savings_grams_co2e": "3557.82724819",
+              "monthly_water_savings_liters": "8.55447627",
+              "name": "Storage (P30, LRS)",
+              "price": "135.17",
+              "quantity": "1",
+              "total_monthly_cost": "135.17",
+              "unit": "months",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "c7e58445a8245991"
+          },
+          "name": "azurerm_managed_disk.data[1]",
+          "supports_tags": true,
+          "tags": {
+            "Environment": "Dev",
+            "Service": "finops-poc"
+          },
+          "type": "azurerm_managed_disk"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "280.32",
+              "monthly_carbon_savings_grams_co2e": "9202.8523611",
+              "monthly_water_savings_liters": "55.8437736",
+              "name": "Instance usage (Linux, pay as you go, Standard_D8s_v5)",
+              "price": "0.384",
+              "quantity": "730",
+              "total_monthly_cost": "280.32",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "ab6a1ba0cae315a9"
+          },
+          "name": "azurerm_linux_virtual_machine.app[0]",
+          "subresources": [
+            {
+              "cost_components": [
+                {
+                  "base_monthly_cost": "19.71",
+                  "monthly_carbon_savings_grams_co2e": "444.73245081",
+                  "monthly_water_savings_liters": "1.06931926",
+                  "name": "Storage (P10, LRS)",
+                  "price": "19.71",
+                  "quantity": "1",
+                  "total_monthly_cost": "19.71",
+                  "unit": "months",
+                  "usage_monthly_cost": "0"
+                }
+              ],
+              "is_free": false,
+              "is_supported": false,
+              "metadata": {},
+              "name": "os_disk",
+              "type": ""
+            }
+          ],
+          "supports_tags": true,
+          "tags": {
+            "Environment": "Dev",
+            "Service": "finops-poc"
+          },
+          "type": "azurerm_linux_virtual_machine"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "280.32",
+              "monthly_carbon_savings_grams_co2e": "9202.8523611",
+              "monthly_water_savings_liters": "55.8437736",
+              "name": "Instance usage (Linux, pay as you go, Standard_D8s_v5)",
+              "price": "0.384",
+              "quantity": "730",
+              "total_monthly_cost": "280.32",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "2c281a9f7078bc67"
+          },
+          "name": "azurerm_linux_virtual_machine.app[1]",
+          "subresources": [
+            {
+              "cost_components": [
+                {
+                  "base_monthly_cost": "19.71",
+                  "monthly_carbon_savings_grams_co2e": "444.73245081",
+                  "monthly_water_savings_liters": "1.06931926",
+                  "name": "Storage (P10, LRS)",
+                  "price": "19.71",
+                  "quantity": "1",
+                  "total_monthly_cost": "19.71",
+                  "unit": "months",
+                  "usage_monthly_cost": "0"
+                }
+              ],
+              "is_free": false,
+              "is_supported": false,
+              "metadata": {},
+              "name": "os_disk",
+              "type": ""
+            }
+          ],
+          "supports_tags": true,
+          "tags": {
+            "Environment": "Dev",
+            "Service": "finops-poc"
+          },
+          "type": "azurerm_linux_virtual_machine"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "3.65",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0",
+              "name": "IP address (static, regional)",
+              "price": "0.005",
+              "quantity": "730",
+              "total_monthly_cost": "3.65",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "63c39ee70b274a45"
+          },
+          "name": "azurerm_public_ip.egress[0]",
+          "supports_tags": true,
+          "tags": {
+            "Environment": "Dev",
+            "Service": "finops-poc"
+          },
+          "type": "azurerm_public_ip"
+        }
+      ],
+      "tagging_results": [
+        {
+          "failing_resources": [],
+          "message": "This example Tagging policy shows how you can enforce required FinOps tag keys/values in pull requests. This example checks for the tags 'Service' (can have any value) and 'Environment' (must be Dev/Stage/Prod) on all taggable resources being changed in the pull request. You can adjust it from https://dashboard.infracost.io > Governance > Tagging policies. You have a 14 day trial of this feature as it's part of Infracost Cloud.",
+          "policy_id": "d9d6a664-485f-4851-adb0-3fb150eb0aa9",
+          "policy_name": "FinOps tags"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "costed_resources": 5,
+    "free_resources": 0,
+    "projects": 1,
+    "resources": 5,
+    "tagging_policies": 1,
+    "total_monthly_cost": "874.05"
+  }
+}

@@ -1,0 +1,37 @@
+name: Tests
+
+# Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
+"on":
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit / integration / e2e
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install --quiet -e ".[dev]"
+
+      # No Infracost binary, API key or network needed: integration tests replay
+      # golden fixtures captured from real Infracost runs.
+      - name: Run tests
+        run: pytest -v --tb=short
+
+      - name: Coverage summary
+        run: pytest -q --cov=finops --cov-report=term-missing | tail -40

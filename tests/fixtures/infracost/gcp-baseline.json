@@ -1,0 +1,106 @@
+{
+  "currency": "USD",
+  "projects": [
+    {
+      "finops_results": [
+        {
+          "failing_resources": [],
+          "policy_id": "f233a79d-2697-45d8-88f3-5b7699aa19f7",
+          "policy_message": "N1s are first-generation general purpose VMs. For most use-cases (excluding GPU workloads), Google recommends one of their second-generation types such as:\n\n- **E2** offers the lowest total cost of ownership with up to 31% savings compared to N1.\n- **N2** uses 2nd Gen Intel Xeon Scalable Processors (Cascade Lake) and offers a greater than 20% price-performance improvement for many workloads and support up to 25% more memory per vCPU.\n- **N2D** uses latest 2nd Gen AMD EPYC (Rome) CPUs, and support the highest core count and memory of any general-purpose Compute Engine VM.",
+          "policy_name": "Compute - consider using current generation machine types",
+          "policy_slug": "google-compute-use-latest-machine-types"
+        }
+      ],
+      "path": "gcp-baseline.json",
+      "project_name": "gcp-baseline.json",
+      "resources": [
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "24.4591683",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0",
+              "name": "Instance usage (Linux/UNIX, on-demand, e2-medium)",
+              "price": "0.03350571",
+              "quantity": "730",
+              "total_monthly_cost": "24.4591683",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            },
+            {
+              "base_monthly_cost": "2",
+              "monthly_carbon_savings_grams_co2e": "43.34568779999999",
+              "monthly_water_savings_liters": "0.09442060000000001",
+              "name": "Balanced provisioned storage (pd-balanced)",
+              "price": "0.1",
+              "quantity": "20",
+              "total_monthly_cost": "2",
+              "unit": "GB",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "f9c50e46ff5b3471"
+          },
+          "name": "google_compute_instance.app[0]",
+          "supports_default_tags": true,
+          "supports_tags": true,
+          "type": "google_compute_instance"
+        }
+      ],
+      "tagging_results": [
+        {
+          "failing_resources": [
+            {
+              "address": "google_compute_instance.app[0]",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "path": "",
+              "propagation_problems": [],
+              "resource_type": "google_compute_instance"
+            }
+          ],
+          "message": "This example Tagging policy shows how you can enforce required FinOps tag keys/values in pull requests. This example checks for the tags 'Service' (can have any value) and 'Environment' (must be Dev/Stage/Prod) on all taggable resources being changed in the pull request. You can adjust it from https://dashboard.infracost.io > Governance > Tagging policies. You have a 14 day trial of this feature as it's part of Infracost Cloud.",
+          "policy_id": "d9d6a664-485f-4851-adb0-3fb150eb0aa9",
+          "policy_name": "FinOps tags",
+          "tag_schema": [
+            {
+              "key": "Environment",
+              "mandatory": true,
+              "valid_values": [
+                "Dev",
+                "Prod",
+                "Stage"
+              ]
+            },
+            {
+              "key": "Service",
+              "mandatory": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "costed_resources": 1,
+    "distinct_failing_tagging_resources": 1,
+    "failing_tagging_policies": 1,
+    "finops_policies": 1,
+    "free_resources": 0,
+    "projects": 1,
+    "resources": 1,
+    "tagging_policies": 1,
+    "total_monthly_cost": "26.4591683"
+  }
+}

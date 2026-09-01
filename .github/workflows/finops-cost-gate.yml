@@ -1,0 +1,243 @@
+name: FinOps Cost Gate
+
+# Shift-left FinOps control:
+#   detect IaC change -> terraform plan (base + head) -> Infracost -> threshold
+#   -> PASS (lock cost, continue) | FAIL (block, require peer review)
+
+# Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
+"on":
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - 'config/finops-policy.yaml'
+      - '.github/workflows/finops-cost-gate.yml'
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Cloud stack to evaluate
+        required: true
+        default: aws
+        type: choice
+        options: [aws, azure, gcp]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: '3.12'
+  TERRAFORM_VERSION: '1.11.0'
+
+jobs:
+  detect-changes:
+    name: Detect infrastructure changes
+    runs-on: ubuntu-latest
+    outputs:
+      has_infra_changes: ${{ steps.detect.outputs.has_infra_changes }}
+      clouds: ${{ steps.detect.outputs.clouds }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      - name: Detect
+        id: detect
+        run: |
+          set -euo pipefail
+          BASE="origin/${{ github.base_ref || github.event.repository.default_branch }}"
+
+          finops detect-changes --base "$BASE" --head HEAD --json > changes.json
+          cat changes.json
+
+          HAS=$(python -c "import json;print(str(json.load(open('changes.json'))['has_infrastructure_changes']).lower())")
+          echo "has_infra_changes=$HAS" >> "$GITHUB_OUTPUT"
+
+          # Only evaluate stacks the PR actually touched.
+          CLOUDS=$(python - <<'PY'
+          import json
+          files = json.load(open('changes.json'))['infrastructure_files']
+          found = [c for c in ('aws', 'azure', 'gcp') if any(f'terraform/{c}/' in f for f in files)]
+          print(json.dumps(found or ['aws']))
+          PY
+          )
+          echo "clouds=$CLOUDS" >> "$GITHUB_OUTPUT"
+          echo "Detected clouds: $CLOUDS"
+
+  cost-gate:
+    name: Cost gate (${{ matrix.cloud }})
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_infra_changes == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cloud: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.cloud)) || fromJSON(needs.detect-changes.outputs.clouds) }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: head
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref || github.event.repository.default_branch }}
+          path: base
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Install engine
+        working-directory: head
+        run: pip install --quiet -e .
+
+      # Real pipelines authenticate here (OIDC) so `terraform plan` can refresh
+      # state. The POC stacks use mock credentials and skip validation.
+      # - name: Configure AWS credentials
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+      #     aws-region: us-east-1
+
+      # Both plans use the committed terraform.tfvars, which Terraform loads
+      # automatically. The cost difference therefore comes purely from what the
+      # pull request changed.
+      - name: Terraform plan (base branch = baseline cost)
+        id: baseline
+        continue-on-error: true
+        working-directory: base/terraform/${{ matrix.cloud }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -no-color
+          terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
+          terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/baseline-plan.json"
+
+      - name: Terraform plan (PR head = proposed cost)
+        working-directory: head/terraform/${{ matrix.cloud }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -no-color
+          terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
+          terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/proposed-plan.json"
+
+      - name: FinOps cost gate
+        id: gate
+        working-directory: head
+        continue-on-error: true
+        env:
+          # Infracost CLI v2 reads this; v0.10 reads INFRACOST_API_KEY.
+          INFRACOST_CLI_AUTHENTICATION_TOKEN: ${{ secrets.INFRACOST_API_KEY }}
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+          FINOPS_THRESHOLD_VALUE: ${{ vars.FINOPS_THRESHOLD_VALUE || '100' }}
+          FINOPS_THRESHOLD_METRIC: ${{ vars.FINOPS_THRESHOLD_METRIC || 'incremental_monthly_cost' }}
+          FINOPS_AI_PROVIDER: ${{ vars.FINOPS_AI_PROVIDER || 'mock' }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT }}
+        run: |
+          set +e
+          BASELINE_ARG=""
+          if [ -f "$GITHUB_WORKSPACE/baseline-plan.json" ]; then
+            BASELINE_ARG="--baseline-plan $GITHUB_WORKSPACE/baseline-plan.json"
+          else
+            echo "::warning::No baseline plan; incremental cost equals full projected cost."
+          fi
+
+          finops analyze \
+            --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
+            $BASELINE_ARG \
+            --commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --execution-id "${{ github.run_id }}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Publish gate summary
+        if: always()
+        working-directory: head
+        run: |
+          if [ -f .finops/pr-comment.md ]; then
+            cat .finops/pr-comment.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comment on pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'head/.finops/pr-comment.md';
+            if (!fs.existsSync(path)) return;
+
+            const body = fs.readFileSync(path, 'utf8');
+            const marker = '<!-- finops-cost-gate -->';
+            const tag = `${marker}\n<!-- cloud:${{ matrix.cloud }} -->`;
+            const scoped = body.replace(marker, tag);
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes(`<!-- cloud:${{ matrix.cloud }} -->`));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body: scoped,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body: scoped,
+              });
+            }
+
+      - name: Upload FinOps artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-${{ matrix.cloud }}-${{ github.run_id }}
+          path: head/.finops/
+          retention-days: 90
+
+      # The gate is the last word: a non-zero exit stops the pipeline.
+      #   1 = threshold exceeded, peer review required
+      #   2 = cost could not be trusted, failing safe
+      - name: Enforce gate
+        if: always()
+        run: |
+          CODE="${{ steps.gate.outputs.exit_code }}"
+          case "$CODE" in
+            0) echo "PASS - cost locked, pipeline may continue." ;;
+            1) echo "::error::FinOps threshold exceeded. Peer review required before merging."; exit 1 ;;
+            *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
+          esac
+
+  deploy:
+    name: Deploy (gated)
+    needs: [detect-changes, cost-gate]
+    if: needs.detect-changes.outputs.has_infra_changes == 'true' && needs.cost-gate.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cost approved
+        run: |
+          echo "Cost lock verified for this execution; terraform apply would run here."

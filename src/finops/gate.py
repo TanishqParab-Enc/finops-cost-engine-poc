@@ -1,0 +1,150 @@
+"""Component H - the CI/CD gate orchestration.
+
+Exit codes:
+  0  PASS   - within threshold, cost locked, pipeline continues
+  1  FAIL   - threshold exceeded, no lock, peer review required
+  2  ERROR  - cost could not be trusted, fail safe
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+from .ai import factory as ai_factory
+from .config import Config
+from .cost.base import EstimationRequest, CostEstimator
+from .errors import FinOpsError
+from .lock.cost_lock import create_cost_lock, write_cost_lock
+from .models import GateResult, NormalizedPlan, Status
+from .plan.normalizer import normalize_plan_file
+from .policy import engine as policy_engine
+
+
+@dataclass
+class GateRequest:
+    proposed_plan: Path
+    baseline_plan: Path | None = None
+    commit: str = ""
+    execution_id: str = ""
+
+
+def _resolve_identity(request: GateRequest) -> tuple[str, str]:
+    commit = (
+        request.commit
+        or os.environ.get("GITHUB_SHA")
+        or os.environ.get("GIT_COMMIT")
+        or "unknown"
+    )
+    execution_id = (
+        request.execution_id
+        or os.environ.get("GITHUB_RUN_ID")
+        or os.environ.get("BUILD_NUMBER")
+        or str(uuid.uuid4())
+    )
+    return commit, execution_id
+
+
+def run_gate(request: GateRequest, config: Config, estimator: CostEstimator) -> GateResult:
+    commit, execution_id = _resolve_identity(request)
+    result = GateResult(status=Status.ERROR, commit=commit, execution_id=execution_id)
+
+    plan: NormalizedPlan | None = None
+    errors: list[FinOpsError] = []
+
+    try:
+        plan = normalize_plan_file(request.proposed_plan)
+        result.plan = plan
+    except FinOpsError as exc:
+        result.errors.append(exc.to_dict())
+        return result
+
+    try:
+        estimator.preflight()
+        estimate = estimator.estimate(
+            EstimationRequest(
+                proposed_plan_json=request.proposed_plan,
+                baseline_plan_json=request.baseline_plan,
+                normalized_plan=plan,
+                currency=config.threshold.currency,
+            )
+        )
+        result.estimate = estimate
+    except FinOpsError as exc:
+        result.errors.append(exc.to_dict())
+        errors.append(exc)
+        estimate = None
+
+    if estimate is None:
+        decision = policy_engine.evaluate(
+            estimate=_empty_estimate(config), config=config, upstream_errors=errors
+        )
+        result.decision = decision
+        result.status = Status.ERROR
+        return result
+
+    decision = policy_engine.evaluate(estimate, config)
+    result.decision = decision
+    result.status = decision.status
+    result.errors.extend(decision.blocking_errors)
+
+    analysis, ai_error = ai_factory.analyze(plan, estimate, decision, config.ai)
+    result.ai = analysis
+    if ai_error and config.ai.required and config.fail_safe.blocks("on_ai_failure"):
+        result.status = Status.ERROR
+        result.errors.append(ai_error.to_dict())
+        return result
+
+    if result.status is Status.PASS:
+        lock = create_cost_lock(decision, estimate, plan, config, commit, execution_id)
+        write_cost_lock(lock, config)
+        result.cost_lock = lock
+
+    return result
+
+
+def _empty_estimate(config: Config):
+    from decimal import Decimal
+
+    from .models import CostEstimate, EstimatorTrust
+
+    return CostEstimate(
+        currency=config.threshold.currency,
+        estimator="none",
+        trust=EstimatorTrust.AUTHORITATIVE,
+        previous_monthly_cost=Decimal("0"),
+        new_monthly_cost=Decimal("0"),
+        incremental_monthly_cost=Decimal("0"),
+    )
+
+
+def write_artifacts(result: GateResult, config: Config) -> dict[str, Path]:
+    from .report.markdown import render_markdown
+
+    output_dir = Path(config.cost_lock.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    written: dict[str, Path] = {}
+
+    result_path = output_dir / "gate-result.json"
+    result_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+    written["result"] = result_path
+
+    comment_path = output_dir / "pr-comment.md"
+    comment_path.write_text(render_markdown(result), encoding="utf-8")
+    written["comment"] = comment_path
+
+    if result.estimate:
+        cost_path = output_dir / "cost-estimate.json"
+        cost_path.write_text(json.dumps(result.estimate.to_dict(), indent=2), encoding="utf-8")
+        written["cost"] = cost_path
+
+    if result.plan:
+        plan_path = output_dir / "normalized-plan.json"
+        plan_path.write_text(json.dumps(result.plan.to_dict(), indent=2), encoding="utf-8")
+        written["plan"] = plan_path
+
+    return written

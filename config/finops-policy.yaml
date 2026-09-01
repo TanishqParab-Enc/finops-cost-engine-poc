@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# FinOps shift-left policy configuration.
+#
+# This file is the ONLY place the business threshold is defined. The engine
+# core operates on normalised, cloud-agnostic cost data and never hard-codes
+# a threshold value, unit or comparison.
+#
+# Every value can be overridden by an environment variable (see .env.example)
+# so CI/CD can vary the policy per environment without changing code.
+# ---------------------------------------------------------------------------
+schema_version: "1.0"
+
+threshold:
+  # PENDING BUSINESS CLARIFICATION.
+  # The metric is deliberately configurable because the business has not yet
+  # confirmed whether the limit is monthly, annualised or percentage based.
+  #
+  #   incremental_monthly_cost  - added cost per month introduced by this PR (POC default)
+  #   incremental_annual_cost   - incremental_monthly_cost * 12
+  #   incremental_percentage    - incremental cost as a % of the current baseline
+  #   total_monthly_cost        - absolute projected monthly cost of the stack
+  metric: incremental_monthly_cost
+  value: 100
+  currency: USD
+
+evaluation:
+  # Requirement section 13: define whether equality passes. Documented as PASS.
+  #   cost <= threshold -> PASS
+  #   cost >  threshold -> FAIL
+  equality_is_pass: true
+
+  # Cost reductions (negative incremental cost) always pass.
+  allow_cost_reductions: true
+
+# ---------------------------------------------------------------------------
+# Cost estimation.
+#
+# Infracost is the authoritative pricing engine. It is open source (Apache 2.0),
+# has a free CI/CD tier, supports AWS + Azure + GCP from a Terraform plan JSON,
+# and returns machine-readable costs including diffTotalMonthlyCost.
+#
+#   infracost         - REQUIRED. Authoritative. Default for CI/CD.
+#   infracost_fixture - Replays a recorded Infracost JSON file. Integration tests.
+#   mock              - Tiny deterministic table. UNIT/E2E TESTS ONLY.
+#                       NOT AUTHORITATIVE. Cannot produce a cost lock unless
+#                       allow_non_authoritative_lock is explicitly true.
+# ---------------------------------------------------------------------------
+cost_estimation:
+  estimator: infracost
+  allow_non_authoritative_lock: false
+  timeout_seconds: 300
+
+  infracost:
+    binary: infracost
+    # Infracost CLI v2 uses `scan`; v0.10 uses `breakdown`. auto = probe version.
+    command_style: auto
+    # Optional infracost.yml / usage file passed through to the CLI.
+    config_file: null
+    usage_file: null
+
+# ---------------------------------------------------------------------------
+# Fail-safe behaviour. The gate must never approve a change whose cost could
+# not be trusted. Valid actions: BLOCK | WARN
+# ---------------------------------------------------------------------------
+fail_safe:
+  on_plan_failure: BLOCK
+  on_estimation_failure: BLOCK
+  on_unsupported_provider: BLOCK
+  on_unsupported_resource: WARN
+  on_unknown_cost_resource: WARN
+  # AI only produces the explanation; a deterministic cost result stays valid
+  # when AI is unavailable.
+  on_ai_failure: WARN
+
+# ---------------------------------------------------------------------------
+# AI explanation layer. Never authoritative for money.
+# ---------------------------------------------------------------------------
+ai:
+  provider: mock          # mock | azure_openai | openai
+  enabled: true
+  required: false         # false => AI failure does not invalidate the decision
+  timeout_seconds: 30
+  max_resources_in_prompt: 40
+
+# ---------------------------------------------------------------------------
+# Which changed files mean "this PR can affect cloud consumption"
+# ---------------------------------------------------------------------------
+change_detection:
+  infrastructure_globs:
+    - "**/*.tf"
+    - "**/*.tf.json"
+    - "**/*.tfvars"
+    - "**/*.tfvars.json"
+    - "**/*.hcl"
+  ignore_globs:
+    - "**/.terraform/**"
+    - "**/*.md"
+
+# ---------------------------------------------------------------------------
+# Cost lock artifact
+# ---------------------------------------------------------------------------
+cost_lock:
+  output_dir: .finops
+  # A lock is bound to the fingerprint of the normalised plan. If the Terraform
+  # change is modified, the fingerprint changes and the old lock is rejected.
+  bind_to_plan_fingerprint: true

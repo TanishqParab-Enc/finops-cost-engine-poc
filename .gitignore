@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan.binary
+crash.log
+
+# FinOps engine output (generated per CI/CD execution)
+.finops/
+out/
+
+# Secrets / credentials - never commit
+.env
+*.pem
+*.key
+credentials.json
+gcp-sa-*.json

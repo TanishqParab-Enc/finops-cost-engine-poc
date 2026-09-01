@@ -1,0 +1,5 @@
+{
+  "captured_with": "infracost 2.16.2",
+  "command_style": "v2",
+  "note": "Golden fixtures from real Infracost runs. Regenerate with scripts/capture_fixtures.py"
+}

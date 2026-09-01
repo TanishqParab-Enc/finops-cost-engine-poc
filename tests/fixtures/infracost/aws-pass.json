@@ -1,0 +1,154 @@
+{
+  "currency": "USD",
+  "projects": [
+    {
+      "finops_results": [
+        {
+          "failing_resources": [
+            {
+              "issues": [
+                {
+                  "address": "aws_instance.app[0]",
+                  "attribute": "associate_public_ip_address",
+                  "description": "Consider disabling `associate_public_ip_address`. Set `associate_public_ip_address = false` and use NAT gateways for outbound connectivity.",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "yearly_savings": "0"
+                }
+              ],
+              "name": "aws_instance.app[0]"
+            }
+          ],
+          "policy_id": "9caf2745-6adb-4f00-b06e-8b8dd6d80bec",
+          "policy_message": "EC2 instances and launch templates should not have a public IPv4 address to reduce attack surface and prevent direct internet exposure. Use NAT gateways for outbound connectivity and AWS Systems Manager Session Manager for secure instance access. Corresponds to AWS Security Hub control EC2.9 and EC2.25.",
+          "policy_name": "[EC2.9, EC2.25] Amazon EC2 and launch templates should not associate a public IPv4 address",
+          "policy_slug": "aws-ec2-disable-associate-public-ipv4"
+        },
+        {
+          "failing_resources": [],
+          "policy_id": "f022b6d4-87d5-4f16-947a-3ec2e459bcf9",
+          "policy_message": "gp3 volumes are the latest generation of general-purpose SSD-based EBS volumes that enable you to provision performance independent of storage capacity, while providing up to **20% lower price per GB** than existing gp2 volumes. With gp3 volumes, you can scale IOPS (input/output operations per second) and throughput without needing to provision additional block storage capacity. This means you only pay for the storage you need.",
+          "policy_name": "EBS - consider upgrading gp2 volumes to gp3",
+          "policy_slug": "aws-gp2-to-gp3"
+        },
+        {
+          "failing_resources": [],
+          "policy_id": "a6e0e47f-7179-40b4-ba1d-e0cdbd26fa16",
+          "policy_message": "io1 and io2 volume types that need less than 16K IOPS, and less than 1000 MB/s Throughput, and don\u2019t use Multi-Attach should be switched to gp3 as that is **at least 2X cheaper**. For example, a gp3 volume with 16TB storage, 16K IOPS and 1000 MB/s Throughput costs $1.4K/month vs $3K/month on io1 or io2.",
+          "policy_name": "EBS - consider updating io1/io2 volumes to gp3",
+          "policy_slug": "aws-io1-io2-to-gp3"
+        },
+        {
+          "failing_resources": [
+            {
+              "issues": [
+                {
+                  "address": "aws_instance.app[0]",
+                  "attribute": "instance_type",
+                  "description": "Switch `instance_type` from `m5.large` to `m6g.large`",
+                  "monthly_carbon_savings_grams_co2e": "1129.2219547",
+                  "monthly_water_savings_liters": "7.6093302",
+                  "yearly_savings": "166.44"
+                }
+              ],
+              "name": "aws_instance.app[0]"
+            }
+          ],
+          "policy_id": "bf7f152f-38d0-4310-90de-91ea06769a43",
+          "policy_message": "Graviton instances are around 20% cheaper than equivalent x86 instances.",
+          "policy_name": "EC2 - consider using Graviton instances",
+          "policy_slug": "aws-use-graviton-ec2-instance"
+        },
+        {
+          "failing_resources": [],
+          "policy_id": "90c60d32-f7bb-432b-9108-f7035ab50868",
+          "policy_message": "Upgrade to the latest generation of Amazon EC2 instances in the M family for enhanced CPU performance, increased memory capacity, and improved networking bandwidth, all at a more cost-effective price compared to previous generations.",
+          "policy_name": "EC2 - consider using latest generation instances for m family instances",
+          "policy_slug": "aws-use-latest-generation-m-family-policy"
+        }
+      ],
+      "path": "aws-pass.json",
+      "project_name": "aws-pass.json",
+      "resources": [
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "70.08",
+              "monthly_carbon_savings_grams_co2e": "2610.1268406",
+              "monthly_water_savings_liters": "15.8841065",
+              "name": "Instance usage (Linux/UNIX, on-demand, m5.large)",
+              "price": "0.096",
+              "quantity": "730",
+              "total_monthly_cost": "70.08",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "18d440175e415ba8"
+          },
+          "name": "aws_instance.app[0]",
+          "subresources": [
+            {
+              "cost_components": [
+                {
+                  "base_monthly_cost": "4",
+                  "monthly_carbon_savings_grams_co2e": "112.145131",
+                  "monthly_water_savings_liters": "0.279645",
+                  "name": "Storage (general purpose SSD, gp3)",
+                  "price": "0.08",
+                  "quantity": "50",
+                  "total_monthly_cost": "4",
+                  "unit": "GB",
+                  "usage_monthly_cost": "0"
+                }
+              ],
+              "is_free": false,
+              "is_supported": false,
+              "metadata": {},
+              "name": "root_block_device",
+              "supports_default_tags": true,
+              "supports_tags": true,
+              "tags": {
+                "Environment": "Dev",
+                "Name": "finops-poc-app-0",
+                "Service": "finops-poc"
+              },
+              "type": ""
+            }
+          ],
+          "supports_default_tags": true,
+          "supports_tags": true,
+          "tags": {
+            "Environment": "Dev",
+            "Name": "finops-poc-app-0",
+            "Service": "finops-poc"
+          },
+          "type": "aws_instance"
+        }
+      ],
+      "tagging_results": [
+        {
+          "failing_resources": [],
+          "message": "This example Tagging policy shows how you can enforce required FinOps tag keys/values in pull requests. This example checks for the tags 'Service' (can have any value) and 'Environment' (must be Dev/Stage/Prod) on all taggable resources being changed in the pull request. You can adjust it from https://dashboard.infracost.io > Governance > Tagging policies. You have a 14 day trial of this feature as it's part of Infracost Cloud.",
+          "policy_id": "d9d6a664-485f-4851-adb0-3fb150eb0aa9",
+          "policy_name": "FinOps tags"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "costed_resources": 1,
+    "distinct_failing_finops_resources": 1,
+    "failing_finops_policies": 2,
+    "finops_policies": 5,
+    "free_resources": 0,
+    "projects": 1,
+    "resources": 1,
+    "tagging_policies": 1,
+    "total_monthly_cost": "74.08",
+    "total_potential_yearly_savings": "166.44"
+  }
+}

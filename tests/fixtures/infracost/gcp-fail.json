@@ -1,0 +1,313 @@
+{
+  "currency": "USD",
+  "projects": [
+    {
+      "finops_results": [
+        {
+          "failing_resources": [],
+          "policy_id": "f233a79d-2697-45d8-88f3-5b7699aa19f7",
+          "policy_message": "N1s are first-generation general purpose VMs. For most use-cases (excluding GPU workloads), Google recommends one of their second-generation types such as:\n\n- **E2** offers the lowest total cost of ownership with up to 31% savings compared to N1.\n- **N2** uses 2nd Gen Intel Xeon Scalable Processors (Cascade Lake) and offers a greater than 20% price-performance improvement for many workloads and support up to 25% more memory per vCPU.\n- **N2D** uses latest 2nd Gen AMD EPYC (Rome) CPUs, and support the highest core count and memory of any general-purpose Compute Engine VM.",
+          "policy_name": "Compute - consider using current generation machine types",
+          "policy_slug": "google-compute-use-latest-machine-types"
+        },
+        {
+          "failing_resources": [
+            {
+              "issues": [
+                {
+                  "address": "google_compute_disk.data[0]",
+                  "attribute": "name",
+                  "description": "Remove unattached disk.",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "yearly_savings": "0"
+                }
+              ],
+              "name": "google_compute_disk.data[0]"
+            },
+            {
+              "issues": [
+                {
+                  "address": "google_compute_disk.data[1]",
+                  "attribute": "name",
+                  "description": "Remove unattached disk.",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "yearly_savings": "0"
+                }
+              ],
+              "name": "google_compute_disk.data[1]"
+            }
+          ],
+          "policy_id": "bc4753d0-e35e-4699-a20f-e39ae3b73a36",
+          "policy_message": "Unattached disks can accumulate after migration projects, diagnostic drives of instances, or backups, but most unused disks are orphaned disks. When instances are deleted, the disks are not deleted automatically, which leaves behind orphaned disks. These take up space and incur unnecessary charges.",
+          "policy_name": "Compute - consider removing unattached disks",
+          "policy_slug": "google-remove-unattached-disks-policy"
+        }
+      ],
+      "path": "gcp-fail.json",
+      "project_name": "gcp-fail.json",
+      "resources": [
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "3.65",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0",
+              "name": "IP address (standard VM)",
+              "price": "0.005",
+              "quantity": "730",
+              "total_monthly_cost": "3.65",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "04a8bcc3df531fa4"
+          },
+          "name": "google_compute_address.egress[0]",
+          "supports_default_tags": true,
+          "supports_tags": true,
+          "type": "google_compute_address"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "170",
+              "monthly_carbon_savings_grams_co2e": "2167.28439",
+              "monthly_water_savings_liters": "4.72103",
+              "name": "SSD provisioned storage (pd-ssd)",
+              "price": "0.17",
+              "quantity": "1000",
+              "total_monthly_cost": "170",
+              "unit": "GB",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "85513b5966d52d1a"
+          },
+          "name": "google_compute_disk.data[0]",
+          "supports_default_tags": true,
+          "supports_tags": true,
+          "type": "google_compute_disk"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "170",
+              "monthly_carbon_savings_grams_co2e": "2167.28439",
+              "monthly_water_savings_liters": "4.72103",
+              "name": "SSD provisioned storage (pd-ssd)",
+              "price": "0.17",
+              "quantity": "1000",
+              "total_monthly_cost": "170",
+              "unit": "GB",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "f5dea1c60d6e665d"
+          },
+          "name": "google_compute_disk.data[1]",
+          "supports_default_tags": true,
+          "supports_tags": true,
+          "type": "google_compute_disk"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "226.867648",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0",
+              "name": "Instance usage (Linux/UNIX, on-demand, n2-standard-8)",
+              "price": "0.3107776",
+              "quantity": "730",
+              "total_monthly_cost": "226.867648",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            },
+            {
+              "base_monthly_cost": "17",
+              "monthly_carbon_savings_grams_co2e": "216.72843899999998",
+              "monthly_water_savings_liters": "0.472103",
+              "name": "SSD provisioned storage (pd-ssd)",
+              "price": "0.17",
+              "quantity": "100",
+              "total_monthly_cost": "17",
+              "unit": "GB",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "fc90bfbaca77d863"
+          },
+          "name": "google_compute_instance.app[0]",
+          "supports_default_tags": true,
+          "supports_tags": true,
+          "type": "google_compute_instance"
+        },
+        {
+          "cost_components": [
+            {
+              "base_monthly_cost": "226.867648",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0",
+              "name": "Instance usage (Linux/UNIX, on-demand, n2-standard-8)",
+              "price": "0.3107776",
+              "quantity": "730",
+              "total_monthly_cost": "226.867648",
+              "unit": "hours",
+              "usage_monthly_cost": "0"
+            },
+            {
+              "base_monthly_cost": "17",
+              "monthly_carbon_savings_grams_co2e": "216.72843899999998",
+              "monthly_water_savings_liters": "0.472103",
+              "name": "SSD provisioned storage (pd-ssd)",
+              "price": "0.17",
+              "quantity": "100",
+              "total_monthly_cost": "17",
+              "unit": "GB",
+              "usage_monthly_cost": "0"
+            }
+          ],
+          "is_free": false,
+          "is_supported": true,
+          "metadata": {
+            "deep_checksum": "7c708a1304400370"
+          },
+          "name": "google_compute_instance.app[1]",
+          "supports_default_tags": true,
+          "supports_tags": true,
+          "type": "google_compute_instance"
+        }
+      ],
+      "tagging_results": [
+        {
+          "failing_resources": [
+            {
+              "address": "google_compute_address.egress[0]",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "path": "",
+              "propagation_problems": [],
+              "resource_type": "google_compute_address"
+            },
+            {
+              "address": "google_compute_disk.data[0]",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "path": "",
+              "propagation_problems": [],
+              "resource_type": "google_compute_disk"
+            },
+            {
+              "address": "google_compute_disk.data[1]",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "path": "",
+              "propagation_problems": [],
+              "resource_type": "google_compute_disk"
+            },
+            {
+              "address": "google_compute_instance.app[0]",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "path": "",
+              "propagation_problems": [],
+              "resource_type": "google_compute_instance"
+            },
+            {
+              "address": "google_compute_instance.app[1]",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "path": "",
+              "propagation_problems": [],
+              "resource_type": "google_compute_instance"
+            }
+          ],
+          "message": "This example Tagging policy shows how you can enforce required FinOps tag keys/values in pull requests. This example checks for the tags 'Service' (can have any value) and 'Environment' (must be Dev/Stage/Prod) on all taggable resources being changed in the pull request. You can adjust it from https://dashboard.infracost.io > Governance > Tagging policies. You have a 14 day trial of this feature as it's part of Infracost Cloud.",
+          "policy_id": "d9d6a664-485f-4851-adb0-3fb150eb0aa9",
+          "policy_name": "FinOps tags",
+          "tag_schema": [
+            {
+              "key": "Environment",
+              "mandatory": true,
+              "valid_values": [
+                "Dev",
+                "Prod",
+                "Stage"
+              ]
+            },
+            {
+              "key": "Service",
+              "mandatory": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "costed_resources": 5,
+    "distinct_failing_finops_resources": 2,
+    "distinct_failing_tagging_resources": 5,
+    "failing_finops_policies": 1,
+    "failing_tagging_policies": 1,
+    "finops_policies": 2,
+    "free_resources": 0,
+    "projects": 1,
+    "resources": 5,
+    "tagging_policies": 1,
+    "total_monthly_cost": "831.385296"
+  }
+}
