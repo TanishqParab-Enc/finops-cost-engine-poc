@@ -216,7 +216,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: finops-${{ matrix.cloud }}-${{ github.run_id }}
-          path: head/.finops/
+          path: |
+            head/.finops/
+          if-no-files-found: warn
           retention-days: 90
 
       # The gate is the last word: a non-zero exit stops the pipeline.
