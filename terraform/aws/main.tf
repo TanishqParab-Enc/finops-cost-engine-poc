@@ -6,18 +6,15 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  # Backend config is supplied at init time via -backend-config flags in CI.
+  # Local runs: `terraform init -backend=false` to skip state.
+  backend "s3" {}
 }
 
-# Credentials are faked and all validation is skipped so `terraform plan` runs
-# offline in the POC. A real pipeline uses OIDC federation instead.
+# Credentials come from the OIDC role assumed in the workflow.
 provider "aws" {
-  region                      = var.region
-  access_key                  = "mock_access_key"
-  secret_key                  = "mock_secret_key"
-  skip_credentials_validation = true
-  skip_metadata_api_check     = true
-  skip_requesting_account_id  = true
-  skip_region_validation      = true
+  region = var.region
 
   default_tags {
     tags = {

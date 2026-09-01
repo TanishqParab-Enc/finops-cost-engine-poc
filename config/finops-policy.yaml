@@ -76,7 +76,7 @@ fail_safe:
 # AI explanation layer. Never authoritative for money.
 # ---------------------------------------------------------------------------
 ai:
-  provider: mock          # mock | azure_openai | openai
+  provider: bedrock       # mock | bedrock | azure_openai | openai
   enabled: true
   required: false         # false => AI failure does not invalidate the decision
   timeout_seconds: 30
