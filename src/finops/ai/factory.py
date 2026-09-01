@@ -20,6 +20,10 @@ def build_provider(config: AIConfig) -> AIProvider:
         from .providers import OpenAIProvider
 
         return OpenAIProvider(timeout_seconds=config.timeout_seconds)
+    if config.provider == "bedrock":
+        from .bedrock_provider import BedrockProvider
+
+        return BedrockProvider(timeout_seconds=config.timeout_seconds)
     raise AIError(f"Unknown AI provider '{config.provider}'")
 
 

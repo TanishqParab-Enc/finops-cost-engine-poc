@@ -23,10 +23,12 @@ name: FinOps Cost Gate
 permissions:
   contents: read
   pull-requests: write
+  id-token: write   # required for AWS OIDC
 
 env:
   PYTHON_VERSION: '3.12'
   TERRAFORM_VERSION: '1.11.0'
+  AWS_REGION: us-east-1
 
 jobs:
   detect-changes:
@@ -108,15 +110,13 @@ jobs:
 
       - name: Install engine
         working-directory: head
-        run: pip install --quiet -e .
+        run: pip install --quiet -e '.[bedrock]'
 
-      # Real pipelines authenticate here (OIDC) so `terraform plan` can refresh
-      # state. The POC stacks use mock credentials and skip validation.
-      # - name: Configure AWS credentials
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
-      #     aws-region: us-east-1
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       # Both plans use the committed terraform.tfvars, which Terraform loads
       # automatically. The cost difference therefore comes purely from what the
@@ -127,7 +127,11 @@ jobs:
         working-directory: base/terraform/${{ matrix.cloud }}
         run: |
           set -euo pipefail
-          terraform init -input=false -no-color
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=finops-poc/${{ matrix.cloud }}/terraform.tfstate" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/baseline-plan.json"
 
@@ -135,7 +139,11 @@ jobs:
         working-directory: head/terraform/${{ matrix.cloud }}
         run: |
           set -euo pipefail
-          terraform init -input=false -no-color
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=finops-poc/${{ matrix.cloud }}/terraform.tfstate" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/proposed-plan.json"
 
@@ -149,10 +157,10 @@ jobs:
           INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
           FINOPS_THRESHOLD_VALUE: ${{ vars.FINOPS_THRESHOLD_VALUE || '100' }}
           FINOPS_THRESHOLD_METRIC: ${{ vars.FINOPS_THRESHOLD_METRIC || 'incremental_monthly_cost' }}
-          FINOPS_AI_PROVIDER: ${{ vars.FINOPS_AI_PROVIDER || 'mock' }}
-          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT }}
+          # Bedrock uses the OIDC role already assumed above - no extra key.
+          FINOPS_AI_PROVIDER: bedrock
+          FINOPS_BEDROCK_MODEL: ${{ vars.FINOPS_BEDROCK_MODEL || 'anthropic.claude-3-haiku-20240307-v1:0' }}
+          FINOPS_BEDROCK_REGION: ${{ env.AWS_REGION }}
         run: |
           set +e
           BASELINE_ARG=""
@@ -237,7 +245,28 @@ jobs:
     needs: [detect-changes, cost-gate]
     if: needs.detect-changes.outputs.has_infra_changes == 'true' && needs.cost-gate.result == 'success'
     runs-on: ubuntu-latest
+    environment: production   # requires a manual approval reviewer in repo settings
     steps:
-      - name: Cost approved
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform apply
+        working-directory: terraform/aws
         run: |
-          echo "Cost lock verified for this execution; terraform apply would run here."
+          set -euo pipefail
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=finops-poc/aws/terraform.tfstate" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform apply -input=false -no-color -auto-approve
