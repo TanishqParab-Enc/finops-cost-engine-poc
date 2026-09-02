@@ -19,10 +19,21 @@ locals {
   plan_role_name   = coalesce(var.plan_role_name, "${var.project_name}-${var.environment}-plan-role")
   deploy_role_name = coalesce(var.deploy_role_name, "${var.project_name}-${var.environment}-deploy-role")
 
-  # Each environment gets its own state key namespace.
-  state_key_prefixes = [
-    "${var.project_name}/${var.environment}/*",
-  ]
+  # AWS_PLAN_ROLE_ARN/AWS_DEPLOY_ROLE_ARN are single repo-level secrets shared
+  # by every environment's CI job, so in practice ONE role pair manages every
+  # environment's backend state, not one pair per environment. State access
+  # must therefore span the whole project when self-management is enabled -
+  # scoping it to just this environment's prefix denies every other
+  # environment's plan/apply with "not authorized to perform s3:PutObject",
+  # confirmed for real on 2026-09-02 (Plan (staging) using dev's role).
+  # IAM management is already project-wide (see the *_iam_write statements
+  # below), so this keeps the two consistent instead of a half-measure that
+  # blocks bootstrapping sibling environments.
+  state_key_prefixes = (
+    var.enable_backend_self_management
+    ? ["${var.project_name}/*"]
+    : ["${var.project_name}/${var.environment}/*"]
+  )
 
   common_tags = merge(
     {
