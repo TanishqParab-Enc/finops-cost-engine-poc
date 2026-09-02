@@ -11,18 +11,33 @@ locals {
   plan_role_name   = coalesce(var.plan_role_name, "${local.name_prefix}-plan-role")
   deploy_role_name = coalesce(var.deploy_role_name, "${local.name_prefix}-deploy-role")
 
-  repo = "${var.github_owner}/${var.github_repository}"
+  # GitHub can emit either the classic subject or an "immutable" one that embeds
+  # numeric IDs so renaming the org/repo does not silently break trust:
+  #   classic   : repo:owner/repo:ref:refs/heads/main
+  #   immutable : repo:owner@1234/repo@5678:ref:refs/heads/main
+  # Confirmed on this repo 2026-09-02 by decoding a real token; the immutable
+  # form was sent. Both are trusted so the roles keep working either way.
+  # Check with: gh api /repos/<owner>/<repo>/actions/oidc/customization/sub
+  repo_classic = "${var.github_owner}/${var.github_repository}"
+  repo_immutable = (
+    var.github_owner_id != null && var.github_repository_id != null
+    ? "${var.github_owner}@${var.github_owner_id}/${var.github_repository}@${var.github_repository_id}"
+    : null
+  )
+  repo_forms = compact([local.repo_classic, local.repo_immutable])
 
   # Pull requests from the repo, plus pushes to the allowed branches.
-  plan_subjects = length(var.plan_subjects) > 0 ? var.plan_subjects : concat(
-    ["repo:${local.repo}:pull_request"],
-    [for b in var.allowed_branches : "repo:${local.repo}:ref:refs/heads/${b}"],
-  )
+  plan_subjects = length(var.plan_subjects) > 0 ? var.plan_subjects : flatten([
+    for repo in local.repo_forms : concat(
+      ["repo:${repo}:pull_request"],
+      [for b in var.allowed_branches : "repo:${repo}:ref:refs/heads/${b}"],
+    )
+  ])
 
   # Deployment is only permitted from the protected GitHub environment, so the
   # environment's required reviewers gate every use of this role.
   deploy_subjects = length(var.deploy_subjects) > 0 ? var.deploy_subjects : [
-    "repo:${local.repo}:environment:${var.github_environment_name}",
+    for repo in local.repo_forms : "repo:${repo}:environment:${var.github_environment_name}"
   ]
 
   state_bucket_arn = "arn:${data.aws_partition.current.partition}:s3:::${var.state_bucket_name}"

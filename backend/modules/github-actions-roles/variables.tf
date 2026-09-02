@@ -41,6 +41,20 @@ variable "github_repository" {
   }
 }
 
+# GitHub's immutable OIDC subject claims embed numeric IDs. Get them with:
+#   gh api /repos/<owner>/<repo> --jq '{owner: .owner.id, repo: .id}'
+variable "github_owner_id" {
+  description = "Numeric GitHub owner ID, used to trust immutable OIDC subjects. Null trusts only the classic subject form."
+  type        = string
+  default     = null
+}
+
+variable "github_repository_id" {
+  description = "Numeric GitHub repository ID, used to trust immutable OIDC subjects. Null trusts only the classic subject form."
+  type        = string
+  default     = null
+}
+
 variable "github_environment_name" {
   description = "GitHub environment that gates the deploy role."
   type        = string
