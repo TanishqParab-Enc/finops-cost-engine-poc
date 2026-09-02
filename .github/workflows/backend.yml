@@ -1,7 +1,10 @@
 name: Backend Terraform
 
-# One workflow for the backend/ Terraform: plan on pull requests, plan-then-apply
-# on main. Apply order is always dev -> staging -> prod.
+# One workflow for the backend/ Terraform: plan on pull requests and on pushes
+# to main (all three environments, read-only, for visibility). Apply NEVER
+# runs automatically - it only runs via a manual workflow_dispatch that picks
+# exactly one environment (dev, staging or prod). A push to main never applies
+# anything and never cascades across environments.
 #
 # BOOTSTRAP IS NOT RUN HERE. backend/bootstrap creates the S3 state bucket, the
 # GitHub OIDC provider and the IAM roles that THIS workflow authenticates with,
@@ -295,15 +298,16 @@ jobs:
             }
 
   # -------------------------------------------------------------------------
-  # Apply: dev -> staging -> prod, never from a pull request.
+  # Apply: manual only. Each job below is independent - none of them depend on
+  # each other, and none of them run from a push or a pull request. Choosing
+  # one environment in workflow_dispatch applies only that environment.
   # -------------------------------------------------------------------------
   apply-dev:
     name: Apply dev
     needs: [preflight, plan]
     if: |
       needs.preflight.outputs.configured == 'true' &&
-      github.event_name != 'pull_request' &&
-      (github.event_name == 'push' || inputs.environment == 'dev')
+      github.event_name == 'workflow_dispatch' && inputs.environment == 'dev'
     runs-on: ubuntu-latest
     environment: dev
     steps:
@@ -335,10 +339,10 @@ jobs:
 
   apply-staging:
     name: Apply staging
-    needs: [preflight, apply-dev]
+    needs: [preflight, plan]
     if: |
-      always() && needs.apply-dev.result == 'success' &&
-      (github.event_name == 'push' || inputs.environment == 'staging')
+      needs.preflight.outputs.configured == 'true' &&
+      github.event_name == 'workflow_dispatch' && inputs.environment == 'staging'
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -372,9 +376,9 @@ jobs:
   # so an automatic production apply would be an unreviewed production change.
   apply-prod:
     name: Apply prod
-    needs: [preflight, apply-staging]
+    needs: [preflight, plan]
     if: |
-      always() && needs.apply-staging.result == 'success' &&
+      needs.preflight.outputs.configured == 'true' &&
       github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
     runs-on: ubuntu-latest
     environment: production

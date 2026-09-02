@@ -35,6 +35,14 @@ locals {
     : ["${var.project_name}/${var.environment}/*"]
   )
 
+  # The GitHub Actions environment names backend.yml actually uses for the
+  # other two environments (dev/staging/production), so the shared deploy
+  # role's trust also covers them. Kept as a fixed list rather than derived
+  # from var.environment, since "prod" maps to the GitHub environment
+  # "production", not "prod".
+  all_backend_github_environments   = ["dev", "staging", "production"]
+  other_backend_github_environments = setsubtract(local.all_backend_github_environments, [var.github_environment_name])
+
   common_tags = merge(
     {
       Project     = var.project_name
@@ -331,7 +339,10 @@ module "github_actions_roles" {
   github_owner_id         = var.github_owner_id
   github_repository_id    = var.github_repository_id
   github_environment_name = var.github_environment_name
-  allowed_branches        = var.allowed_branches
+  additional_deploy_environments = (
+    var.enable_backend_self_management ? local.other_backend_github_environments : []
+  )
+  allowed_branches = var.allowed_branches
 
   state_bucket_name  = var.state_bucket_name
   state_key_prefixes = local.state_key_prefixes

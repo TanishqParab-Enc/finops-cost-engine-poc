@@ -34,11 +34,20 @@ locals {
     )
   ])
 
-  # Deployment is only permitted from the protected GitHub environment, so the
-  # environment's required reviewers gate every use of this role.
-  deploy_subjects = length(var.deploy_subjects) > 0 ? var.deploy_subjects : [
-    for repo in local.repo_forms : "repo:${repo}:environment:${var.github_environment_name}"
-  ]
+  # Deployment is only permitted from a protected GitHub environment. A single
+  # shared deploy role manages every backend environment (one repo secret,
+  # not one per environment - see finops-environment), so it must trust the
+  # GitHub environment claim for ALL of them, not just the one that created
+  # it. Confirmed for real on 2026-09-02: Apply staging failed with
+  # "Not authorized to perform sts:AssumeRoleWithWebIdentity" because the
+  # trust condition only allowed sub=...:environment:dev.
+  deploy_environments = distinct(concat([var.github_environment_name], var.additional_deploy_environments))
+
+  deploy_subjects = length(var.deploy_subjects) > 0 ? var.deploy_subjects : flatten([
+    for repo in local.repo_forms : [
+      for env in local.deploy_environments : "repo:${repo}:environment:${env}"
+    ]
+  ])
 
   state_bucket_arn = "arn:${data.aws_partition.current.partition}:s3:::${var.state_bucket_name}"
 

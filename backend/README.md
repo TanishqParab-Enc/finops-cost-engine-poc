@@ -361,14 +361,20 @@ One workflow handles the whole backend lifecycle: [.github/workflows/backend.yml
 | Event | What runs |
 |---|---|
 | PR touching `backend/**` | static checks → plan (all 3 environments) → PR comment |
-| Push to `main` | static checks → plan → apply dev → apply staging |
-| Manual dispatch | static checks → plan → apply the chosen environment |
+| Push to `main` | static checks → plan (all 3 environments, read-only) — **no apply** |
+| Manual dispatch | static checks → plan → apply **only** the chosen environment |
 
 ```
-preflight ──► plan ──► apply-dev ──► apply-staging ──► apply-prod
-(no creds)   (read-only    (auto on main)  (auto on main)   (manual dispatch
-              plan role)                                     + typed confirm)
+preflight ──► plan ──► apply-dev        (workflow_dispatch, environment == dev)
+(no creds)   (read-only ──► apply-staging    (workflow_dispatch, environment == staging)
+              plan role) ──► apply-prod       (workflow_dispatch, environment == prod
+                                               + typed confirm)
 ```
+
+Each `apply-*` job is independent — none `needs:` another apply job. Choosing `staging` in
+workflow_dispatch runs plan then applies **only** staging; dev and prod are untouched in that
+run. A push to `main` only re-plans all three environments for visibility and never applies
+anything, so merging a PR can never trigger an unattended change in AWS.
 
 ### Why one workflow
 
@@ -392,7 +398,8 @@ If any are missing, plan and apply are **skipped with an explanatory summary** r
 |---|---|
 | Plans cannot apply | The plan job assumes the **read-only** plan role — apply is impossible, not just omitted |
 | PRs never apply | `github.event_name != 'pull_request'` on every apply job |
-| Strict ordering | `needs:` chain, each requiring `result == 'success'` |
+| Push never applies | Every apply job requires `github.event_name == 'workflow_dispatch'` — a push only plans |
+| No cross-environment cascade | Each apply job is gated only by `inputs.environment == '<env>'`; apply jobs do not depend on each other |
 | Applied plan == reviewed plan | Plans to a file, then applies **that saved file** |
 | No accidental deletion | The composite action **aborts** if the plan would destroy any resource |
 | No concurrent state writes | `concurrency: backend-terraform-<ref>` |
@@ -432,6 +439,26 @@ CI derives this from `OIDC_OWNER_ENVIRONMENT` (default `dev`). The composite act
 X Plan would destroy 1 resource(s) in dev. Apply aborted.
   # module.backend.module.github_oidc.aws_iam_openid_connect_provider.github[0] will be destroyed
 ```
+
+**3. A single shared deploy role must trust every GitHub environment it will assume-role from.**
+
+This design uses one repo-level `AWS_DEPLOY_ROLE_ARN` secret for all three environments (rather than a
+separate role per environment), so the deploy role's trust policy must list every GitHub Actions
+`environment:` subject it will ever be assumed from, not just the one that created it. Hit for real on
+2026-09-02: the role was created by the `dev` environment folder with `github_environment_name = "dev"`,
+so its trust policy only allowed `...:environment:dev`. `Apply staging` then failed with:
+
+```
+Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+Fixed by `additional_deploy_environments` on the `github-actions-roles` module: when
+`enable_backend_self_management = true`, `finops-environment` passes the two GitHub environment names the
+current environment does *not* own (e.g. dev's module call passes `["staging", "production"]`), and the
+module unions them with its own `github_environment_name` before building `deploy_subjects`. The deploy
+role's trust policy therefore lists `environment:dev`, `environment:staging` and `environment:production`
+simultaneously — the same "make the IAM scope project-wide because the CI identity already is" pattern used
+for the state-access fix above.
 
 ### Backend self-management and privilege escalation
 
@@ -516,6 +543,28 @@ Destroying the OIDC-owning environment without realizing it would lock every env
 | Cannot race an apply | Shares the `backend-terraform-<ref>` concurrency group with `backend.yml` |
 | Production still scoped | Uses the same `environment: production` used by apply, so the deploy role's OIDC trust is unaffected |
 | Bootstrap and GitHub layers untouched | Only acts on `backend/environments/<env>` — the state bucket (`prevent_destroy`) and `backend/github` are never in scope |
+
+### What happens to the state file
+
+`backend-destroy.yml` runs `terraform destroy` against the environment's existing state key (e.g.
+`finops-poc/staging/terraform.tfstate` in the state bucket). Destroy removes the real AWS resources **and**
+rewrites that state file to reflect zero managed resources — but it does not delete the state *object* from
+S3. The object stays at the same key, now representing an empty state, and the bucket itself is a separate
+resource (created in `bootstrap/`, protected by `prevent_destroy`) that `backend-destroy.yml` never touches.
+
+Re-applying later — via `backend.yml`'s `workflow_dispatch`, any time after — reads that same (now empty)
+state key and creates the resources fresh, exactly like the original first-time apply. No manual state
+cleanup or recovery step is needed for a normal (non-OIDC-owning) environment.
+
+The one exception is destroying the `OIDC_OWNER_ENVIRONMENT` (default `dev`): that also destroys the GitHub
+OIDC provider every environment authenticates through. The S3 bucket is untouched (see above), so bootstrap
+does **not** need to be rerun, but:
+
+1. Re-apply that same environment locally (with human AWS credentials, since CI can no longer authenticate)
+   to recreate the OIDC provider and the plan/deploy roles.
+2. Reset `AWS_PLAN_ROLE_ARN`, `AWS_DEPLOY_ROLE_ARN` and `AWS_OIDC_PROVIDER_ARN` (GitHub secrets/variables) to
+   the newly-created ARNs — they are regenerated with new resource IDs, not restored to their old values.
+3. Only then will `backend.yml` be able to authenticate again for any environment.
 
 Verified locally with a real `terraform plan -destroy` against the applied `dev` environment: `Plan: 0 to add, 0 to change, 10 to destroy` — clean, destroy-only, plan discarded without applying.
 

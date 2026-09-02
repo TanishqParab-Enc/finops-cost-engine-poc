@@ -61,6 +61,12 @@ variable "github_environment_name" {
   default     = "production"
 }
 
+variable "additional_deploy_environments" {
+  description = "Extra GitHub Actions environment names (besides github_environment_name) trusted to assume the deploy role."
+  type        = list(string)
+  default     = []
+}
+
 variable "allowed_branches" {
   description = "Branches whose push events may assume the plan role."
   type        = list(string)
