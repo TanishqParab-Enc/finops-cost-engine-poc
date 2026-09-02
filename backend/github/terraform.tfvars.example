@@ -41,7 +41,11 @@ environments = {
   }
 
   production = {
-    # REQUIRED for production: at least one reviewer.
+    # VERIFIED 2026-09-02: on a PRIVATE repo owned by a personal account the
+    # GitHub API rejects reviewers with HTTP 422 ("billing plan"). Leave these
+    # empty unless the repo is public or on Pro/Team/Enterprise - otherwise
+    # `terraform apply` here will fail.
+    # IDs are numeric: gh api /users/<login> --jq .id
     reviewer_user_ids       = []
     reviewer_team_ids       = []
     prevent_self_review     = true

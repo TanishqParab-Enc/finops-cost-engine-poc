@@ -1,0 +1,127 @@
+name: Terraform Apply (backend environment)
+description: Init, render tfvars, plan then apply one backend environment.
+
+inputs:
+  environment:
+    description: Environment directory under backend/environments
+    required: true
+  aws-region:
+    description: AWS region
+    required: true
+  state-bucket:
+    description: Terraform state S3 bucket
+    required: true
+  state-key-prefix:
+    description: Key prefix within the state bucket
+    required: true
+  project-name:
+    description: Project name used for resource naming
+    required: true
+  oidc-provider-arn:
+    description: Existing GitHub OIDC provider ARN to reuse
+    required: true
+  bedrock-model-id:
+    description: Bedrock inference profile ID
+    required: true
+  bedrock-inference-profile-arn:
+    description: Bedrock inference profile ARN
+    required: true
+  bedrock-foundation-model-arns:
+    description: JSON array of foundation model ARNs for every routed region
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Terraform init
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        terraform init -input=false -no-color \
+          -backend-config="bucket=${{ inputs.state-bucket }}" \
+          -backend-config="key=${{ inputs.state-key-prefix }}/${{ inputs.environment }}/terraform.tfstate" \
+          -backend-config="region=${{ inputs.aws-region }}" \
+          -backend-config="encrypt=true" \
+          -backend-config="use_lockfile=true"
+
+    - name: Render terraform.tfvars
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        cat > terraform.tfvars <<EOF
+        project_name = "${{ inputs.project-name }}"
+        environment  = "${{ inputs.environment }}"
+        aws_region   = "${{ inputs.aws-region }}"
+
+        github_owner      = "${{ github.repository_owner }}"
+        github_repository = "${{ github.event.repository.name }}"
+
+        github_environment_name = "${{ inputs.environment }}"
+
+        state_bucket_name = "${{ inputs.state-bucket }}"
+
+        create_oidc_provider       = false
+        existing_oidc_provider_arn = "${{ inputs.oidc-provider-arn }}"
+
+        enable_bedrock_access         = true
+        bedrock_model_id              = "${{ inputs.bedrock-model-id }}"
+        bedrock_inference_profile_arn = "${{ inputs.bedrock-inference-profile-arn }}"
+        bedrock_foundation_model_arns = ${{ inputs.bedrock-foundation-model-arns }}
+        EOF
+
+    # Plan to a file first, then apply exactly that plan. Applying a saved plan
+    # guarantees the applied changes are the reviewed ones.
+    - name: Terraform plan
+      id: plan
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        terraform plan -input=false -no-color -lock-timeout=5m \
+          -var-file=terraform.tfvars -out=tfplan.binary
+        terraform show -json tfplan.binary > plan.json
+
+        DESTROY=$(python3 -c "import json;d=json.load(open('plan.json'));print(sum(1 for c in d.get('resource_changes',[]) if 'delete' in c['change']['actions']))")
+        echo "destroy_count=$DESTROY" >> "$GITHUB_OUTPUT"
+        echo "Resources to destroy: $DESTROY"
+
+    # A backend apply should never delete infrastructure. If it wants to,
+    # something is wrong - stop and make a human look.
+    - name: Block destructive apply
+      if: steps.plan.outputs.destroy_count != '0'
+      shell: bash
+      run: |
+        echo "::error title=Destructive apply blocked::Plan would destroy ${{ steps.plan.outputs.destroy_count }} resource(s) in ${{ inputs.environment }}. Apply aborted. Review the plan and apply manually if this is intended."
+        exit 1
+
+    - name: Terraform apply
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        terraform apply -input=false -no-color -lock-timeout=5m tfplan.binary
+
+    - name: Publish outputs
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        {
+          echo "### Backend apply — \`${{ inputs.environment }}\`"
+          echo
+          echo '| Output | Value |'
+          echo '|---|---|'
+          terraform output -json \
+            | python3 -c "import json,sys;[print(f'| {k} | \`{v[\"value\"]}\` |') for k,v in json.load(sys.stdin).items() if not v.get('sensitive')]"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload plan artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: backend-apply-${{ inputs.environment }}-${{ github.run_id }}
+        path: backend/environments/${{ inputs.environment }}/plan.json
+        if-no-files-found: warn
+        retention-days: 90

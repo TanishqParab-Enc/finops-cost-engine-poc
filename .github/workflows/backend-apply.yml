@@ -1,0 +1,173 @@
+name: Backend Terraform Apply
+
+# Runs only after changes land on the protected branch. Applies strictly in
+# order: dev -> staging -> prod, stopping at the first failure.
+#
+# PRODUCTION APPROVAL - IMPORTANT
+# ------------------------------------------------------------------------
+# Verified 2026-09-02 against this repository: it is PRIVATE on a personal
+# account, and the GitHub API rejects required-reviewer protection rules with
+#   HTTP 422 "Please ensure the billing plan supports the required reviewers
+#   protection rule."
+#
+# So `environment: production` alone does NOT enforce manual approval here. It
+# is still declared because it scopes the deploy role's OIDC trust subject
+# (repo:<owner>/<repo>:environment:production) and it starts enforcing
+# automatically if the repo becomes public or the plan is upgraded.
+#
+# Until then the real gate is `require_production_confirmation`: production
+# apply runs only from a manual workflow_dispatch where the operator types
+# the environment name. See backend/README.md.
+# ------------------------------------------------------------------------
+
+# Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
+"on":
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-apply.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to apply
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+      confirm:
+        description: 'Type the environment name to confirm (required for prod)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TERRAFORM_VERSION: '1.11.0'
+  AWS_REGION: us-east-1
+
+# Never let two applies touch the same state concurrently.
+concurrency:
+  group: backend-apply
+  cancel-in-progress: false
+
+jobs:
+  dev:
+    name: Apply dev
+    if: github.event_name == 'push' || inputs.environment == 'dev'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-apply-dev-${{ github.run_id }}
+
+      - name: Apply
+        uses: ./.github/actions/terraform-apply
+        with:
+          environment: dev
+          aws-region: ${{ env.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+
+  staging:
+    name: Apply staging
+    needs: dev
+    if: |
+      always() && needs.dev.result == 'success' &&
+      (github.event_name == 'push' || inputs.environment == 'staging')
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-apply-staging-${{ github.run_id }}
+
+      - name: Apply
+        uses: ./.github/actions/terraform-apply
+        with:
+          environment: staging
+          aws-region: ${{ env.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+
+  # Production is deliberately NOT reachable from a push. Because required
+  # reviewers are unavailable on this plan, an automatic push-triggered apply
+  # would be an unreviewed production change.
+  prod:
+    name: Apply prod
+    needs: staging
+    if: |
+      always() && needs.staging.result == 'success' &&
+      github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Verify production confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "prod" ]; then
+            echo "::error title=Confirmation required::Re-run and type 'prod' in the confirm input to apply to production."
+            exit 1
+          fi
+          echo "Production apply confirmed by ${{ github.actor }}."
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-apply-prod-${{ github.run_id }}
+
+      - name: Apply
+        uses: ./.github/actions/terraform-apply
+        with:
+          environment: prod
+          aws-region: ${{ env.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}

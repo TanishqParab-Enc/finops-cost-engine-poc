@@ -271,36 +271,152 @@ aws bedrock get-inference-profile \
 
 These are separate controls and neither substitutes for the other:
 
-| Gate | Type | Where |
-|---|---|---|
-| **FinOps cost threshold** | Automatic, deterministic | `config/finops-policy.yaml`, evaluated by the cost engine |
-| **Production approval** | Manual, human | GitHub environment required reviewers |
+| Gate | Type | Where | Enforced here? |
+|---|---|---|---|
+| **FinOps cost threshold** | Automatic, deterministic | `config/finops-policy.yaml` | Yes |
+| **Production approval** | Human | GitHub environment | **No** — see the verified limitation above; currently manual-dispatch only |
 
-A PR under the cost threshold still requires human approval to deploy to production. A PR over the threshold is blocked before it ever reaches that point.
+A PR under the cost threshold still requires a deliberate manual dispatch to reach production. A PR over the threshold is blocked before it ever gets there.
 
 ```
 PR → plan → Infracost → threshold → PASS/FAIL
                                       │
-                                      PASS → cost lock → production environment → reviewer approval → apply
+                                      PASS → cost lock → manual dispatch + typed confirmation → apply
                                       FAIL → build blocked, no lock, peer review required
 ```
 
 ---
 
-## GitHub environment requirements
+## Production approval — VERIFIED LIMITATION
 
-Required reviewers on environments need:
-
-- **Public repositories** — available on all plans
-- **Private repositories** — GitHub **Pro, Team or Enterprise**
-
-If you are on a private repo with GitHub Free, `github_repository_environment` will apply but protection rules are silently ignored. Either make the repo public, upgrade, or rely on branch protection instead.
-
-Reviewer IDs are numeric, not usernames:
+**Required reviewers do not work on this repository.** This was tested against the live API on 2026-09-02, not assumed:
 
 ```bash
-gh api /users/<login> --jq .id          # user ID
-gh api /orgs/<org>/teams/<slug> --jq .id  # team ID
+$ gh api --method PUT /repos/TanishqParab-Enc/finops-cost-engine-poc/environments/protection-test \
+    --input '{"reviewers":[{"type":"User","id":209082352}],"prevent_self_review":true}'
+
+HTTP 422
+"Failed to create the environment protection rule. Please ensure the billing
+ plan supports the required reviewers protection rule."
+```
+
+The repository is **private** and owned by a **personal account**. Required reviewers on environments need GitHub **Pro, Team or Enterprise** for private repositories.
+
+### What does and does not work here
+
+| Capability | Status | Consequence |
+|---|---|---|
+| Create environment | Works | `protection_rules: []` |
+| Environment-scoped OIDC subject | Works | Deploy role trust **is** enforced by AWS |
+| Deployment branch policies | Works | Branch restriction is enforced |
+| **Required reviewers / manual approval** | **HTTP 422** | **Not enforced** |
+
+So `environment: production` is still declared in `backend-apply.yml` — it scopes the deploy role's OIDC trust to `repo:<owner>/<repo>:environment:production`, which AWS genuinely enforces — but **it does not gate the apply behind a human**.
+
+### The actual production gate in use
+
+Because approval cannot be enforced, production apply is **not reachable from a push**. It requires a deliberate human action:
+
+1. Run `Backend Terraform Apply` manually via **workflow_dispatch**
+2. Select `environment: prod`
+3. Type `prod` into the **confirm** input
+
+A mismatched or empty confirmation fails the job before any AWS credentials are used.
+
+```yaml
+if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
+```
+
+`dev` and `staging` do apply automatically on merge to `main`; production never does.
+
+### To get real approval enforcement
+
+Any one of these, after which the existing `environment: production` starts enforcing with no code change:
+
+| Option | Cost |
+|---|---|
+| Make the repository public | Free |
+| Upgrade to GitHub Pro | ~$4/user/month |
+| Move to a GitHub Team organization | ~$4/user/month |
+
+Then set reviewers in `backend/github/terraform.tfvars`:
+
+```hcl
+production = {
+  reviewer_user_ids   = [209082352]
+  prevent_self_review = true
+}
+```
+
+and remove the `workflow_dispatch`-only restriction on the `prod` job.
+
+> Until then, **do not describe production apply as "approval gated"**. It is *manual-dispatch gated*, which is weaker: it proves intent but not peer review.
+
+---
+
+## GitHub Actions workflows
+
+| Workflow | Trigger | Applies? |
+|---|---|---|
+| `backend-plan.yml` | PR touching `backend/**`, or manual | **Never** |
+| `backend-apply.yml` | Push to `main`, or manual | dev + staging automatically; prod manual only |
+
+### `backend-plan.yml`
+
+1. `terraform fmt -check -recursive -diff`
+2. `terraform validate` across all five layers
+3. Assumes the **read-only plan role** via OIDC
+4. Plans dev, staging and prod in parallel
+5. Posts a sticky per-environment PR comment and uploads the plan as an artifact
+6. Warns loudly if a plan would destroy anything
+
+Apply is not merely omitted from the YAML — the job assumes the read-only role, so `terraform apply` **cannot** succeed with those credentials.
+
+### `backend-apply.yml`
+
+Strict ordering, stopping at the first failure:
+
+```
+dev  ──►  staging  ──►  prod
+(auto)     (auto)        (manual dispatch + typed confirmation)
+```
+
+Each apply plans to a file first and applies **that saved plan**, so what runs is what was reviewed. A shared composite action ([.github/actions/terraform-apply](../.github/actions/terraform-apply/action.yml)) also **aborts the apply if the plan would destroy any resource** — a backend apply should only ever add or update.
+
+`concurrency: backend-apply` with `cancel-in-progress: false` prevents two applies racing on the same state.
+
+### Required repository configuration
+
+The workflows render `terraform.tfvars` from repository variables, since tfvars are not committed.
+
+| Type | Name | Example |
+|---|---|---|
+| Secret | `AWS_PLAN_ROLE_ARN` | `arn:aws:iam::<acct>:role/finops-poc-dev-plan-role` |
+| Secret | `AWS_DEPLOY_ROLE_ARN` | `arn:aws:iam::<acct>:role/finops-poc-dev-deploy-role` |
+| Secret | `INFRACOST_API_KEY` | Infracost CLI token |
+| Variable | `TF_STATE_BUCKET` | `finops-poc-tfstate-<acct>` |
+| Variable | `TF_STATE_KEY_PREFIX` | `finops-poc` |
+| Variable | `PROJECT_NAME` | `finops-poc` |
+| Variable | `AWS_OIDC_PROVIDER_ARN` | `arn:aws:iam::<acct>:oidc-provider/token.actions.githubusercontent.com` |
+| Variable | `FINOPS_BEDROCK_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| Variable | `BEDROCK_INFERENCE_PROFILE_ARN` | `arn:aws:bedrock:us-east-1:<acct>:inference-profile/us.anthropic...` |
+| Variable | `BEDROCK_FOUNDATION_MODEL_ARNS` | JSON array — see below |
+
+`BEDROCK_FOUNDATION_MODEL_ARNS` is injected verbatim as HCL, so it must be a valid JSON array:
+
+```json
+["arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0","arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0","arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"]
+```
+
+### Bootstrap stays out of CI, deliberately
+
+`bootstrap/` is **never** run by GitHub Actions. It creates the S3 state bucket *and* the OIDC provider and IAM roles that the workflows themselves depend on — CI cannot create its own credentials. Run it once, locally, with human AWS credentials.
+
+```
+bootstrap (local, once)
+   └─► state bucket + OIDC provider + IAM roles
+          └─► GitHub Actions can now authenticate
+                 └─► backend-plan.yml / backend-apply.yml
 ```
 
 ---
