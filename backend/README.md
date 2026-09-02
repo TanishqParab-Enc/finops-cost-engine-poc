@@ -398,6 +398,49 @@ If any are missing, plan and apply are **skipped with an explanatory summary** r
 | No concurrent state writes | `concurrency: backend-terraform-<ref>` |
 | No static AWS keys | OIDC only |
 
+### Two OIDC gotchas that will lock CI out of AWS
+
+Both were hit for real on 2026-09-02 and are now handled in code. Read this before changing the trust policy or the tfvars rendering.
+
+**1. GitHub sends immutable subject claims containing numeric IDs.**
+
+Decoding a real token from this repo gave:
+
+```
+sub : repo:TanishqParab-Enc@209082352/finops-cost-engine-poc@1353830250:ref:refs/heads/main
+```
+
+not the classic `repo:owner/repo:ref:refs/heads/main`. A trust policy allowing only the classic form fails every assume-role with:
+
+```
+Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+The module trusts **both** forms. Supply `github_owner_id` and `github_repository_id`; CI derives them from `github.repository_owner_id` and `github.repository_id`. Check your repo's format with:
+
+```bash
+gh api /repos/<owner>/<repo>/actions/oidc/customization/sub
+```
+
+**2. Only one environment may own the OIDC provider.**
+
+If CI renders `create_oidc_provider = false` while an environment's state owns it, Terraform plans to **destroy the provider CI authenticates with** — a self-inflicted lockout that also requires local credentials to repair.
+
+CI derives this from `OIDC_OWNER_ENVIRONMENT` (default `dev`). The composite action's destroy guard caught exactly this case before it applied:
+
+```
+X Plan would destroy 1 resource(s) in dev. Apply aborted.
+  # module.backend.module.github_oidc.aws_iam_openid_connect_provider.github[0] will be destroyed
+```
+
+### Backend self-management and privilege escalation
+
+Because the workflow manages the backend layer, the roles need IAM permissions. IAM write is inherently privilege-adjacent, so:
+
+- Deploy-role IAM actions are scoped to `arn:aws:iam::<acct>:role/<project>-*` and `.../policy/<project>-*`, plus the single GitHub OIDC provider ARN
+- An explicit **`Deny`** blocks `UpdateAssumeRolePolicy`, `PutRolePolicy`, `AttachRolePolicy`, `DeleteRole` and friends on the plan and deploy roles themselves — Deny beats Allow, so the role cannot widen its own permissions
+- Set `enable_backend_self_management = false` to remove all IAM permissions and run the backend layer only from a workstation
+
 ### Required repository configuration
 
 tfvars are not committed, so CI renders them from repository variables.
