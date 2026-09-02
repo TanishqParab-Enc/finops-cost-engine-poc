@@ -1,0 +1,142 @@
+name: Backend Terraform Destroy
+
+# Deliberately separate from backend.yml. Tears down one environment's backend
+# infrastructure (IAM roles, policies, and the GitHub OIDC provider IF this
+# environment owns it). NEVER runs automatically - workflow_dispatch only, and
+# requires two typed confirmations before anything is planned.
+#
+# Shares its concurrency group with backend.yml so a destroy can never race a
+# plan/apply on the same state.
+#
+# DOES NOT touch:
+#   - backend/bootstrap (the Terraform state S3 bucket - has prevent_destroy)
+#   - backend/github    (GitHub environments/variables - separate state)
+# Tear those down manually if ever needed.
+
+"on":
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to destroy
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      confirm:
+        description: "Type destroy-<environment> to confirm, e.g. destroy-dev"
+        required: true
+        type: string
+      confirm_oidc_impact:
+        description: >-
+          Only required when destroying the environment that owns the shared
+          GitHub OIDC provider (see repo variable OIDC_OWNER_ENVIRONMENT).
+          Destroying it locks EVERY environment out of AWS until bootstrap and
+          this environment are re-applied. Type exactly:
+          yes-lock-out-all-environments
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TERRAFORM_VERSION: '1.11.0'
+  AWS_REGION: us-east-1
+
+# Same group as backend.yml (by design) so a destroy and a plan/apply can
+# never run concurrently against the same state.
+concurrency:
+  group: backend-terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Verify confirmation
+    runs-on: ubuntu-latest
+    outputs:
+      oidc_owner_environment: ${{ steps.owner.outputs.value }}
+    steps:
+      - name: Check typed confirmation matches the environment
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          EXPECTED="destroy-${ENVIRONMENT}"
+          if [ "$CONFIRM" != "$EXPECTED" ]; then
+            echo "::error title=Confirmation required::Type '$EXPECTED' exactly in the confirm input. Got: '$CONFIRM'"
+            exit 1
+          fi
+          echo "Confirmed: destroying ${ENVIRONMENT}."
+
+      - name: Determine OIDC owner and check the extra confirmation
+        id: owner
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          OWNER: ${{ vars.OIDC_OWNER_ENVIRONMENT }}
+          CONFIRM_OIDC: ${{ inputs.confirm_oidc_impact }}
+        run: |
+          OWNER="${OWNER:-dev}"
+          echo "value=$OWNER" >> "$GITHUB_OUTPUT"
+
+          if [ "$ENVIRONMENT" = "$OWNER" ]; then
+            if [ "$CONFIRM_OIDC" != "yes-lock-out-all-environments" ]; then
+              echo "::error title=OIDC impact confirmation required::'${ENVIRONMENT}' owns the shared GitHub OIDC provider (repo variable OIDC_OWNER_ENVIRONMENT). Destroying it locks every environment out of AWS. Re-run and type 'yes-lock-out-all-environments' in the confirm_oidc_impact input to proceed anyway."
+              exit 1
+            fi
+            echo "::warning title=Destroying the OIDC owner environment::Proceeding - this run explicitly confirmed the cross-environment lockout impact."
+          fi
+
+      - name: Check bootstrap configuration is present
+        env:
+          PLAN_ROLE: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          DEPLOY_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          MISSING=""
+          [ -z "$PLAN_ROLE" ]    && MISSING="$MISSING AWS_PLAN_ROLE_ARN(secret)"
+          [ -z "$DEPLOY_ROLE" ]  && MISSING="$MISSING AWS_DEPLOY_ROLE_ARN(secret)"
+          [ -z "$STATE_BUCKET" ] && MISSING="$MISSING TF_STATE_BUCKET(variable)"
+          if [ -n "$MISSING" ]; then
+            echo "::error title=Nothing to destroy::Missing:$MISSING - bootstrap has not been applied, so there is no backend infrastructure to tear down."
+            exit 1
+          fi
+
+  destroy:
+    name: Destroy ${{ inputs.environment }}
+    needs: guard
+    runs-on: ubuntu-latest
+    # Scopes the deploy role's OIDC trust the same way apply does. Destroying
+    # `production` still goes through the `production` GitHub environment.
+    environment: ${{ inputs.environment == 'prod' && 'production' || inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        working-directory: backend
+        run: terraform fmt -check -recursive -diff
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-destroy-${{ inputs.environment }}-${{ github.run_id }}
+
+      - uses: ./.github/actions/terraform-destroy
+        with:
+          environment: ${{ inputs.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+          oidc-owner-environment: ${{ needs.guard.outputs.oidc_owner_environment }}
+          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}

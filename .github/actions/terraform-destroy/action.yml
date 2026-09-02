@@ -1,0 +1,194 @@
+name: Terraform Destroy (backend environment)
+description: Init, render tfvars, plan -destroy, verify the plan is destroy-only, then apply it.
+
+inputs:
+  environment:
+    description: Environment directory under backend/environments
+    required: true
+  aws-region:
+    description: AWS region
+    required: true
+  state-bucket:
+    description: Terraform state S3 bucket
+    required: true
+  state-key-prefix:
+    description: Key prefix within the state bucket
+    required: true
+  project-name:
+    description: Project name used for resource naming
+    required: true
+  oidc-provider-arn:
+    description: Existing GitHub OIDC provider ARN to reuse
+    required: true
+  oidc-owner-environment:
+    description: Environment whose Terraform state owns the OIDC provider
+    required: false
+    default: dev
+  bedrock-model-id:
+    description: Bedrock inference profile ID
+    required: true
+  bedrock-inference-profile-arn:
+    description: Bedrock inference profile ARN
+    required: true
+  bedrock-foundation-model-arns:
+    description: JSON array of foundation model ARNs for every routed region
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Terraform init
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        terraform init -input=false -no-color \
+          -backend-config="bucket=${{ inputs.state-bucket }}" \
+          -backend-config="key=${{ inputs.state-key-prefix }}/${{ inputs.environment }}/terraform.tfstate" \
+          -backend-config="region=${{ inputs.aws-region }}" \
+          -backend-config="encrypt=true" \
+          -backend-config="use_lockfile=true"
+
+    # Same rendering as terraform-apply, and the same two load-bearing values:
+    #  * github_owner_id/github_repository_id for immutable OIDC subjects.
+    #  * create_oidc_provider - MUST match the environment that actually owns
+    #    the provider in state, or Terraform tries to destroy/recreate it
+    #    instead of just tearing down this environment's roles.
+    - name: Render terraform.tfvars
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.environment }}" = "${{ inputs.oidc-owner-environment }}" ]; then
+          CREATE_OIDC=true
+          EXISTING_OIDC=null
+        else
+          CREATE_OIDC=false
+          EXISTING_OIDC='"${{ inputs.oidc-provider-arn }}"'
+        fi
+
+        cat > terraform.tfvars <<EOF
+        project_name = "${{ inputs.project-name }}"
+        environment  = "${{ inputs.environment }}"
+        aws_region   = "${{ inputs.aws-region }}"
+
+        github_owner         = "${{ github.repository_owner }}"
+        github_repository    = "${{ github.event.repository.name }}"
+        github_owner_id      = "${{ github.repository_owner_id }}"
+        github_repository_id = "${{ github.repository_id }}"
+
+        github_environment_name = "${{ inputs.environment }}"
+
+        state_bucket_name = "${{ inputs.state-bucket }}"
+
+        create_oidc_provider       = ${CREATE_OIDC}
+        existing_oidc_provider_arn = ${EXISTING_OIDC}
+
+        enable_bedrock_access         = true
+        bedrock_model_id              = "${{ inputs.bedrock-model-id }}"
+        bedrock_inference_profile_arn = "${{ inputs.bedrock-inference-profile-arn }}"
+        bedrock_foundation_model_arns = ${{ inputs.bedrock-foundation-model-arns }}
+        EOF
+
+    - name: Terraform plan -destroy
+      id: plan
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        terraform plan -destroy -input=false -no-color -lock-timeout=5m \
+          -var-file=terraform.tfvars -out=destroy.tfplan
+        terraform show -no-color destroy.tfplan > destroy-full.txt
+        terraform show -json    destroy.tfplan > destroy.json
+
+        TOTAL=$(python3 -c "import json;print(len(json.load(open('destroy.json')).get('resource_changes',[])))")
+        NON_DELETE=$(python3 -c "
+        import json
+        d = json.load(open('destroy.json'))
+        n = sum(1 for c in d.get('resource_changes', [])
+                if c['change']['actions'] not in (['delete'], ['no-op']))
+        print(n)
+        ")
+        DESTROYS_OIDC=$(python3 -c "
+        import json
+        d = json.load(open('destroy.json'))
+        hit = any(c['type'] == 'aws_iam_openid_connect_provider' and 'delete' in c['change']['actions']
+                   for c in d.get('resource_changes', []))
+        print('true' if hit else 'false')
+        ")
+
+        echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+        echo "non_delete=$NON_DELETE" >> "$GITHUB_OUTPUT"
+        echo "destroys_oidc=$DESTROYS_OIDC" >> "$GITHUB_OUTPUT"
+        echo "Resources in plan: $TOTAL (non-delete: $NON_DELETE, destroys OIDC provider: $DESTROYS_OIDC)"
+
+    # A destroy plan must contain ONLY deletions (or no-ops). Anything else
+    # means the rendered tfvars do not match this environment's real state -
+    # for example the OIDC-ownership flag flipped - and applying it could
+    # create or modify resources instead of tearing them down as intended.
+    - name: Verify plan is destroy-only
+      if: steps.plan.outputs.non_delete != '0'
+      shell: bash
+      run: |
+        echo "::error title=Unexpected plan shape::This destroy plan contains ${{ steps.plan.outputs.non_delete }} non-delete change(s). Refusing to apply - a destroy must only remove resources. Check that create_oidc_provider / oidc-owner-environment match this environment's actual state."
+        exit 1
+
+    - name: Warn about shared OIDC provider
+      if: steps.plan.outputs.destroys_oidc == 'true'
+      shell: bash
+      run: |
+        echo "::warning title=Destroying the shared GitHub OIDC provider::This destroys the GitHub Actions OIDC provider that ALL environments authenticate with. Every other environment's plan/apply/destroy will fail with 'Not authorized to perform sts:AssumeRoleWithWebIdentity' until bootstrap + the OIDC-owning environment are re-applied. Proceeding because this run was explicitly confirmed for that impact."
+
+    - name: Upload destroy plan artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: backend-destroy-plan-${{ inputs.environment }}-${{ github.run_id }}
+        path: |
+          backend/environments/${{ inputs.environment }}/destroy-full.txt
+          backend/environments/${{ inputs.environment }}/destroy.json
+        if-no-files-found: warn
+        retention-days: 90
+
+    - name: Publish plan to job summary
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        {
+          echo "### Destroy plan — \`${{ inputs.environment }}\`"
+          echo
+          echo "Resources to destroy: **${{ steps.plan.outputs.total }}**"
+          echo
+          echo '<details><summary>Show plan</summary>'
+          echo
+          echo '```terraform'
+          cat destroy-full.txt
+          echo '```'
+          echo
+          echo '</details>'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Terraform apply (destroy)
+      shell: bash
+      working-directory: backend/environments/${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        terraform apply -input=false -no-color -lock-timeout=5m destroy.tfplan
+
+    - name: Confirm teardown
+      shell: bash
+      run: |
+        {
+          echo "### Backend destroy complete — \`${{ inputs.environment }}\`"
+          echo
+          echo "${{ steps.plan.outputs.total }} resource(s) removed."
+          if [ "${{ steps.plan.outputs.destroys_oidc }}" = "true" ]; then
+            echo
+            echo "> [!WARNING]"
+            echo "> The shared GitHub OIDC provider was destroyed. All other environments"
+            echo "> are now locked out of AWS until you re-run: bootstrap, then this"
+            echo "> environment's apply (to recreate the provider), then re-add the"
+            echo "> AWS_PLAN_ROLE_ARN / AWS_DEPLOY_ROLE_ARN / AWS_OIDC_PROVIDER_ARN"
+            echo "> secrets and variables."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

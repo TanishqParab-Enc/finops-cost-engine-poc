@@ -477,6 +477,59 @@ bootstrap (local, once)
 
 ---
 
+## Destroying backend infrastructure
+
+Tearing down an environment's backend infrastructure is a **separate workflow**: [.github/workflows/backend-destroy.yml](../.github/workflows/backend-destroy.yml). It is never part of `backend.yml` and never runs from a push or a PR — destroying infrastructure is deliberate, not incidental.
+
+### Trigger it
+
+Actions → **Backend Terraform Destroy** → Run workflow, then fill in:
+
+| Input | Required | Value |
+|---|---|---|
+| `environment` | Yes | `dev`, `staging` or `prod` |
+| `confirm` | Yes | Type **`destroy-<environment>`** exactly, e.g. `destroy-dev` |
+| `confirm_oidc_impact` | Only if this environment owns the OIDC provider | Type **`yes-lock-out-all-environments`** exactly |
+
+A mismatched or missing confirmation fails the job before any AWS credentials are used.
+
+### Why the second confirmation exists
+
+The environment named by the repo variable `OIDC_OWNER_ENVIRONMENT` (default `dev`) is the only one whose Terraform state owns the GitHub OIDC provider. Destroying it destroys the provider **every environment authenticates through** — confirmed for real on 2026-09-02, where a plan showed:
+
+```
+# module.backend.module.github_oidc.aws_iam_openid_connect_provider.github[0] will be destroyed
+```
+
+Destroying the OIDC-owning environment without realizing it would lock every environment out of AWS simultaneously, recoverable only by re-running bootstrap and re-applying that environment locally. The extra confirmation makes that impact impossible to trigger by accident.
+
+### Safety properties
+
+| Property | How it is enforced |
+|---|---|
+| Never automatic | The only trigger is `workflow_dispatch` — no `push`, no `pull_request` |
+| Cannot fat-finger the environment | `confirm` must equal `destroy-<environment>` exactly |
+| Cannot accidentally lock out all environments | Separate typed phrase, required only when it matters |
+| Plan is reviewed before it runs | Full `terraform plan -destroy` posted to the job summary and uploaded as an artifact |
+| Plan must be destroy-only | The action fails if the plan contains anything other than `delete`/`no-op` — catches tfvars misconfiguration before it can create or modify instead of tearing down |
+| Applied plan == reviewed plan | Applies the saved `destroy.tfplan`, not a fresh plan |
+| Cannot race an apply | Shares the `backend-terraform-<ref>` concurrency group with `backend.yml` |
+| Production still scoped | Uses the same `environment: production` used by apply, so the deploy role's OIDC trust is unaffected |
+| Bootstrap and GitHub layers untouched | Only acts on `backend/environments/<env>` — the state bucket (`prevent_destroy`) and `backend/github` are never in scope |
+
+Verified locally with a real `terraform plan -destroy` against the applied `dev` environment: `Plan: 0 to add, 0 to change, 10 to destroy` — clean, destroy-only, plan discarded without applying.
+
+### What it does not tear down
+
+| Layer | How to destroy it |
+|---|---|
+| `bootstrap` (state bucket) | Manually, locally: remove `prevent_destroy`, then `terraform destroy -var-file=terraform.tfvars` |
+| `github` (environments/variables) | Manually, locally: `terraform destroy -var-file=terraform.tfvars` |
+
+Both are rare, deliberately manual operations outside CI.
+
+---
+
 ## Adding a new environment
 
 ```bash
