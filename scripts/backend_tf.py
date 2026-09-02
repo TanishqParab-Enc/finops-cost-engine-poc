@@ -45,12 +45,19 @@ def main() -> int:
     if run(init, cwd) != 0:
         return 1
 
-    command = "apply" if args.apply else "plan"
-    argv = ["terraform", command, "-input=false", "-no-color", "-var-file=terraform.tfvars"]
-    if not args.apply:
-        argv.append("-out=tfplan.binary")
+    plan = [
+        "terraform", "plan", "-input=false", "-no-color",
+        "-var-file=terraform.tfvars", "-out=tfplan.binary",
+    ]
+    if run(plan, cwd) != 0:
+        return 1
 
-    return run(argv, cwd)
+    if not args.apply:
+        return 0
+
+    # Apply the saved plan so what runs is exactly what was just planned, and
+    # so no interactive approval prompt is needed.
+    return run(["terraform", "apply", "-input=false", "-no-color", "tfplan.binary"], cwd)
 
 
 if __name__ == "__main__":
