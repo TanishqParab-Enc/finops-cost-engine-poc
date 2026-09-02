@@ -1,0 +1,393 @@
+name: Backend Terraform
+
+# One workflow for the backend/ Terraform: plan on pull requests, plan-then-apply
+# on main. Apply order is always dev -> staging -> prod.
+#
+# BOOTSTRAP IS NOT RUN HERE. backend/bootstrap creates the S3 state bucket, the
+# GitHub OIDC provider and the IAM roles that THIS workflow authenticates with,
+# so it must be applied once locally first. Until that is done the preflight job
+# detects the missing configuration and skips everything with a clear message
+# instead of failing on "Could not load credentials".
+#
+# PRODUCTION APPROVAL - VERIFIED LIMITATION (2026-09-02)
+# This repository is private on a personal account, and the GitHub API rejects
+# required-reviewer rules with HTTP 422 ("billing plan"). `environment:
+# production` is still declared because it scopes the deploy role's OIDC trust
+# subject, which AWS does enforce - but it does NOT gate the apply behind a
+# human. Production therefore never runs from a push; it requires a manual
+# workflow_dispatch with a typed confirmation. See backend/README.md.
+
+# Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
+"on":
+  pull_request:
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend.yml'
+      - '.github/actions/terraform-apply/**'
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend.yml'
+      - '.github/actions/terraform-apply/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to apply
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+      confirm:
+        description: "Type the environment name to confirm (required for prod)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  TERRAFORM_VERSION: '1.11.0'
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: backend-terraform-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Static checks need no credentials, so they run even before bootstrap and
+  # fail fast on formatting or syntax problems.
+  # -------------------------------------------------------------------------
+  preflight:
+    name: Static checks
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        working-directory: backend
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate (all layers)
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          for dir in bootstrap environments/dev environments/staging environments/prod github; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false -no-color
+            terraform -chdir="$dir" validate -no-color
+            echo "::endgroup::"
+          done
+
+      - name: Check bootstrap has been applied
+        id: check
+        env:
+          PLAN_ROLE: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          OIDC_ARN: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -z "$PLAN_ROLE" ]    && MISSING="$MISSING AWS_PLAN_ROLE_ARN(secret)"
+          [ -z "$STATE_BUCKET" ] && MISSING="$MISSING TF_STATE_BUCKET(variable)"
+          [ -z "$OIDC_ARN" ]     && MISSING="$MISSING AWS_OIDC_PROVIDER_ARN(variable)"
+
+          if [ -n "$MISSING" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Backend Terraform — not yet configured"
+              echo
+              echo "Static checks passed, but plan/apply were skipped."
+              echo
+              echo "Missing:$MISSING"
+              echo
+              echo "Run the one-time bootstrap locally first, then set the repository"
+              echo "secrets and variables listed in \`backend/README.md\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Bootstrap required::Missing:$MISSING - see backend/README.md"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "Backend configuration present."
+          fi
+
+  # -------------------------------------------------------------------------
+  # Plan. Runs on PRs and before any apply. Uses the READ-ONLY plan role, so
+  # apply is not merely absent from this job - it is impossible.
+  # -------------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.environment)) || fromJSON('["dev","staging","prod"]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (plan role, read-only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-plan-${{ matrix.environment }}-${{ github.run_id }}
+
+      - name: Terraform init
+        working-directory: backend/environments/${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}/${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # tfvars are environment-specific config and are not committed, so CI
+      # renders them from repository variables.
+      - name: Render terraform.tfvars
+        working-directory: backend/environments/${{ matrix.environment }}
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          cat > terraform.tfvars <<EOF
+          project_name = "${{ vars.PROJECT_NAME || 'finops-poc' }}"
+          environment  = "${ENVIRONMENT}"
+          aws_region   = "${{ env.AWS_REGION }}"
+
+          github_owner      = "${{ github.repository_owner }}"
+          github_repository = "${{ github.event.repository.name }}"
+
+          github_environment_name = "${ENVIRONMENT}"
+
+          state_bucket_name = "${{ vars.TF_STATE_BUCKET }}"
+
+          create_oidc_provider       = false
+          existing_oidc_provider_arn = "${{ vars.AWS_OIDC_PROVIDER_ARN }}"
+
+          enable_bedrock_access         = true
+          bedrock_model_id              = "${{ vars.FINOPS_BEDROCK_MODEL }}"
+          bedrock_inference_profile_arn = "${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}"
+          bedrock_foundation_model_arns = ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+          EOF
+
+      - name: Terraform plan
+        id: plan
+        working-directory: backend/environments/${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var-file=terraform.tfvars -out=tfplan.binary
+
+          terraform show -no-color tfplan.binary > plan-full.txt
+          terraform show -json    tfplan.binary > plan.json
+
+          DESTROY=$(python3 -c "import json;d=json.load(open('plan.json'));print(sum(1 for c in d.get('resource_changes',[]) if 'delete' in c['change']['actions']))")
+          echo "destroy_count=$DESTROY" >> "$GITHUB_OUTPUT"
+          echo "Resources to destroy: $DESTROY"
+
+      - name: Flag destructive changes
+        if: steps.plan.outputs.destroy_count != '0'
+        run: echo "::warning title=Destructive plan::${{ matrix.environment }} would DESTROY ${{ steps.plan.outputs.destroy_count }} resource(s)."
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-plan-${{ matrix.environment }}-${{ github.run_id }}
+          path: |
+            backend/environments/${{ matrix.environment }}/plan-full.txt
+            backend/environments/${{ matrix.environment }}/plan.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Comment plan on pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          DESTROY_COUNT: ${{ steps.plan.outputs.destroy_count }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const file = `backend/environments/${env}/plan-full.txt`;
+
+            let plan = 'Plan did not complete. See the workflow logs.';
+            if (fs.existsSync(file)) plan = fs.readFileSync(file, 'utf8');
+
+            const LIMIT = 60000;   // GitHub rejects comments over 65536 chars
+            if (plan.length > LIMIT) {
+              plan = plan.slice(0, LIMIT) + '\n\n... truncated. Download the artifact for the full plan.';
+            }
+
+            const destroys = process.env.DESTROY_COUNT || '0';
+            const warning = destroys !== '0'
+              ? `\n> [!WARNING]\n> This plan destroys **${destroys}** resource(s).\n` : '';
+
+            const marker = `<!-- backend-plan:${env} -->`;
+            const body = [
+              marker,
+              `### Backend Terraform plan — \`${env}\``,
+              warning,
+              '<details><summary>Show plan</summary>',
+              '', '```terraform', plan, '```', '',
+              '</details>', '',
+              `<sub>Read-only plan role · run \`${context.runId}\` · apply runs only on \`main\`</sub>`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+  # -------------------------------------------------------------------------
+  # Apply: dev -> staging -> prod, never from a pull request.
+  # -------------------------------------------------------------------------
+  apply-dev:
+    name: Apply dev
+    needs: [preflight, plan]
+    if: |
+      needs.preflight.outputs.configured == 'true' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'push' || inputs.environment == 'dev')
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-apply-dev-${{ github.run_id }}
+
+      - uses: ./.github/actions/terraform-apply
+        with:
+          environment: dev
+          aws-region: ${{ env.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+
+  apply-staging:
+    name: Apply staging
+    needs: [preflight, apply-dev]
+    if: |
+      always() && needs.apply-dev.result == 'success' &&
+      (github.event_name == 'push' || inputs.environment == 'staging')
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-apply-staging-${{ github.run_id }}
+
+      - uses: ./.github/actions/terraform-apply
+        with:
+          environment: staging
+          aws-region: ${{ env.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+
+  # Not reachable from a push. Required reviewers are unavailable on this plan,
+  # so an automatic production apply would be an unreviewed production change.
+  apply-prod:
+    name: Apply prod
+    needs: [preflight, apply-staging]
+    if: |
+      always() && needs.apply-staging.result == 'success' &&
+      github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Verify production confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "prod" ]; then
+            echo "::error title=Confirmation required::Re-run and type 'prod' in the confirm input."
+            exit 1
+          fi
+          echo "Production apply confirmed by ${{ github.actor }}."
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backend-apply-prod-${{ github.run_id }}
+
+      - uses: ./.github/actions/terraform-apply
+        with:
+          environment: prod
+          aws-region: ${{ env.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}

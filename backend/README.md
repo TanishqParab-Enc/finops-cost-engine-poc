@@ -354,40 +354,53 @@ and remove the `workflow_dispatch`-only restriction on the `prod` job.
 
 ---
 
-## GitHub Actions workflows
+## GitHub Actions workflow
 
-| Workflow | Trigger | Applies? |
-|---|---|---|
-| `backend-plan.yml` | PR touching `backend/**`, or manual | **Never** |
-| `backend-apply.yml` | Push to `main`, or manual | dev + staging automatically; prod manual only |
+One workflow handles the whole backend lifecycle: [.github/workflows/backend.yml](../.github/workflows/backend.yml)
 
-### `backend-plan.yml`
-
-1. `terraform fmt -check -recursive -diff`
-2. `terraform validate` across all five layers
-3. Assumes the **read-only plan role** via OIDC
-4. Plans dev, staging and prod in parallel
-5. Posts a sticky per-environment PR comment and uploads the plan as an artifact
-6. Warns loudly if a plan would destroy anything
-
-Apply is not merely omitted from the YAML — the job assumes the read-only role, so `terraform apply` **cannot** succeed with those credentials.
-
-### `backend-apply.yml`
-
-Strict ordering, stopping at the first failure:
+| Event | What runs |
+|---|---|
+| PR touching `backend/**` | static checks → plan (all 3 environments) → PR comment |
+| Push to `main` | static checks → plan → apply dev → apply staging |
+| Manual dispatch | static checks → plan → apply the chosen environment |
 
 ```
-dev  ──►  staging  ──►  prod
-(auto)     (auto)        (manual dispatch + typed confirmation)
+preflight ──► plan ──► apply-dev ──► apply-staging ──► apply-prod
+(no creds)   (read-only    (auto on main)  (auto on main)   (manual dispatch
+              plan role)                                     + typed confirm)
 ```
 
-Each apply plans to a file first and applies **that saved plan**, so what runs is what was reviewed. A shared composite action ([.github/actions/terraform-apply](../.github/actions/terraform-apply/action.yml)) also **aborts the apply if the plan would destroy any resource** — a backend apply should only ever add or update.
+### Why one workflow
 
-`concurrency: backend-apply` with `cancel-in-progress: false` prevents two applies racing on the same state.
+Plan and apply share the same inputs, the same rendered tfvars and the same ordering. Splitting them meant duplicating all of that and losing the guarantee that **the plan you reviewed is the plan that gets applied**. Here every apply is preceded by a plan in the same run.
+
+### The bootstrap guard
+
+The `preflight` job runs `fmt -check` and `validate` **without any AWS credentials**, then checks whether bootstrap has been completed:
+
+| Required | Type |
+|---|---|
+| `AWS_PLAN_ROLE_ARN` | secret |
+| `TF_STATE_BUCKET` | variable |
+| `AWS_OIDC_PROVIDER_ARN` | variable |
+
+If any are missing, plan and apply are **skipped with an explanatory summary** rather than failing with `Could not load credentials from any providers`. This is the expected state before bootstrap has been run.
+
+### Safety properties
+
+| Property | How it is enforced |
+|---|---|
+| Plans cannot apply | The plan job assumes the **read-only** plan role — apply is impossible, not just omitted |
+| PRs never apply | `github.event_name != 'pull_request'` on every apply job |
+| Strict ordering | `needs:` chain, each requiring `result == 'success'` |
+| Applied plan == reviewed plan | Plans to a file, then applies **that saved file** |
+| No accidental deletion | The composite action **aborts** if the plan would destroy any resource |
+| No concurrent state writes | `concurrency: backend-terraform-<ref>` |
+| No static AWS keys | OIDC only |
 
 ### Required repository configuration
 
-The workflows render `terraform.tfvars` from repository variables, since tfvars are not committed.
+tfvars are not committed, so CI renders them from repository variables.
 
 | Type | Name | Example |
 |---|---|---|
@@ -410,13 +423,13 @@ The workflows render `terraform.tfvars` from repository variables, since tfvars 
 
 ### Bootstrap stays out of CI, deliberately
 
-`bootstrap/` is **never** run by GitHub Actions. It creates the S3 state bucket *and* the OIDC provider and IAM roles that the workflows themselves depend on — CI cannot create its own credentials. Run it once, locally, with human AWS credentials.
+`bootstrap/` is **never** run by GitHub Actions. It creates the S3 state bucket *and* the OIDC provider and IAM roles that the workflow itself authenticates with — CI cannot create its own credentials. Run it once, locally, with human AWS credentials.
 
 ```
 bootstrap (local, once)
    └─► state bucket + OIDC provider + IAM roles
-          └─► GitHub Actions can now authenticate
-                 └─► backend-plan.yml / backend-apply.yml
+          └─► set GitHub secrets/variables
+                 └─► backend.yml can authenticate
 ```
 
 ---
