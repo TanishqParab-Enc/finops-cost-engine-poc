@@ -3,8 +3,12 @@
 No extra secrets needed: the GitHub Actions OIDC role that runs `terraform plan`
 also calls `bedrock:InvokeModel` once the policy in Phase A includes it.
 
-Default model: Claude 3 Haiku (fast, cheap, excellent JSON output).
-Override with FINOPS_BEDROCK_MODEL env var.
+Default model: Claude Haiku 4.5 (fast, cheap, excellent JSON output), invoked via
+its cross-region inference profile — verified 2026-09-02 against a real account.
+Claude 3 Haiku is deprecated on Bedrock ("Legacy", access denied after 30 days of
+inactivity) and direct on-demand invocation of newer Claude models is rejected
+with "Retry using an inference profile", so the profile ID is required, not the
+bare model ID. Override with FINOPS_BEDROCK_MODEL env var.
 """
 
 from __future__ import annotations
@@ -15,8 +19,9 @@ from typing import Any
 
 from ..errors import AIError
 from .base import AIProvider
+from .json_extract import extract_json_object
 
-DEFAULT_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
+DEFAULT_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 DEFAULT_REGION = "us-east-1"
 
 
@@ -68,9 +73,10 @@ class BedrockProvider(AIProvider):
         try:
             raw = json.loads(response["body"].read())
             content = raw["content"][0]["text"]
-            return json.loads(content)
         except (KeyError, IndexError, json.JSONDecodeError) as exc:
             raise AIError("Unexpected Bedrock response shape", detail=str(exc)) from exc
+
+        return extract_json_object(content)
 
 
 def _boto_config(timeout_seconds: int):

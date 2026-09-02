@@ -27,3 +27,6 @@ out/
 *.key
 credentials.json
 gcp-sa-*.json
+
+# Editor
+.vscode/

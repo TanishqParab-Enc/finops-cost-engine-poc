@@ -13,6 +13,7 @@ from typing import Any
 
 from ..errors import AIError
 from .base import AIProvider
+from .json_extract import extract_json_object
 
 
 def _post_json(url: str, headers: dict[str, str], payload: dict, timeout: int) -> dict:
@@ -41,10 +42,7 @@ def _extract_message(response: dict) -> dict[str, Any]:
         content = response["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise AIError("AI response had an unexpected shape", detail=str(exc)) from exc
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise AIError("AI did not return valid JSON", detail=content[:300]) from exc
+    return extract_json_object(content)
 
 
 class AzureOpenAIProvider(AIProvider):

@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from finops.ai.schema import validate_analysis
+from finops.ai.json_extract import extract_json_object
 from finops.config import load_config
 from finops.errors import AIError, ConfigurationError
 from finops.plan.detector import classify_files
@@ -192,3 +193,36 @@ class TestAISchema:
                     "cost_impact": 999999,
                 }
             )
+
+
+class TestJsonExtraction:
+    """Claude via Bedrock wraps JSON in a markdown fence even when told not to
+    (confirmed against a real Bedrock call on 2026-09-02); every provider must
+    tolerate this.
+    """
+
+    def test_plain_json_object(self):
+        assert extract_json_object('{"a": 1}') == {"a": 1}
+
+    def test_markdown_fenced_json(self):
+        text = '```json\n{"a": 1, "b": "two"}\n```'
+        assert extract_json_object(text) == {"a": 1, "b": "two"}
+
+    def test_fenced_without_language_tag(self):
+        text = '```\n{"a": 1}\n```'
+        assert extract_json_object(text) == {"a": 1}
+
+    def test_json_surrounded_by_prose(self):
+        text = 'Here is the result:\n{"a": 1}\nHope that helps!'
+        assert extract_json_object(text) == {"a": 1}
+
+    def test_leading_trailing_whitespace(self):
+        assert extract_json_object('  \n{"a": 1}\n  ') == {"a": 1}
+
+    def test_raises_on_non_json_text(self):
+        with pytest.raises(AIError, match="did not return valid JSON"):
+            extract_json_object("not json at all")
+
+    def test_raises_on_json_array_not_object(self):
+        with pytest.raises(AIError):
+            extract_json_object("[1, 2, 3]")
