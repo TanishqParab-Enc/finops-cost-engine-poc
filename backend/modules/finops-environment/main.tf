@@ -14,6 +14,11 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
 
+  # Must match the names github-actions-roles derives, so the anti-escalation
+  # Deny below targets the right role ARNs.
+  plan_role_name   = coalesce(var.plan_role_name, "${var.project_name}-${var.environment}-plan-role")
+  deploy_role_name = coalesce(var.deploy_role_name, "${var.project_name}-${var.environment}-deploy-role")
+
   # Each environment gets its own state key namespace.
   state_key_prefixes = [
     "${var.project_name}/${var.environment}/*",
@@ -69,6 +74,53 @@ data "aws_iam_policy_document" "plan_read" {
     actions   = ["sts:GetCallerIdentity"]
     resources = ["*"]
   }
+
+  # The backend layer manages IAM roles, policies and the OIDC provider, so
+  # planning it needs to read them. Read-only, and IAM Get/List actions do not
+  # support resource-level conditions for all of these.
+  dynamic "statement" {
+    for_each = var.enable_backend_self_management ? [1] : []
+
+    content {
+      sid    = "ReadBackendIamForPlan"
+      effect = "Allow"
+      actions = [
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRoleTags",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:ListPolicyTags",
+        "iam:GetOpenIDConnectProvider",
+        "iam:ListOpenIDConnectProviders",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_backend_self_management ? [1] : []
+
+    content {
+      sid    = "ReadStateBucketConfigForPlan"
+      effect = "Allow"
+      actions = [
+        "s3:GetBucketVersioning",
+        "s3:GetBucketPolicy",
+        "s3:GetBucketAcl",
+        "s3:GetBucketTagging",
+        "s3:GetBucketLocation",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketOwnershipControls",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+      ]
+      resources = ["arn:${local.partition}:s3:::${var.state_bucket_name}"]
+    }
+  }
 }
 
 data "aws_iam_policy_document" "deploy_write" {
@@ -109,6 +161,134 @@ data "aws_iam_policy_document" "deploy_write" {
     effect    = "Allow"
     actions   = ["ec2:Describe*", "sts:GetCallerIdentity"]
     resources = ["*"]
+  }
+
+  # ---------------------------------------------------------------------
+  # Backend self-management.
+  #
+  # SECURITY: a principal that can write IAM can escalate to administrator.
+  # This is scoped to resources carrying the project prefix, and the explicit
+  # Deny below stops the deploy role rewriting its own trust policy or the
+  # plan role's. Set enable_backend_self_management = false to run the backend
+  # layer only from a human workstation.
+  # ---------------------------------------------------------------------
+  dynamic "statement" {
+    for_each = var.enable_backend_self_management ? [1] : []
+
+    content {
+      sid    = "ManageBackendIamRead"
+      effect = "Allow"
+      actions = [
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRoleTags",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:ListPolicyTags",
+        "iam:GetOpenIDConnectProvider",
+        "iam:ListOpenIDConnectProviders",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_backend_self_management ? [1] : []
+
+    content {
+      sid    = "ManageBackendIamWrite"
+      effect = "Allow"
+      actions = [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion",
+        "iam:TagPolicy",
+        "iam:UntagPolicy",
+      ]
+      resources = [
+        "arn:${local.partition}:iam::${local.account_id}:role/${var.project_name}-*",
+        "arn:${local.partition}:iam::${local.account_id}:policy/${var.project_name}-*",
+      ]
+    }
+  }
+
+  # The OIDC provider ARN is fixed by its issuer URL and cannot be prefixed.
+  dynamic "statement" {
+    for_each = var.enable_backend_self_management ? [1] : []
+
+    content {
+      sid    = "ManageGitHubOidcProvider"
+      effect = "Allow"
+      actions = [
+        "iam:CreateOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint",
+        "iam:AddClientIDToOpenIDConnectProvider",
+        "iam:RemoveClientIDFromOpenIDConnectProvider",
+        "iam:TagOpenIDConnectProvider",
+        "iam:UntagOpenIDConnectProvider",
+      ]
+      resources = [
+        "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com",
+      ]
+    }
+  }
+
+  # Prevents the deploy role from granting itself more privilege, or from
+  # disabling the plan role. Deny always wins over Allow.
+  dynamic "statement" {
+    for_each = var.enable_backend_self_management ? [1] : []
+
+    content {
+      sid    = "DenySelfPrivilegeEscalation"
+      effect = "Deny"
+      actions = [
+        "iam:UpdateAssumeRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRole",
+      ]
+      resources = [
+        "arn:${local.partition}:iam::${local.account_id}:role/${local.deploy_role_name}",
+        "arn:${local.partition}:iam::${local.account_id}:role/${local.plan_role_name}",
+      ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_backend_self_management ? [1] : []
+
+    content {
+      sid    = "ManageStateBucketConfig"
+      effect = "Allow"
+      actions = [
+        "s3:CreateBucket",
+        "s3:GetBucket*",
+        "s3:PutBucket*",
+        "s3:GetEncryptionConfiguration",
+        "s3:PutEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:PutLifecycleConfiguration",
+      ]
+      resources = ["arn:${local.partition}:s3:::${var.state_bucket_name}"]
+    }
   }
 }
 

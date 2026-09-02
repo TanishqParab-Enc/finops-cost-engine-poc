@@ -108,6 +108,16 @@ variable "extra_deploy_actions" {
   default     = []
 }
 
+# SECURITY: enabling this lets the deploy role write IAM, which is inherently
+# privilege-adjacent. It is scoped to <project_name>-* resources and paired
+# with an explicit Deny protecting the plan and deploy roles themselves. Set
+# false to run the backend layer only from a human workstation.
+variable "enable_backend_self_management" {
+  description = "Allow the CI roles to plan/apply the backend layer itself (IAM roles, policies, OIDC provider, state bucket config)."
+  type        = bool
+  default     = true
+}
+
 # ---------------------------------------------------------------------------
 # Bedrock
 # ---------------------------------------------------------------------------
