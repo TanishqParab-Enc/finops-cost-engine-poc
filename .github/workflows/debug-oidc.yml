@@ -5,6 +5,9 @@ name: Debug OIDC claims
 
 "on":
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/debug-oidc.yml'
 
 permissions:
   contents: read
@@ -15,31 +18,19 @@ jobs:
     name: Show OIDC claims
     runs-on: ubuntu-latest
     steps:
-      - name: Decode OIDC token claims
+      - name: Fetch OIDC token
         run: |
-          set -euo pipefail
-          TOKEN=$(curl -sSL \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)['value'])")
+          curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" > token.json
 
-          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2)
-          # base64url -> base64, then pad
-          PAYLOAD=$(echo "$PAYLOAD" | tr '_-' '/+')
-          case $(( ${#PAYLOAD} % 4 )) in
-            2) PAYLOAD="$PAYLOAD==" ;;
-            3) PAYLOAD="$PAYLOAD=" ;;
-          esac
-
-          echo "$PAYLOAD" | base64 -d 2>/dev/null \
-            | python3 -c "
-import sys, json
-c = json.load(sys.stdin)
-print('sub        :', c.get('sub'))
-print('aud        :', c.get('aud'))
-print('repository :', c.get('repository'))
-print('ref        :', c.get('ref'))
-print('event_name :', c.get('event_name'))
-print('environment:', c.get('environment'))
-print('iss        :', c.get('iss'))
-"
+      - name: Decode claims
+        run: |
+          python3 -c "
+          import base64, json
+          tok = json.load(open('token.json'))['value']
+          part = tok.split('.')[1]
+          part += '=' * (-len(part) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(part))
+          for key in ('sub','aud','repository','repository_id','repository_owner','repository_owner_id','ref','event_name','environment'):
+              print('{:22}: {}'.format(key, claims.get(key)))
+          "
