@@ -161,32 +161,55 @@ jobs:
 
       # tfvars are environment-specific config and are not committed, so CI
       # renders them from repository variables.
+      #
+      # Two values here are load-bearing:
+      #  * github_owner_id/github_repository_id - GitHub sends immutable OIDC
+      #    subjects containing these. Omitting them rewrites the trust policy
+      #    to the classic form and locks CI out of AWS.
+      #  * create_oidc_provider - only the owning environment may manage it.
+      #    Getting this wrong makes Terraform destroy the provider CI
+      #    authenticates with.
       - name: Render terraform.tfvars
         working-directory: backend/environments/${{ matrix.environment }}
         env:
           ENVIRONMENT: ${{ matrix.environment }}
+          OIDC_OWNER_ENV: ${{ vars.OIDC_OWNER_ENVIRONMENT || 'dev' }}
         run: |
           set -euo pipefail
+          if [ "$ENVIRONMENT" = "$OIDC_OWNER_ENV" ]; then
+            CREATE_OIDC=true
+            EXISTING_OIDC=null
+          else
+            CREATE_OIDC=false
+            EXISTING_OIDC='"${{ vars.AWS_OIDC_PROVIDER_ARN }}"'
+          fi
+
           cat > terraform.tfvars <<EOF
           project_name = "${{ vars.PROJECT_NAME || 'finops-poc' }}"
           environment  = "${ENVIRONMENT}"
           aws_region   = "${{ env.AWS_REGION }}"
 
-          github_owner      = "${{ github.repository_owner }}"
-          github_repository = "${{ github.event.repository.name }}"
+          github_owner         = "${{ github.repository_owner }}"
+          github_repository    = "${{ github.event.repository.name }}"
+          github_owner_id      = "${{ github.repository_owner_id }}"
+          github_repository_id = "${{ github.repository_id }}"
 
           github_environment_name = "${ENVIRONMENT}"
 
           state_bucket_name = "${{ vars.TF_STATE_BUCKET }}"
 
-          create_oidc_provider       = false
-          existing_oidc_provider_arn = "${{ vars.AWS_OIDC_PROVIDER_ARN }}"
+          create_oidc_provider       = ${CREATE_OIDC}
+          existing_oidc_provider_arn = ${EXISTING_OIDC}
 
           enable_bedrock_access         = true
           bedrock_model_id              = "${{ vars.FINOPS_BEDROCK_MODEL }}"
           bedrock_inference_profile_arn = "${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}"
           bedrock_foundation_model_arns = ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
           EOF
+
+          echo "::group::rendered tfvars"
+          cat terraform.tfvars
+          echo "::endgroup::"
 
       - name: Terraform plan
         id: plan

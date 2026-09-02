@@ -20,6 +20,10 @@ inputs:
   oidc-provider-arn:
     description: Existing GitHub OIDC provider ARN to reuse
     required: true
+  oidc-owner-environment:
+    description: Environment whose Terraform state owns the OIDC provider
+    required: false
+    default: dev
   bedrock-model-id:
     description: Bedrock inference profile ID
     required: true
@@ -45,25 +49,42 @@ runs:
           -backend-config="encrypt=true" \
           -backend-config="use_lockfile=true"
 
+    # Two values here are load-bearing:
+    #  * github_owner_id/github_repository_id - GitHub sends immutable OIDC
+    #    subjects containing these. Omitting them rewrites the trust policy to
+    #    the classic form and locks CI out of AWS.
+    #  * create_oidc_provider - only the owning environment may manage it.
+    #    Getting this wrong makes Terraform destroy the provider CI
+    #    authenticates with.
     - name: Render terraform.tfvars
       shell: bash
       working-directory: backend/environments/${{ inputs.environment }}
       run: |
         set -euo pipefail
+        if [ "${{ inputs.environment }}" = "${{ inputs.oidc-owner-environment }}" ]; then
+          CREATE_OIDC=true
+          EXISTING_OIDC=null
+        else
+          CREATE_OIDC=false
+          EXISTING_OIDC='"${{ inputs.oidc-provider-arn }}"'
+        fi
+
         cat > terraform.tfvars <<EOF
         project_name = "${{ inputs.project-name }}"
         environment  = "${{ inputs.environment }}"
         aws_region   = "${{ inputs.aws-region }}"
 
-        github_owner      = "${{ github.repository_owner }}"
-        github_repository = "${{ github.event.repository.name }}"
+        github_owner         = "${{ github.repository_owner }}"
+        github_repository    = "${{ github.event.repository.name }}"
+        github_owner_id      = "${{ github.repository_owner_id }}"
+        github_repository_id = "${{ github.repository_id }}"
 
         github_environment_name = "${{ inputs.environment }}"
 
         state_bucket_name = "${{ inputs.state-bucket }}"
 
-        create_oidc_provider       = false
-        existing_oidc_provider_arn = "${{ inputs.oidc-provider-arn }}"
+        create_oidc_provider       = ${CREATE_OIDC}
+        existing_oidc_provider_arn = ${EXISTING_OIDC}
 
         enable_bedrock_access         = true
         bedrock_model_id              = "${{ inputs.bedrock-model-id }}"
