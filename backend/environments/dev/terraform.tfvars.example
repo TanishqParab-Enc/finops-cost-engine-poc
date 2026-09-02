@@ -1,0 +1,39 @@
+project_name = "finops-poc"
+environment  = "dev"
+aws_region   = "us-east-1"
+
+github_owner      = "YOUR_GITHUB_OWNER"
+github_repository = "YOUR_REPOSITORY"
+
+# Scopes the deploy role's OIDC trust to this GitHub environment.
+github_environment_name = "dev"
+allowed_branches        = ["main"]
+
+# Created by: cd ../../bootstrap && terraform apply
+state_bucket_name = "finops-poc-tfstate-REPLACE_WITH_ACCOUNT_ID"
+
+# Apply dev FIRST with this true. Then take github_oidc_provider_arn from its
+# outputs and set create_oidc_provider = false + existing_oidc_provider_arn in
+# staging and prod. Only one OIDC provider may exist per AWS account.
+create_oidc_provider = true
+# existing_oidc_provider_arn = "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
+
+# Values below are for the US cross-region Claude Haiku 4.5 profile.
+# Regenerate with:
+#   aws bedrock get-inference-profile \
+#     --inference-profile-identifier us.anthropic.claude-haiku-4-5-20251001-v1:0
+enable_bedrock_access         = true
+bedrock_model_id              = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+bedrock_inference_profile_arn = "arn:aws:bedrock:us-east-1:REPLACE_WITH_ACCOUNT_ID:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+# AWS requires the foundation model in EVERY region the profile routes to.
+bedrock_foundation_model_arns = [
+  "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+  "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+  "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+]
+
+tags = {
+  CostCenter = "REPLACE_ME"
+  Owner      = "REPLACE_ME"
+}

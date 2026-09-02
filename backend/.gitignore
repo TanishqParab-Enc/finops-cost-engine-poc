@@ -1,0 +1,21 @@
+# Terraform state - never commit. Bootstrap uses local state.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log
+
+# Real configuration - only *.example files are committed
+terraform.tfvars
+*.auto.tfvars
+backend.hcl
+
+# Plan artifacts may contain sensitive attribute values
+*.tfplan
+tfplan.binary
+plan.json
+
+# Provider lock files are committed intentionally (reproducible builds);
+# see the note in README.md about the linux_amd64 hash requirement for CI.
+!.terraform.lock.hcl

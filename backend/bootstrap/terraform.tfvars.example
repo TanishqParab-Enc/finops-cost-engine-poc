@@ -1,0 +1,10 @@
+project_name = "finops-poc"
+aws_region   = "us-east-1"
+
+# Leave null to auto-derive: <project_name>-tfstate-<aws_account_id>
+# state_bucket_name = "finops-poc-tfstate-024125831628"
+
+noncurrent_version_retention_days = 90
+
+# DEPRECATED - S3 native locking (use_lockfile) is used instead.
+enable_legacy_dynamodb_lock = false

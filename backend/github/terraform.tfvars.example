@@ -1,0 +1,56 @@
+github_owner      = "YOUR_GITHUB_OWNER"
+github_repository = "YOUR_REPOSITORY"
+
+primary_environment = "production"
+
+# Non-secret, repository-wide. Read by .github/workflows/finops-cost-gate.yml.
+# The Infracost token is a SECRET and is set out-of-band:
+#   gh secret set INFRACOST_API_KEY --repo <owner>/<repo>
+repository_variables = {
+  AWS_REGION            = "us-east-1"
+  TF_STATE_BUCKET       = "finops-poc-tfstate-REPLACE_WITH_ACCOUNT_ID"
+  FINOPS_BEDROCK_MODEL  = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  FINOPS_BEDROCK_REGION = "us-east-1"
+  FINOPS_THRESHOLD_VALUE = "100"
+}
+
+environments = {
+  dev = {
+    # No approval gate in dev.
+    restrict_deployment_branches = false
+    variables = {
+      FINOPS_ENVIRONMENT = "dev"
+      TF_STATE_KEY       = "finops-poc/dev/terraform.tfstate"
+      # From: terraform -chdir=../environments/dev output -raw plan_role_arn
+      AWS_PLAN_ROLE_ARN   = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-dev-plan-role"
+      AWS_DEPLOY_ROLE_ARN = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-dev-deploy-role"
+    }
+  }
+
+  staging = {
+    # Numeric GitHub user IDs: gh api /users/<login> --jq .id
+    reviewer_user_ids          = []
+    prevent_self_review        = true
+    deployment_branch_patterns = ["main", "release/*"]
+    variables = {
+      FINOPS_ENVIRONMENT  = "staging"
+      TF_STATE_KEY        = "finops-poc/staging/terraform.tfstate"
+      AWS_PLAN_ROLE_ARN   = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-staging-plan-role"
+      AWS_DEPLOY_ROLE_ARN = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-staging-deploy-role"
+    }
+  }
+
+  production = {
+    # REQUIRED for production: at least one reviewer.
+    reviewer_user_ids       = []
+    reviewer_team_ids       = []
+    prevent_self_review     = true
+    only_protected_branches = true
+    variables = {
+      FINOPS_ENVIRONMENT  = "prod"
+      TF_STATE_KEY        = "finops-poc/prod/terraform.tfstate"
+      AWS_PLAN_ROLE_ARN   = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-prod-plan-role"
+      AWS_DEPLOY_ROLE_ARN = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-prod-deploy-role"
+    }
+  }
+}
