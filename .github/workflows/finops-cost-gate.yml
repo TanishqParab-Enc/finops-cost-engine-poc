@@ -239,6 +239,9 @@ jobs:
           name: finops-${{ matrix.cloud }}-${{ github.run_id }}
           path: head/.finops/
           retention-days: 90
+          # .finops is dot-prefixed, and upload-artifact@v4 skips hidden paths
+          # by default, which silently discarded the whole audit trail.
+          include-hidden-files: true
 
       # The gate is the last word: a non-zero exit stops the pipeline.
       #   1 = threshold exceeded, peer review required
