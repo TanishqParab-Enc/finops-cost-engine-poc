@@ -1,5 +1,7 @@
 terraform {
-  required_version = ">= 1.5"
+  # 1.10+ required: the deploy backend config uses use_lockfile (S3 native
+  # locking), which is not recognized by older Terraform versions.
+  required_version = ">= 1.10.0, < 2.0.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"

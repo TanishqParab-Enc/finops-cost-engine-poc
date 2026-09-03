@@ -19,6 +19,17 @@ name: FinOps Cost Gate
         default: aws
         type: choice
         options: [aws, azure, gcp]
+      deploy:
+        description: "Apply the stack after the gate passes (leave unchecked to only evaluate cost)"
+        required: false
+        default: false
+        type: boolean
+      deploy_environment:
+        description: Environment to deploy to when 'deploy' is checked
+        required: false
+        default: dev
+        type: choice
+        options: [dev, prod]
 
 permissions:
   contents: read
@@ -107,6 +118,10 @@ jobs:
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
+          # Pinned - both the runner and parser are verified against this
+          # exact version. Do not float; an untested minor/major bump could
+          # silently change command syntax or output schema.
+          version: "0.10.45"
 
       - name: Install engine
         working-directory: head
@@ -121,17 +136,19 @@ jobs:
       # Both plans use the committed terraform.tfvars, which Terraform loads
       # automatically. The cost difference therefore comes purely from what the
       # pull request changed.
+      #
+      # -backend=false is deliberate: the cost gate must never read, write or
+      # lock any live workload state (dev's or prod's). Infracost prices the
+      # plan's *planned end state*, so pricing is correct and reproducible
+      # from a fresh, empty local state every run - it does not need, and
+      # must not touch, the real deploy state.
       - name: Terraform plan (base branch = baseline cost)
         id: baseline
         continue-on-error: true
         working-directory: base/terraform/${{ matrix.cloud }}
         run: |
           set -euo pipefail
-          terraform init -input=false -no-color \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=finops-poc/${{ matrix.cloud }}/terraform.tfstate" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
-            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform init -backend=false -input=false -no-color
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/baseline-plan.json"
 
@@ -139,11 +156,7 @@ jobs:
         working-directory: head/terraform/${{ matrix.cloud }}
         run: |
           set -euo pipefail
-          terraform init -input=false -no-color \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=finops-poc/${{ matrix.cloud }}/terraform.tfstate" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
-            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform init -backend=false -input=false -no-color
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/proposed-plan.json"
 
@@ -159,7 +172,7 @@ jobs:
           FINOPS_THRESHOLD_METRIC: ${{ vars.FINOPS_THRESHOLD_METRIC || 'incremental_monthly_cost' }}
           # Bedrock uses the OIDC role already assumed above - no extra key.
           FINOPS_AI_PROVIDER: bedrock
-          FINOPS_BEDROCK_MODEL: ${{ vars.FINOPS_BEDROCK_MODEL || 'anthropic.claude-3-haiku-20240307-v1:0' }}
+          FINOPS_BEDROCK_MODEL: ${{ vars.FINOPS_BEDROCK_MODEL || 'us.anthropic.claude-haiku-4-5-20251001-v1:0' }}
           FINOPS_BEDROCK_REGION: ${{ env.AWS_REGION }}
         run: |
           set +e
@@ -226,6 +239,9 @@ jobs:
           name: finops-${{ matrix.cloud }}-${{ github.run_id }}
           path: head/.finops/
           retention-days: 90
+          # .finops is dot-prefixed, and upload-artifact@v4 skips hidden paths
+          # by default, which silently discarded the whole audit trail.
+          include-hidden-files: true
 
       # The gate is the last word: a non-zero exit stops the pipeline.
       #   1 = threshold exceeded, peer review required
@@ -240,13 +256,48 @@ jobs:
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
           esac
 
+  # Apply is NEVER reachable from a pull request. Without this guard, any PR
+  # whose cost gate passed would run a real `terraform apply -auto-approve`
+  # from the PR branch's code. Apply also targets an environment-specific
+  # workload state and var-file, so dev and prod are genuinely isolated - not
+  # just IAM-role-labelled copies of the same shared state.
   deploy:
     name: Deploy (gated)
     needs: [detect-changes, cost-gate]
-    if: needs.detect-changes.outputs.has_infra_changes == 'true' && needs.cost-gate.result == 'success'
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      inputs.deploy == true &&
+      needs.cost-gate.result == 'success'
     runs-on: ubuntu-latest
-    environment: production   # requires a manual approval reviewer in repo settings
+    environment:
+      name: ${{ inputs.deploy_environment == 'prod' && 'production' || 'dev' }}
     steps:
+      # The deploy role is a single repo-level secret pointing at ONE
+      # environment's role (see backend/README.md "Why only two tiers").
+      # Applying prod with it would silently use dev's identity, so prod
+      # requires an explicit prod-specific secret instead of falling back.
+      - name: Resolve deploy role for the target environment
+        id: role
+        env:
+          DEV_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          PROD_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
+          TARGET: ${{ inputs.deploy_environment }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "prod" ]; then
+            if [ -z "$PROD_ROLE" ]; then
+              echo "::error title=No production deploy role::AWS_DEPLOY_ROLE_ARN_PROD is not set. Refusing to deploy prod with dev's role. Apply backend/environments/prod first, then set that secret."
+              exit 1
+            fi
+            echo "arn=$PROD_ROLE" >> "$GITHUB_OUTPUT"
+          else
+            if [ -z "$DEV_ROLE" ]; then
+              echo "::error title=No deploy role::AWS_DEPLOY_ROLE_ARN is not set."
+              exit 1
+            fi
+            echo "arn=$DEV_ROLE" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3
@@ -257,16 +308,56 @@ jobs:
       - name: Configure AWS credentials (deploy role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ steps.role.outputs.arn }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform apply
+      # State key and var-file are both selected via a GitHub Actions
+      # expression (inputs.deploy_environment), not shell string
+      # substitution, so a misconfigured input fails workflow parsing/schema
+      # validation rather than silently building a wrong path at runtime.
+      # terraform.tfvars in this directory is the committed cost-gate
+      # baseline only; it is never passed as -var-file for a deploy, and the
+      # explicit -var-file below sets every variable that file also sets, so
+      # its auto-loaded values are always overridden.
+      #
+      # Plan to a file first, then apply exactly that plan - the same
+      # save-then-apply pattern already used by
+      # .github/actions/terraform-apply/action.yml for the backend layer, so
+      # the applied changes are always the reviewed ones, never a fresh plan
+      # generated at apply time.
+      - name: Terraform plan
+        id: plan
         working-directory: terraform/aws
         run: |
           set -euo pipefail
           terraform init -input=false -no-color \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=finops-poc/aws/terraform.tfstate" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="key=finops-poc/${{ inputs.deploy_environment }}/aws/terraform.tfstate" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
             -backend-config="region=${{ env.AWS_REGION }}"
-          terraform apply -input=false -no-color -auto-approve
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var-file="environments/${{ inputs.deploy_environment }}.tfvars" \
+            -out=tfplan.binary
+          terraform show -json tfplan.binary > plan.json
+
+          DESTROY=$(python3 -c "import json;d=json.load(open('plan.json'));print(sum(1 for c in d.get('resource_changes',[]) if 'delete' in c['change']['actions']))")
+          echo "destroy_count=$DESTROY" >> "$GITHUB_OUTPUT"
+          echo "Resources to destroy: $DESTROY"
+
+      # 'delete' in a resource's actions covers both a pure destroy
+      # (actions: ["delete"]) and a destructive replace (actions:
+      # ["delete","create"] / ["create","delete"]), so this single check
+      # blocks both. A workload deploy should never delete infrastructure
+      # outside a deliberate, human-reviewed change - fail closed instead.
+      - name: Block destructive apply
+        if: steps.plan.outputs.destroy_count != '0'
+        run: |
+          echo "::error title=Destructive apply blocked::Plan would destroy ${{ steps.plan.outputs.destroy_count }} resource(s) in ${{ inputs.deploy_environment }}. Apply aborted. Review the plan and apply manually if this is intended."
+          exit 1
+
+      - name: Terraform apply
+        working-directory: terraform/aws
+        run: |
+          set -euo pipefail
+          terraform apply -input=false -no-color -lock-timeout=5m tfplan.binary
