@@ -19,6 +19,17 @@ name: FinOps Cost Gate
         default: aws
         type: choice
         options: [aws, azure, gcp]
+      deploy:
+        description: "Apply the stack after the gate passes (leave unchecked to only evaluate cost)"
+        required: false
+        default: false
+        type: boolean
+      deploy_environment:
+        description: Environment to deploy to when 'deploy' is checked
+        required: false
+        default: dev
+        type: choice
+        options: [dev, prod]
 
 permissions:
   contents: read
@@ -130,7 +141,8 @@ jobs:
           terraform init -input=false -no-color \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=finops-poc/${{ matrix.cloud }}/terraform.tfstate" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
             -backend-config="region=${{ env.AWS_REGION }}"
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/baseline-plan.json"
@@ -142,7 +154,8 @@ jobs:
           terraform init -input=false -no-color \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=finops-poc/${{ matrix.cloud }}/terraform.tfstate" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
             -backend-config="region=${{ env.AWS_REGION }}"
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/proposed-plan.json"
@@ -159,7 +172,7 @@ jobs:
           FINOPS_THRESHOLD_METRIC: ${{ vars.FINOPS_THRESHOLD_METRIC || 'incremental_monthly_cost' }}
           # Bedrock uses the OIDC role already assumed above - no extra key.
           FINOPS_AI_PROVIDER: bedrock
-          FINOPS_BEDROCK_MODEL: ${{ vars.FINOPS_BEDROCK_MODEL || 'anthropic.claude-3-haiku-20240307-v1:0' }}
+          FINOPS_BEDROCK_MODEL: ${{ vars.FINOPS_BEDROCK_MODEL || 'us.anthropic.claude-haiku-4-5-20251001-v1:0' }}
           FINOPS_BEDROCK_REGION: ${{ env.AWS_REGION }}
         run: |
           set +e
@@ -240,13 +253,46 @@ jobs:
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
           esac
 
+  # Apply is NEVER reachable from a pull request. Until 2026-09-03 this job had
+  # no event guard, so any PR whose cost gate passed would have run a real
+  # `terraform apply -auto-approve` from the PR branch's code.
   deploy:
     name: Deploy (gated)
     needs: [detect-changes, cost-gate]
-    if: needs.detect-changes.outputs.has_infra_changes == 'true' && needs.cost-gate.result == 'success'
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      inputs.deploy == true &&
+      needs.cost-gate.result == 'success'
     runs-on: ubuntu-latest
-    environment: production   # requires a manual approval reviewer in repo settings
+    environment:
+      name: ${{ inputs.deploy_environment == 'prod' && 'production' || 'dev' }}
     steps:
+      # The deploy role is a single repo-level secret pointing at ONE
+      # environment's role (see backend/README.md "Why only two tiers").
+      # Applying prod with it would silently use dev's identity, so prod
+      # requires an explicit prod-specific secret instead of falling back.
+      - name: Resolve deploy role for the target environment
+        id: role
+        env:
+          DEV_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          PROD_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
+          TARGET: ${{ inputs.deploy_environment }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "prod" ]; then
+            if [ -z "$PROD_ROLE" ]; then
+              echo "::error title=No production deploy role::AWS_DEPLOY_ROLE_ARN_PROD is not set. Refusing to deploy prod with dev's role. Apply backend/environments/prod first, then set that secret."
+              exit 1
+            fi
+            echo "arn=$PROD_ROLE" >> "$GITHUB_OUTPUT"
+          else
+            if [ -z "$DEV_ROLE" ]; then
+              echo "::error title=No deploy role::AWS_DEPLOY_ROLE_ARN is not set."
+              exit 1
+            fi
+            echo "arn=$DEV_ROLE" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3
@@ -257,7 +303,7 @@ jobs:
       - name: Configure AWS credentials (deploy role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ steps.role.outputs.arn }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Terraform apply
@@ -267,6 +313,7 @@ jobs:
           terraform init -input=false -no-color \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=finops-poc/aws/terraform.tfstate" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
             -backend-config="region=${{ env.AWS_REGION }}"
           terraform apply -input=false -no-color -auto-approve
