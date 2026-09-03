@@ -36,11 +36,12 @@ locals {
   )
 
   # The GitHub Actions environment names backend.yml actually uses for the
-  # other two environments (dev/staging/production), so the shared deploy
-  # role's trust also covers them. Kept as a fixed list rather than derived
-  # from var.environment, since "prod" maps to the GitHub environment
-  # "production", not "prod".
-  all_backend_github_environments   = ["dev", "staging", "production"]
+  # other environment (dev/production - "staging" was dropped 2026-09-03: it
+  # shared dev's role/trust anyway and added no real isolation), so the
+  # shared deploy role's trust also covers it. Kept as a fixed list rather
+  # than derived from var.environment, since "prod" maps to the GitHub
+  # environment "production", not "prod".
+  all_backend_github_environments   = ["dev", "production"]
   other_backend_github_environments = setsubtract(local.all_backend_github_environments, [var.github_environment_name])
 
   common_tags = merge(
@@ -232,6 +233,11 @@ data "aws_iam_policy_document" "deploy_write" {
         "iam:DetachRolePolicy",
         "iam:TagRole",
         "iam:UntagRole",
+        # The AWS provider checks for instance profiles before deleting a
+        # role; missing this makes `terraform destroy` fail on DeleteRole
+        # after already removing the role's policies. Confirmed for real on
+        # 2026-09-03.
+        "iam:ListInstanceProfilesForRole",
         "iam:CreatePolicy",
         "iam:DeletePolicy",
         "iam:CreatePolicyVersion",

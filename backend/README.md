@@ -35,12 +35,11 @@ backend/
 │   └── finops-environment/     # composes the AWS side for one environment
 ├── environments/
 │   ├── dev/                    # AWS only - no GitHub token needed
-│   ├── staging/
 │   └── prod/
 └── github/                     # GitHub environments + variables (separate state)
 ```
 
-`environments/*/main.tf` are identical by design. **Only `terraform.tfvars` differs.** Adding `qa` or `uat` means copying an environment directory and editing its tfvars — never editing module code.
+`environments/*/main.tf` are identical by design. **Only `terraform.tfvars` differs.** Adding `staging`, `qa` or `uat` means copying an environment directory and editing its tfvars — never editing module code. (A `staging` tier existed here until 2026-09-03; it was dropped because the shared-secret design below meant its IAM roles were created but never actually used - see "Why only two tiers".)
 
 ### State boundaries
 
@@ -50,7 +49,6 @@ Each layer has its own state file, so a mistake in one cannot corrupt another:
 |---|---|
 | bootstrap | local `terraform.tfstate` (gitignored) |
 | dev | `finops-poc/dev/terraform.tfstate` |
-| staging | `finops-poc/staging/terraform.tfstate` |
 | prod | `finops-poc/prod/terraform.tfstate` |
 | github | `finops-poc/github/terraform.tfstate` |
 
@@ -121,9 +119,9 @@ terraform output plan_role_arn
 terraform output deploy_role_arn
 ```
 
-### 4. Apply `staging` and `prod` — reusing that provider
+### 4. Apply `prod` — reusing that provider
 
-In each of their `terraform.tfvars`:
+In its `terraform.tfvars`:
 
 ```hcl
 create_oidc_provider       = false
@@ -137,7 +135,7 @@ Then the same three commands.
 ```bash
 cd ../../github
 cp backend.hcl.example      backend.hcl
-cp terraform.tfvars.example terraform.tfvars   # paste role ARNs from steps 3-4
+cp terraform.tfvars.example terraform.tfvars   # paste role ARNs from step 3-4
 
 export GITHUB_TOKEN=<token with repo scope>
 terraform init -backend-config=backend.hcl
@@ -327,7 +325,8 @@ A mismatched or empty confirmation fails the job before any AWS credentials are 
 if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
 ```
 
-`dev` and `staging` do apply automatically on merge to `main`; production never does.
+No environment applies automatically on a push to `main` — see "GitHub Actions workflow" below. Dev's typed
+confirm is optional; prod's is required.
 
 ### To get real approval enforcement
 
@@ -360,21 +359,20 @@ One workflow handles the whole backend lifecycle: [.github/workflows/backend.yml
 
 | Event | What runs |
 |---|---|
-| PR touching `backend/**` | static checks → plan (all 3 environments) → PR comment |
-| Push to `main` | static checks → plan (all 3 environments, read-only) — **no apply** |
+| PR touching `backend/**` | static checks → plan (both environments) → PR comment |
+| Push to `main` | static checks → plan (both environments, read-only) — **no apply** |
 | Manual dispatch | static checks → plan → apply **only** the chosen environment |
 
 ```
-preflight ──► plan ──► apply-dev        (workflow_dispatch, environment == dev)
-(no creds)   (read-only ──► apply-staging    (workflow_dispatch, environment == staging)
-              plan role) ──► apply-prod       (workflow_dispatch, environment == prod
-                                               + typed confirm)
+preflight ──► plan ──► apply-dev   (workflow_dispatch, environment == dev)
+(no creds)   (read-only ──► apply-prod  (workflow_dispatch, environment == prod
+              plan role)                                     + typed confirm)
 ```
 
-Each `apply-*` job is independent — none `needs:` another apply job. Choosing `staging` in
-workflow_dispatch runs plan then applies **only** staging; dev and prod are untouched in that
-run. A push to `main` only re-plans all three environments for visibility and never applies
-anything, so merging a PR can never trigger an unattended change in AWS.
+Each `apply-*` job is independent — none `needs:` another apply job. Choosing `prod` in
+workflow_dispatch runs plan then applies **only** prod; dev is untouched in that run. A push to
+`main` only re-plans both environments for visibility and never applies anything, so merging a
+PR can never trigger an unattended change in AWS.
 
 ### Why one workflow
 
@@ -442,23 +440,61 @@ X Plan would destroy 1 resource(s) in dev. Apply aborted.
 
 **3. A single shared deploy role must trust every GitHub environment it will assume-role from.**
 
-This design uses one repo-level `AWS_DEPLOY_ROLE_ARN` secret for all three environments (rather than a
-separate role per environment), so the deploy role's trust policy must list every GitHub Actions
-`environment:` subject it will ever be assumed from, not just the one that created it. Hit for real on
-2026-09-02: the role was created by the `dev` environment folder with `github_environment_name = "dev"`,
-so its trust policy only allowed `...:environment:dev`. `Apply staging` then failed with:
+This design uses one repo-level `AWS_DEPLOY_ROLE_ARN` secret for every environment (rather than a separate
+role per environment), so the deploy role's trust policy must list every GitHub Actions `environment:`
+subject it will ever be assumed from, not just the one that created it. Hit for real on 2026-09-02: the role
+was created by the `dev` environment folder with `github_environment_name = "dev"`, so its trust policy only
+allowed `...:environment:dev`. `Apply staging` then failed with (staging existed at the time; see "Why only
+two tiers" below for why it was later dropped):
 
 ```
 Not authorized to perform sts:AssumeRoleWithWebIdentity
 ```
 
 Fixed by `additional_deploy_environments` on the `github-actions-roles` module: when
-`enable_backend_self_management = true`, `finops-environment` passes the two GitHub environment names the
-current environment does *not* own (e.g. dev's module call passes `["staging", "production"]`), and the
-module unions them with its own `github_environment_name` before building `deploy_subjects`. The deploy
-role's trust policy therefore lists `environment:dev`, `environment:staging` and `environment:production`
-simultaneously — the same "make the IAM scope project-wide because the CI identity already is" pattern used
-for the state-access fix above.
+`enable_backend_self_management = true`, `finops-environment` passes the GitHub environment name(s) the
+current environment does *not* own (e.g. dev's module call passes `["production"]`), and the module unions
+them with its own `github_environment_name` before building `deploy_subjects`. The deploy role's trust
+policy therefore lists `environment:dev` and `environment:production` simultaneously — the same "make the
+IAM scope project-wide because the CI identity already is" pattern used for the state-access fix above.
+
+**4. The deploy role needs `iam:ListInstanceProfilesForRole` to delete a role, not just to create one.**
+
+Hit for real on 2026-09-03 while destroying staging's roles: `terraform destroy` removed every policy and
+attachment successfully, then failed on the role itself:
+
+```
+Error: deleting IAM Role (finops-poc-staging-deploy-role): reading IAM Instance Profiles for Role: AccessDenied:
+... not authorized to perform: iam:ListInstanceProfilesForRole ...
+```
+
+The AWS provider checks a role for attached instance profiles before deleting it — a read call, but a
+different one than any of the `Get`/`List` actions already granted. Added to `ManageBackendIamWrite` alongside
+the other role-lifecycle actions.
+
+### Why only two tiers (dev + prod)
+
+This started as dev/staging/prod, matching a typical enterprise promotion pipeline. It was collapsed to
+dev + prod on 2026-09-03 after applying staging for real exposed why the extra tier added by that name
+specifically wasn't earning its keep **in this design**:
+
+- Every environment's `finops-environment` module creates its **own** plan/deploy role pair, but
+  `AWS_PLAN_ROLE_ARN`/`AWS_DEPLOY_ROLE_ARN` are single repo-level secrets. Only the ARNs from whichever
+  environment's roles those secrets point at (dev's) are ever actually assumed. Applying staging created
+  `finops-poc-staging-plan-role`/`finops-poc-staging-deploy-role` in AWS, but they sat unused — confirmed via
+  `aws iam list-roles` before they were destroyed.
+- Required-reviewer approval — the one thing that would have made "staging" meaningfully different from
+  "prod" as a promotion gate — is unavailable on this repo (see the HTTP 422 limitation above). Without it,
+  prod only differs from any other environment by a typed `confirm` string, which staging could have carried
+  equally well.
+- With one AWS account and one shared deploy identity, the three tiers gave state-file isolation and a
+  distinct name in the run history, but no real permission or blast-radius isolation beyond that.
+
+The alternative that *would* have kept 3 real tiers is per-environment GitHub Environment secrets (so
+staging's job actually assumes staging's own role) instead of repo-level secrets — a valid, more "textbook"
+design, deliberately not chosen here to keep the CI configuration simpler for a two-tier POC. Re-introducing
+a third tier (or per-environment secrets) later is a matter of copying `environments/dev/` again, not a
+module change — see `environments/*/main.tf` above.
 
 ### Backend self-management and privilege escalation
 
@@ -514,7 +550,7 @@ Actions → **Backend Terraform Destroy** → Run workflow, then fill in:
 
 | Input | Required | Value |
 |---|---|---|
-| `environment` | Yes | `dev`, `staging` or `prod` |
+| `environment` | Yes | `dev` or `prod` |
 | `confirm` | Yes | Type **`destroy-<environment>`** exactly, e.g. `destroy-dev` |
 | `confirm_oidc_impact` | Only if this environment owns the OIDC provider | Type **`yes-lock-out-all-environments`** exactly |
 
@@ -547,7 +583,7 @@ Destroying the OIDC-owning environment without realizing it would lock every env
 ### What happens to the state file
 
 `backend-destroy.yml` runs `terraform destroy` against the environment's existing state key (e.g.
-`finops-poc/staging/terraform.tfstate` in the state bucket). Destroy removes the real AWS resources **and**
+`finops-poc/prod/terraform.tfstate` in the state bucket). Destroy removes the real AWS resources **and**
 rewrites that state file to reflect zero managed resources — but it does not delete the state *object* from
 S3. The object stays at the same key, now representing an empty state, and the bucket itself is a separate
 resource (created in `bootstrap/`, protected by `prevent_destroy`) that `backend-destroy.yml` never touches.

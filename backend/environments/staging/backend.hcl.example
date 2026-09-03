@@ -1,5 +1,0 @@
-bucket       = "finops-poc-tfstate-024125831628"
-key          = "finops-poc/staging/terraform.tfstate"
-region       = "us-east-1"
-encrypt      = true
-use_lockfile = true

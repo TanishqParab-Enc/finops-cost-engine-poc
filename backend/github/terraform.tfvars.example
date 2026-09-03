@@ -27,19 +27,6 @@ environments = {
     }
   }
 
-  staging = {
-    # Numeric GitHub user IDs: gh api /users/<login> --jq .id
-    reviewer_user_ids          = []
-    prevent_self_review        = true
-    deployment_branch_patterns = ["main", "release/*"]
-    variables = {
-      FINOPS_ENVIRONMENT  = "staging"
-      TF_STATE_KEY        = "finops-poc/staging/terraform.tfstate"
-      AWS_PLAN_ROLE_ARN   = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-staging-plan-role"
-      AWS_DEPLOY_ROLE_ARN = "arn:aws:iam::REPLACE_WITH_ACCOUNT_ID:role/finops-poc-staging-deploy-role"
-    }
-  }
-
   production = {
     # VERIFIED 2026-09-02: on a PRIVATE repo owned by a personal account the
     # GitHub API rejects reviewers with HTTP 422 ("billing plan"). Leave these

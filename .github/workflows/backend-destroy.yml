@@ -20,7 +20,7 @@ name: Backend Terraform Destroy
         description: Environment to destroy
         required: true
         type: choice
-        options: [dev, staging, prod]
+        options: [dev, prod]
       confirm:
         description: "Type destroy-<environment> to confirm, e.g. destroy-dev"
         required: true
