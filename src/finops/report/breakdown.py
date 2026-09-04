@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ..models import Action, CostEstimate, ResourceCost, money
+from ..models import Action, CostConfidence, CostEstimate, ResourceCost, money
 
 # Terraform resource type -> the service a FinOps reviewer thinks in.
 _SERVICE_BY_PREFIX = (
@@ -120,9 +120,32 @@ def service_summary(estimate: CostEstimate) -> list[ServiceTotal]:
 
 
 def top_service_drivers(estimate: CostEstimate, limit: int = 5) -> list[ServiceTotal]:
-    """Services ranked by how much they moved the bill, not by absolute size."""
-    ranked = sorted(service_summary(estimate), key=lambda t: -abs(t.delta_monthly_cost))
-    return [t for t in ranked if t.delta_monthly_cost != 0][:limit] or ranked[:limit]
+    """Services ranked by actual monthly spend, largest first."""
+    return sorted(service_summary(estimate), key=lambda t: -t.new_monthly_cost)[:limit]
+
+
+# How Infracost classified each resource. Kept explicit so an unpriced resource
+# is never silently reported as costing nothing.
+COVERAGE_LABELS = {
+    CostConfidence.PRICED: "PRICED",
+    CostConfidence.USAGE_BASED: "USAGE-BASED",
+    CostConfidence.FREE: "NO DIRECT CHARGE",
+    CostConfidence.NO_PRICE: "UNSUPPORTED / UNESTIMATED",
+    CostConfidence.UNSUPPORTED: "UNSUPPORTED / UNESTIMATED",
+}
+
+
+def coverage_label(resource: ResourceCost) -> str:
+    return COVERAGE_LABELS.get(resource.confidence, resource.confidence.value)
+
+
+def coverage_breakdown(estimate: CostEstimate) -> dict[str, list[ResourceCost]]:
+    """Resources grouped by classification, in reporting order."""
+    order = ["PRICED", "USAGE-BASED", "NO DIRECT CHARGE", "UNSUPPORTED / UNESTIMATED"]
+    grouped: dict[str, list[ResourceCost]] = {}
+    for resource in estimate.resources:
+        grouped.setdefault(coverage_label(resource), []).append(resource)
+    return {k: grouped[k] for k in order if k in grouped}
 
 
 def changed_resources(estimate: CostEstimate) -> list[ResourceCost]:

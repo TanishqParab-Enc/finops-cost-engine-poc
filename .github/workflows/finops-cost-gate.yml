@@ -102,7 +102,8 @@ jobs:
               found = [load_stacks()['aws']]
           print(json.dumps([
               {"name": s.name, "dir": s.terraform_dir, "cloud": s.cloud,
-               "deployable": s.deployable, "environment": s.environment}
+               "deployable": s.deployable, "environment": s.environment,
+               "usage_file": s.usage_file or ""}
               for s in found
           ]))
           PY
@@ -316,6 +317,9 @@ jobs:
           FINOPS_AI_PROVIDER: bedrock
           FINOPS_BEDROCK_MODEL: ${{ vars.FINOPS_BEDROCK_MODEL || 'us.anthropic.claude-haiku-4-5-20251001-v1:0' }}
           FINOPS_BEDROCK_REGION: ${{ env.AWS_REGION }}
+          # Usage assumptions for consumption-priced resources (S3, CloudFront,
+          # CloudWatch). Empty for stacks that declare none.
+          FINOPS_INFRACOST_USAGE_FILE: ${{ matrix.stack.usage_file && format('{0}/head/{1}', github.workspace, matrix.stack.usage_file) || '' }}
         run: |
           set +e
           BASELINE_ARG=""

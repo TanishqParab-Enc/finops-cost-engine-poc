@@ -36,5 +36,9 @@ stacks:
     # IAM change is needed for this path.
     state_key: finops-poc/dev/web-platform/terraform.tfstate
     var_file: null
+    # S3, CloudFront and CloudWatch bill on consumption, so Terraform alone
+    # cannot price them. Passed to Infracost 0.10.45 as --usage-file; without
+    # it those resources price at zero and the breakdown understates the bill.
+    usage_file: terraform/workloads/web-platform/infracost-usage.yml
     paths:
       - terraform/workloads/web-platform/

@@ -32,6 +32,7 @@ class Stack:
     state_key: str
     paths: tuple[str, ...]
     var_file: str | None = None
+    usage_file: str | None = None
     deferred_reason: str | None = None
 
     def to_dict(self) -> dict:
@@ -43,6 +44,7 @@ class Stack:
             "environment": self.environment,
             "state_key": self.state_key,
             "var_file": self.var_file,
+            "usage_file": self.usage_file,
             "paths": list(self.paths),
             "deferred_reason": self.deferred_reason,
         }
@@ -98,6 +100,7 @@ def load_stacks(path: str | Path | None = None) -> dict[str, Stack]:
             state_key=str(_require(body, "state_key", name)),
             paths=paths,
             var_file=body.get("var_file") or None,
+            usage_file=body.get("usage_file") or None,
             deferred_reason=(body.get("deferred_reason") or None),
         )
 
