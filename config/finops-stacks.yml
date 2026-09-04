@@ -1,0 +1,40 @@
+# Stack registry for the central FinOps pipeline.
+#
+# This file is the ONLY source of Terraform directories, deployability and
+# state keys. Nothing here may be supplied by a pull request input: the gate
+# resolves a stack by name against this registry, and the trusted main run
+# re-reads it from trusted code before any deployment.
+#
+# deployable=false means the stack is priced and reported but can never be
+# applied, and a PASS must not mint a deployment cost lock for it.
+schema_version: "1.0"
+
+stacks:
+  aws:
+    terraform_dir: terraform/aws
+    cloud: aws
+    deployable: true
+    environment: dev
+    state_key: finops-poc/dev/aws/terraform.tfstate
+    var_file: environments/dev.tfvars
+    paths:
+      - terraform/aws/
+
+  web-platform:
+    terraform_dir: terraform/workloads/web-platform
+    cloud: aws
+    # Deferred: the Dev deploy role has no permission for RDS, ELB, CloudFront,
+    # Route 53, Auto Scaling, CloudWatch Logs, VPC creation, asset buckets or
+    # instance profiles. Widening it requires a separate security review.
+    deployable: false
+    deferred_reason: >-
+      Live deployment is intentionally deferred because the existing Dev
+      deployment role does not have the required AWS service permissions.
+      IAM expansion requires a separate security-reviewed change.
+    environment: dev
+    # Already covered by the project-wide finops-poc/* state permission, so no
+    # IAM change is needed for this path.
+    state_key: finops-poc/dev/web-platform/terraform.tfstate
+    var_file: null
+    paths:
+      - terraform/workloads/web-platform/

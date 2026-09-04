@@ -30,6 +30,10 @@ class GateRequest:
     baseline_plan: Path | None = None
     commit: str = ""
     execution_id: str = ""
+    stack: str | None = None
+    # A lock authorises deployment. A stack that cannot be deployed must not
+    # mint one just because it priced under the threshold.
+    allow_cost_lock: bool = True
 
 
 def _resolve_identity(request: GateRequest) -> tuple[str, str]:
@@ -98,8 +102,10 @@ def run_gate(request: GateRequest, config: Config, estimator: CostEstimator) -> 
         result.errors.append(ai_error.to_dict())
         return result
 
-    if result.status is Status.PASS:
-        lock = create_cost_lock(decision, estimate, plan, config, commit, execution_id)
+    if result.status is Status.PASS and request.allow_cost_lock:
+        lock = create_cost_lock(
+            decision, estimate, plan, config, commit, execution_id, stack=request.stack
+        )
         write_cost_lock(lock, config)
         result.cost_lock = lock
 
