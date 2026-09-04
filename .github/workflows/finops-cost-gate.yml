@@ -573,7 +573,7 @@ jobs:
           terraform plan -input=false -no-color -refresh=false -out=base.tfplan
           terraform show -json base.tfplan > "$GITHUB_WORKSPACE/s-baseline.json"
           terraform plan -input=false -no-color -refresh=false \
-            -var-file="scenarios/${{ matrix.scenario }}.tfvars" -out=prop.tfplan
+            -var-file="$GITHUB_WORKSPACE/tests/fixtures/web-platform/scenarios/${{ matrix.scenario }}.tfvars" -out=prop.tfplan
           terraform show -json prop.tfplan > "$GITHUB_WORKSPACE/s-proposed.json"
 
       - name: Price scenario with Infracost 0.10.45
@@ -587,7 +587,7 @@ jobs:
           FINOPS_INFRACOST_USAGE_FILE: >-
             ${{
               matrix.scenario == '03-s3-growth'
-              && format('{0}/terraform/workloads/web-platform/scenarios/03-s3-growth.usage.yml', github.workspace)
+              && format('{0}/tests/fixtures/web-platform/scenarios/03-s3-growth.usage.yml', github.workspace)
               || format('{0}/terraform/workloads/web-platform/infracost-usage.yml', github.workspace)
             }}
         run: |

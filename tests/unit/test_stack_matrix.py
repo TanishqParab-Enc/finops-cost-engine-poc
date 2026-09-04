@@ -389,8 +389,41 @@ class TestScenarioValidation:
     def test_all_eight_committed_scenarios_are_covered(self, gate):
         listed = set(gate["jobs"]["scenarios"]["strategy"]["matrix"]["scenario"])
         on_disk = {p.stem for p in
-                   (REPO / "terraform/workloads/web-platform/scenarios").glob("*.tfvars")}
+                   (REPO / "tests/fixtures/web-platform/scenarios").glob("*.tfvars")}
         assert listed == on_disk
+
+    def test_scenarios_are_test_fixtures_not_workload_source(self):
+        """The production workload must not carry test-only variants."""
+        workload = REPO / "terraform/workloads/web-platform"
+        assert not (workload / "scenarios").exists()
+        assert not list(workload.rglob("*-scale-up.tfvars"))
+        assert (REPO / "tests/fixtures/web-platform/scenarios").is_dir()
+
+    def test_workload_keeps_only_canonical_configuration(self):
+        workload = REPO / "terraform/workloads/web-platform"
+        roots = {p.name for p in workload.glob("*") if p.is_file()}
+        assert roots == {
+            "main.tf", "variables.tf", "outputs.tf", "locals.tf", "provider.tf",
+            "versions.tf", "terraform.tfvars", "terraform.tfvars.example",
+            "infracost-usage.yml",
+        }, roots
+
+    def test_workload_modules_are_intact(self):
+        modules = {p.name for p in
+                   (REPO / "terraform/workloads/web-platform/modules").iterdir() if p.is_dir()}
+        assert modules == {
+            "networking", "alb", "compute", "database", "object-storage",
+            "cdn", "dns", "monitoring", "iam",
+        }
+
+    def test_normal_estimation_path_needs_no_scenario_file(self, gate):
+        """The cost-gate job plans the workload as committed; only the separate
+        scenario job passes a -var-file."""
+        steps = gate["jobs"]["cost-gate"]["steps"]
+        proposed = next(s for s in steps
+                        if s.get("name") == "Terraform plan (PR head = proposed cost)")
+        assert "-var-file" not in proposed["run"]
+        assert "scenarios" not in proposed["run"]
 
     def test_scenarios_never_fail_the_pull_request(self, gate):
         job = gate["jobs"]["scenarios"]
