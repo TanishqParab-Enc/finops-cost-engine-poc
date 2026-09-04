@@ -9,7 +9,7 @@ instance_type    = "t3.large"
 desired_capacity = 1
 min_capacity     = 1
 max_capacity     = 3
-root_volume_size = 35
+root_volume_size = 40
 
 rds_instance_class = "db.t3.small"
 rds_storage        = 50
