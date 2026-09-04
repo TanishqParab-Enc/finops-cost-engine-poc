@@ -137,18 +137,33 @@ jobs:
       # automatically. The cost difference therefore comes purely from what the
       # pull request changed.
       #
-      # -backend=false is deliberate: the cost gate must never read, write or
-      # lock any live workload state (dev's or prod's). Infracost prices the
-      # plan's *planned end state*, so pricing is correct and reproducible
-      # from a fresh, empty local state every run - it does not need, and
-      # must not touch, the real deploy state.
+      # The cost gate must never read, write or lock any live workload state
+      # (dev's or prod's). `init -backend=false` cannot achieve that: it
+      # records no backend at all, so the following `plan` re-reads the
+      # `backend "s3"` block in main.tf and fails with "Backend
+      # initialization required" (reproduced in CI and a clean checkout).
+      #
+      # Instead each step writes a local-backend override into its own
+      # throwaway base/ or head/ checkout. Terraform then plans against an
+      # ephemeral local state: no S3 call, no .tflock, no live state access.
+      # Infracost prices the plan's *planned end state*, so pricing stays
+      # correct and reproducible from empty state every run.
+      #
+      # This file is generated at runtime and never committed. It must NOT be
+      # copied into the deploy job - a `backend "local"` block there makes
+      # every S3 -backend-config argument invalid and breaks deployment.
       - name: Terraform plan (base branch = baseline cost)
         id: baseline
         continue-on-error: true
         working-directory: base/terraform/${{ matrix.cloud }}
         run: |
           set -euo pipefail
-          terraform init -backend=false -input=false -no-color
+          cat > backend_override.tf <<'EOF'
+          terraform {
+            backend "local" {}
+          }
+          EOF
+          terraform init -input=false -no-color
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/baseline-plan.json"
 
@@ -156,7 +171,12 @@ jobs:
         working-directory: head/terraform/${{ matrix.cloud }}
         run: |
           set -euo pipefail
-          terraform init -backend=false -input=false -no-color
+          cat > backend_override.tf <<'EOF'
+          terraform {
+            backend "local" {}
+          }
+          EOF
+          terraform init -input=false -no-color
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
           terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/proposed-plan.json"
 
