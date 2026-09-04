@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+from ..cost.reconcile import reconcile_estimate
 from ..models import GateResult, Status, as_float
+from .breakdown import change_label, ordered_resources, service_summary, top_service_drivers
 
 MARKER = "<!-- finops-cost-gate -->"
+
+# A PR comment with hundreds of rows is unreadable and GitHub truncates it
+# anyway. The full breakdown always lands in cost-estimate.json.
+MAX_RESOURCE_ROWS = 15
 
 
 def _money(value: float | None, currency: str) -> str:
     if value is None:
         return "n/a"
     return f"{currency} {value:,.2f}"
+
+
+def _signed(value: float | None, currency: str) -> str:
+    if value is None:
+        return "n/a"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{_money(value, currency)}"
 
 
 def render_markdown(result: GateResult) -> str:
@@ -74,13 +87,75 @@ def render_markdown(result: GateResult) -> str:
             lines.append(f"- **{error.get('category')}**: {error.get('message')}{detail}")
 
     if estimate and estimate.resources:
-        lines += ["", "### Cost drivers", "", "| Resource | Cloud | Change |", "|---|---|---|"]
-        for resource in estimate.top_cost_drivers(5):
-            delta = as_float(resource.delta_monthly_cost) or 0.0
-            sign = "+" if delta > 0 else ""
+        currency = estimate.currency
+        rows = ordered_resources(estimate)
+        shown = rows[:MAX_RESOURCE_ROWS]
+
+        lines += [
+            "",
+            "### Cost breakdown",
+            "",
+            "| Resource | Service | Change | Monthly | Incremental |",
+            "|---|---|---|---|---|",
+        ]
+        for resource in shown:
             lines.append(
-                f"| `{resource.address}` | {resource.cloud.value} | "
-                f"{sign}{_money(delta, estimate.currency)}/mo |"
+                f"| `{resource.address}` | {resource.resource_type} | {change_label(resource)} | "
+                f"{_money(as_float(resource.new_monthly_cost), currency)} | "
+                f"{_signed(as_float(resource.delta_monthly_cost), currency)} |"
+            )
+        if len(rows) > len(shown):
+            hidden = len(rows) - len(shown)
+            lines += [
+                "",
+                f"_{hidden} further priced resource(s) omitted. The complete breakdown, "
+                f"including every cost component, is in `cost-estimate.json` in this run's "
+                f"`finops-{estimate.resources[0].cloud.value}` artifact._",
+            ]
+
+        services = service_summary(estimate)
+        if services:
+            lines += [
+                "",
+                "### Service summary",
+                "",
+                "| Service | Resources | Monthly | Incremental |",
+                "|---|---|---|---|",
+            ]
+            for total in services:
+                lines.append(
+                    f"| {total.service} | {total.resource_count} | "
+                    f"{_money(float(total.new_monthly_cost), currency)} | "
+                    f"{_signed(float(total.delta_monthly_cost), currency)} |"
+                )
+            lines.append(
+                f"| **Total (Infracost)** | {len(estimate.resources)} | "
+                f"**{_money(as_float(estimate.new_monthly_cost), currency)}** | "
+                f"**{_signed(as_float(estimate.incremental_monthly_cost), currency)}** |"
+            )
+
+        drivers = top_service_drivers(estimate)
+        if drivers:
+            lines += ["", "### Top cost drivers", ""]
+            for rank, total in enumerate(drivers, start=1):
+                lines.append(
+                    f"{rank}. **{total.service}** — "
+                    f"{_signed(float(total.delta_monthly_cost), currency)}/mo "
+                    f"(now {_money(float(total.new_monthly_cost), currency)}/mo)"
+                )
+
+        # Observability only: Infracost's totals above stay authoritative even
+        # when the per-resource rows do not add up to them.
+        checks = reconcile_estimate(estimate)
+        broken = [c for c in checks if not c.ok and not c.explained_by_coverage]
+        lines += ["", "### Reconciliation", ""]
+        for check in checks:
+            prefix = "**MISMATCH** — " if check in broken else ""
+            lines.append(f"- {prefix}{check.message(currency)}")
+        if broken:
+            lines.append(
+                "- The Infracost totals shown above remain authoritative and drive the "
+                "decision; the breakdown is reporting only."
             )
 
     ai = result.ai
@@ -107,38 +182,6 @@ def render_markdown(result: GateResult) -> str:
         ]
 
     return "\n".join(lines) + "\n"
-
-
-def render_console(result: GateResult) -> str:
-    decision = result.decision
-    estimate = result.estimate
-    if not decision or not estimate:
-        header = f"FinOps gate: {result.status.value}"
-        errors = "\n".join(
-            f"  ! {e.get('category')}: {e.get('message')}" for e in result.errors
-        )
-        return f"{header}\n{errors}" if errors else header
-
-    currency = estimate.currency
-    icon = {Status.PASS: "PASS", Status.FAIL: "FAIL", Status.ERROR: "ERROR"}[result.status]
-    lines = [
-        f"FinOps cost gate: {icon}",
-        f"  previous      : {_money(as_float(estimate.previous_monthly_cost), currency)}/mo",
-        f"  projected     : {_money(as_float(estimate.new_monthly_cost), currency)}/mo",
-        f"  incremental   : {_money(as_float(estimate.incremental_monthly_cost), currency)}/mo",
-        f"  metric        : {decision.metric}",
-        f"  observed      : {as_float(decision.observed_value)}",
-        f"  threshold     : {as_float(decision.threshold_value)} ({decision.unit})",
-        f"  comparison    : observed {decision.comparison} threshold",
-        f"  estimator     : {estimate.estimator} [{estimate.trust.value}]",
-    ]
-    for reason in decision.reasons:
-        lines.append(f"  reason        : {reason}")
-    for error in result.errors:
-        lines.append(f"  error         : {error.get('category')}: {error.get('message')}")
-    if result.cost_lock:
-        lines.append(f"  cost lock     : {result.cost_lock.get('lock_id')}")
-    return "\n".join(lines)
 
 
 def render_exception_banner(approval: dict) -> str:
