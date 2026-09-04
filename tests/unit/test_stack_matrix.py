@@ -373,3 +373,142 @@ class TestPreservedSemantics:
         job = json.dumps(gate["jobs"]["cost-gate"])
         assert "AWS_DEPLOY_ROLE_ARN" not in job
         assert "AWS_PLAN_ROLE_ARN" in job
+
+
+class TestScenarioValidation:
+    """Scenario matrix inside the central workflow (no second workflow)."""
+
+    def test_scenarios_job_lives_in_the_central_workflow(self, gate):
+        assert "scenarios" in gate["jobs"]
+
+    def test_scenarios_only_run_when_web_platform_is_selected(self, gate):
+        assert gate["jobs"]["scenarios"]["if"] == (
+            "contains(needs.detect-changes.outputs.stacks, '\"web-platform\"')"
+        )
+
+    def test_all_eight_committed_scenarios_are_covered(self, gate):
+        listed = set(gate["jobs"]["scenarios"]["strategy"]["matrix"]["scenario"])
+        on_disk = {p.stem for p in
+                   (REPO / "terraform/workloads/web-platform/scenarios").glob("*.tfvars")}
+        assert listed == on_disk
+
+    def test_scenarios_never_fail_the_pull_request(self, gate):
+        job = gate["jobs"]["scenarios"]
+        assert job["strategy"]["fail-fast"] is False
+        price = next(s for s in job["steps"] if s.get("name") == "Price scenario with Infracost 0.10.45")
+        assert price["continue-on-error"] is True
+
+    def test_scenarios_use_the_plan_role_never_the_deploy_role(self, gate):
+        job = json.dumps(gate["jobs"]["scenarios"])
+        assert "AWS_PLAN_ROLE_ARN" in job
+        assert "AWS_DEPLOY_ROLE_ARN" not in job
+
+    def test_scenarios_never_mint_a_cost_lock(self, gate):
+        job = gate["jobs"]["scenarios"]
+        price = next(s for s in job["steps"] if s.get("name") == "Price scenario with Infracost 0.10.45")
+        assert "--no-cost-lock" in price["run"]
+        guard = next(s for s in job["steps"] if s.get("name") == "Assert no cost lock was created")
+        assert guard["if"] == "always()"
+        assert "exit 1" in guard["run"]
+
+    def test_s3_growth_scenario_uses_its_own_usage_file(self, gate):
+        price = next(s for s in gate["jobs"]["scenarios"]["steps"]
+                     if s.get("name") == "Price scenario with Infracost 0.10.45")
+        usage_expr = price["env"]["FINOPS_INFRACOST_USAGE_FILE"]
+        assert "03-s3-growth.usage.yml" in usage_expr
+        assert "infracost-usage.yml" in usage_expr
+
+    def test_no_second_finops_workflow_was_reintroduced(self):
+        assert not (REPO / ".github/workflows/web-platform-finops.yml").exists()
+
+
+class TestCostCreep:
+    """Trusted main must never trust the PR's number - it re-derives cost."""
+
+    def test_exception_rejects_cost_above_its_own_ceiling(self):
+        record = create_exception(
+            _decision(Status.FAIL, "150.00"), _estimate("150.00"), _plan(), _plan_doc(),
+            make_config(approvers=[APPROVER], threshold=100), pr_number=PR, head_sha=HEAD,
+            approver=APPROVER, justification="approved at 150", stack="web-platform",
+            max_incremental_cost=165.0)
+        crept = verify_exception(
+            record, _plan(), _plan_doc(), _estimate("180.00"),
+            make_config(approvers=[APPROVER], threshold=100),
+            pr_number=PR, pr_author=AUTHOR, head_sha=HEAD, stack="web-platform",
+            reviews=_reviews())
+        assert any("exceeds the approved ceiling" in p for p in crept)
+
+    def test_exception_accepts_cost_within_its_ceiling(self):
+        record = create_exception(
+            _decision(Status.FAIL, "150.00"), _estimate("150.00"), _plan(), _plan_doc(),
+            make_config(approvers=[APPROVER], threshold=100), pr_number=PR, head_sha=HEAD,
+            approver=APPROVER, justification="approved at 150", stack="web-platform",
+            max_incremental_cost=165.0)
+        ok = verify_exception(
+            record, _plan(), _plan_doc(), _estimate("160.00"),
+            make_config(approvers=[APPROVER], threshold=100),
+            pr_number=PR, pr_author=AUTHOR, head_sha=HEAD, stack="web-platform",
+            reviews=_reviews())
+        assert ok == []
+
+    def test_deploy_job_reruns_terraform_plan_rather_than_trusting_the_pr(self, gate):
+        """Trusted main must plan again, not read the PR's cached numbers."""
+        names = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]
+        assert "Terraform plan" in names
+        plan = next(s for s in gate["jobs"]["deploy"]["steps"] if s.get("name") == "Terraform plan")
+        assert "terraform plan" in plan["run"]
+
+
+class TestStackedPRSelection:
+    """A pull request stacked on another branch must still select stacks by
+    the files it actually changes, not by everything already on its base."""
+
+    def test_selection_only_reflects_the_named_changed_files(self):
+        # Simulates diffing a stacked PR against its true merge-base: only the
+        # files this PR's commits touch are passed in, regardless of what its
+        # base branch already contains.
+        changed_by_this_pr_only = ["terraform/workloads/web-platform/variables.tf"]
+        assert [s.name for s in select_stacks(changed_by_this_pr_only, REGISTRY)] == ["web-platform"]
+
+    def test_files_already_on_the_base_branch_do_not_leak_in(self):
+        # A stacked PR's diff must not include terraform/aws/main.tf just
+        # because an earlier, unrelated PR in the stack touched it.
+        changed_by_this_pr_only = ["terraform/workloads/web-platform/main.tf"]
+        selected = {s.name for s in select_stacks(changed_by_this_pr_only, REGISTRY)}
+        assert selected == {"web-platform"}
+        assert "aws" not in selected
+
+
+class TestNoValidationDeploymentAuthority:
+    def test_pass_estimate_for_a_non_deployable_stack_writes_no_lock(self, tmp_path):
+        from finops.gate import GateRequest, run_gate
+        from finops.cost.factory import build_estimator
+        import json as _json
+
+        config = make_config(output_dir=str(tmp_path), estimator="infracost_fixture")
+        proposed = tmp_path / "p.json"
+        baseline = tmp_path / "b.json"
+        fixture = {
+            "version": "0.2", "currency": "USD", "totalMonthlyCost": "10.00",
+            "projects": [{"breakdown": {"resources": []}}],
+        }
+        proposed.write_text(_json.dumps(fixture), encoding="utf-8")
+        baseline.write_text(_json.dumps({**fixture, "totalMonthlyCost": "10.00"}), encoding="utf-8")
+
+        plan_doc = {
+            "terraform_version": "1.11.0", "format_version": "1.2",
+            "resource_changes": [], "variables": {"region": {"value": "us-east-1"}},
+        }
+        plan_path = tmp_path / "plan.json"
+        plan_path.write_text(_json.dumps(plan_doc), encoding="utf-8")
+
+        estimator = build_estimator(config, artifact_dir=tmp_path,
+                                    proposed_fixture=proposed, baseline_fixture=baseline)
+        result = run_gate(
+            GateRequest(proposed_plan=plan_path, baseline_plan=plan_path,
+                        stack="web-platform", allow_cost_lock=False),
+            config, estimator)
+
+        assert result.status is Status.PASS
+        assert result.cost_lock is None
+        assert not (tmp_path / "cost-lock.json").exists()
