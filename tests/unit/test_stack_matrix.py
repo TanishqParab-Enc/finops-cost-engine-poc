@@ -283,8 +283,20 @@ class TestSingleCentralWorkflow:
     def test_detect_uses_the_registry(self, gate):
         run = next(s for s in gate["jobs"]["detect-changes"]["steps"]
                    if s.get("id") == "detect")["run"]
-        assert "from finops.stacks import load_stacks, select_stacks" in run
+        assert "from finops.stacks import select_stacks" in run
         assert "deployable" in run
+
+    def test_detect_has_no_fallback_stack(self, gate):
+        """A change matching no stack must evaluate nothing. Defaulting to aws
+        priced an untouched stack and minted a cost lock for it."""
+        run = next(s for s in gate["jobs"]["detect-changes"]["steps"]
+                   if s.get("id") == "detect")["run"]
+        assert "load_stacks()['aws']" not in run
+        assert "found = [" not in run
+
+    def test_gate_is_skipped_when_no_stack_is_selected(self, gate):
+        cond = " ".join(gate["jobs"]["cost-gate"]["if"].split())
+        assert "needs.detect-changes.outputs.stacks != '[]'" in cond
 
     def test_reports_are_scoped_per_stack(self, gate_text):
         assert "<!-- stack:${{ matrix.stack.name }} -->" in gate_text

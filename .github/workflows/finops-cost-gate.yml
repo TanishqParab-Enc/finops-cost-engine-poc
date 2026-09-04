@@ -95,16 +95,16 @@ jobs:
           # arbitrary Terraform directory or mark itself deployable.
           STACKS=$(python - <<'PY'
           import json
-          from finops.stacks import load_stacks, select_stacks
+          from finops.stacks import select_stacks
           files = json.load(open('changes.json'))['infrastructure_files']
-          found = select_stacks(files)
-          if not found:
-              found = [load_stacks()['aws']]
+          # No fallback. A change that maps to no stack must evaluate nothing:
+          # defaulting to aws priced an untouched stack and minted a real cost
+          # lock for it, which is a deployment authorisation nobody asked for.
           print(json.dumps([
               {"name": s.name, "dir": s.terraform_dir, "cloud": s.cloud,
                "deployable": s.deployable, "environment": s.environment,
                "usage_file": s.usage_file or ""}
-              for s in found
+              for s in select_stacks(files)
           ]))
           PY
           )
@@ -122,9 +122,12 @@ jobs:
     name: Cost gate (${{ matrix.stack.name }})
     needs: detect-changes
     if: |
-      needs.detect-changes.outputs.has_infra_changes == 'true' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'push'
+      needs.detect-changes.outputs.stacks != '' &&
+      needs.detect-changes.outputs.stacks != '[]' && (
+        needs.detect-changes.outputs.has_infra_changes == 'true' ||
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'push'
+      )
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
