@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from ..cost.reconcile import reconcile_estimate
 from ..models import GateResult, Status, as_float
-from .breakdown import change_label, ordered_resources, service_summary, top_service_drivers
+from .breakdown import (
+    change_label,
+    coverage_breakdown,
+    ordered_resources,
+    service_summary,
+    top_service_drivers,
+)
 
 MARKER = "<!-- finops-cost-gate -->"
 
@@ -136,13 +142,27 @@ def render_markdown(result: GateResult) -> str:
 
         drivers = top_service_drivers(estimate)
         if drivers:
-            lines += ["", "### Top cost drivers", ""]
+            lines += ["", "### Top cost drivers", "", "Ranked by actual monthly cost.", ""]
             for rank, total in enumerate(drivers, start=1):
                 lines.append(
-                    f"{rank}. **{total.service}** — "
-                    f"{_signed(float(total.delta_monthly_cost), currency)}/mo "
-                    f"(now {_money(float(total.new_monthly_cost), currency)}/mo)"
+                    f"{rank}. **{total.service}** — Monthly cost "
+                    f"{_money(float(total.new_monthly_cost), currency)} · "
+                    f"Incremental impact {_signed(float(total.delta_monthly_cost), currency)}"
                 )
+
+        # Never let a resource Infracost could not price read as free.
+        groups = coverage_breakdown(estimate)
+        if groups:
+            lines += ["", "### Coverage", "",
+                      "| Classification | Resources | Monthly |", "|---|---|---|"]
+            for label, items in groups.items():
+                subtotal = sum((float(r.new_monthly_cost) for r in items), 0.0)
+                lines.append(f"| {label} | {len(items)} | {_money(subtotal, currency)} |")
+            unpriced = groups.get("UNSUPPORTED / UNESTIMATED", [])
+            if unpriced:
+                lines += ["", "Not estimated because usage data or pricing coverage is "
+                          "unavailable - these are **not** zero-cost:"]
+                lines += [f"- `{r.address}` ({r.resource_type})" for r in unpriced[:10]]
 
         # Observability only: Infracost's totals above stay authoritative even
         # when the per-resource rows do not add up to them.

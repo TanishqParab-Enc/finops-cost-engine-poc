@@ -209,7 +209,7 @@ class TestServiceGrouping:
         # the raw sum by a fraction of a cent per service.
         assert abs(summed - expected) <= DEFAULT_TOLERANCE
 
-    def test_top_drivers_rank_by_absolute_movement(self):
+    def test_top_drivers_rank_by_actual_monthly_cost(self):
         est = _synthetic(
             [
                 _resource("aws_instance.a", "aws_instance", 0, 5),
@@ -219,12 +219,51 @@ class TestServiceGrouping:
             previous=110, new=35,
         )
         drivers = top_service_drivers(est)
+        assert [d.service for d in drivers] == ["RDS", "Load Balancing", "EC2"]
+
+    def test_a_large_but_unchanged_service_still_ranks(self):
+        """Ranking by spend, not by movement, keeps the biggest line item visible
+        even when a pull request did not touch it."""
+        est = _synthetic(
+            [
+                _resource("aws_db_instance.b", "aws_db_instance", 500, 500),
+                _resource("aws_instance.a", "aws_instance", 0, 5),
+            ],
+            previous=500, new=505,
+        )
+        drivers = top_service_drivers(est)
         assert drivers[0].service == "RDS"
-        assert all(d.delta_monthly_cost != 0 for d in drivers)
+        assert drivers[0].delta_monthly_cost == Decimal("0.00")
 
     def test_top_drivers_fall_back_when_nothing_moved(self):
         est = _synthetic([_resource("aws_lb.c", "aws_lb", 10, 10)], previous=10, new=10)
         assert [d.service for d in top_service_drivers(est)] == ["Load Balancing"]
+
+    def test_coverage_classification_is_explicit(self):
+        from finops.report.breakdown import coverage_breakdown, coverage_label
+
+        est = _synthetic(
+            [
+                _resource("a", "aws_instance", 0, 60),
+                _resource("b", "aws_s3_bucket", 0, 1, confidence=CostConfidence.USAGE_BASED),
+                _resource("c", "aws_vpc", 0, 0, confidence=CostConfidence.FREE),
+                _resource("d", "aws_thing", 0, 0, confidence=CostConfidence.NO_PRICE),
+            ],
+            previous=0, new=61,
+        )
+        groups = coverage_breakdown(est)
+        assert list(groups) == [
+            "PRICED", "USAGE-BASED", "NO DIRECT CHARGE", "UNSUPPORTED / UNESTIMATED",
+        ]
+        assert coverage_label(est.resources[3]) == "UNSUPPORTED / UNESTIMATED"
+
+    def test_unpriced_is_not_reported_as_free(self):
+        """An unestimated resource must not be grouped with genuinely free ones."""
+        from finops.report.breakdown import coverage_label
+
+        free = _resource("c", "aws_vpc", 0, 0, confidence=CostConfidence.FREE)
+        unpriced = _resource("d", "aws_thing", 0, 0, confidence=CostConfidence.NO_PRICE)
+        assert coverage_label(free) != coverage_label(unpriced)
 
     def test_ordered_resources_put_movers_first(self):
         est = _synthetic(

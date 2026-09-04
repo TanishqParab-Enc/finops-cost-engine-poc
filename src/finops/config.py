@@ -217,7 +217,8 @@ def _build(raw: dict[str, Any], source_path: str) -> Config:
             binary=_env("INFRACOST_BINARY") or infracost_raw.get("binary") or "infracost",
             command_style=command_style,
             config_file=infracost_raw.get("config_file"),
-            usage_file=infracost_raw.get("usage_file"),
+            # Usage assumptions are per stack, so CI supplies them per job.
+            usage_file=_env("FINOPS_INFRACOST_USAGE_FILE") or infracost_raw.get("usage_file"),
         ),
     )
 

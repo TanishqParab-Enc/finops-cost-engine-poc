@@ -62,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--json", action="store_true", help="Emit the gate result as JSON")
     analyze.add_argument("--markdown", action="store_true", help="Emit the PR comment markdown")
+    analyze.add_argument("--stack", default=None, help="Stack this evaluation belongs to")
+    analyze.add_argument(
+        "--no-cost-lock",
+        action="store_true",
+        help="Never write a cost lock (stacks that cannot be deployed)",
+    )
 
     normalize = sub.add_parser("normalize-plan", help="Show the normalised plan")
     _add_config_arg(normalize)
@@ -71,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(verify)
     verify.add_argument("--lock", required=True, help="Path to cost-lock.json")
     verify.add_argument("--plan", required=True, help="Terraform plan JSON to verify against")
+    verify.add_argument("--stack", default=None, help="Stack the lock must authorise")
 
     create_exc = sub.add_parser(
         "create-exception",
@@ -90,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cost ceiling; re-evaluation above this invalidates the exception",
     )
     create_exc.add_argument("--ttl-days", type=int, default=None, help="Lifetime in days")
+    create_exc.add_argument("--stack", default=None, help="Stack this exception authorises")
     create_exc.add_argument("--out", required=True, help="Where to write the exception record")
 
     verify_exc = sub.add_parser(
@@ -109,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON file of GitHub pull request reviews (live API output)",
     )
     verify_exc.add_argument("--verified-commit", default=None, help="Commit being verified")
+    verify_exc.add_argument("--stack", default=None, help="Stack the exception must authorise")
 
     return parser
 
@@ -146,6 +155,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             baseline_plan=Path(args.baseline_plan) if args.baseline_plan else None,
             commit=args.commit,
             execution_id=args.execution_id,
+            stack=args.stack,
+            allow_cost_lock=not args.no_cost_lock,
         ),
         config,
         estimator,
@@ -178,7 +189,7 @@ def _cmd_verify_lock(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     lock = load_cost_lock(args.lock)
     plan = normalize_plan_file(args.plan)
-    problems = verify_cost_lock(lock, plan, config)
+    problems = verify_cost_lock(lock, plan, config, stack=args.stack)
 
     if problems:
         print("Cost lock is INVALID for this plan:")
@@ -240,6 +251,7 @@ def _cmd_create_exception(args: argparse.Namespace) -> int:
         head_sha=args.head_sha,
         approver=args.approver,
         justification=args.justification,
+        stack=args.stack,
         max_incremental_cost=args.max_incremental_cost,
         ttl_days=args.ttl_days,
     )
@@ -298,6 +310,7 @@ def _cmd_verify_exception(args: argparse.Namespace) -> int:
         pr_number=args.pr,
         pr_author=args.pr_author,
         head_sha=args.head_sha,
+        stack=args.stack,
         reviews=reviews,
     )
 

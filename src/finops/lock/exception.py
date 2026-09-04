@@ -95,6 +95,7 @@ def create_exception(
     head_sha: str,
     approver: str,
     justification: str,
+    stack: str | None = None,
     max_incremental_cost: float | None = None,
     ttl_days: int | None = None,
 ) -> dict:
@@ -139,6 +140,9 @@ def create_exception(
         "exception_id": str(uuid.uuid4()),
         "status": "APPROVED",
         "finops_decision": Status.FAIL.value,
+        # Which Terraform root this authorises. An exception for one stack must
+        # never be accepted for another.
+        "stack": stack,
         "pr": int(pr_number),
         "head_sha": head_sha,
         "plan_fingerprint": plan.fingerprint(),
@@ -244,6 +248,7 @@ def verify_exception(
     pr_number: int | None = None,
     pr_author: str | None = None,
     head_sha: str | None = None,
+    stack: str | None = None,
     reviews: list[dict] | None = None,
     now: datetime | None = None,
 ) -> list[str]:
@@ -252,6 +257,12 @@ def verify_exception(
 
     if not config.exceptions.enabled:
         return ["Budget exceptions are disabled by policy"]
+
+    if stack is not None and record.get("stack") != stack:
+        problems.append(
+            f"Exception was approved for stack {record.get('stack')!r} and cannot "
+            f"authorise stack {stack!r}"
+        )
 
     if record.get("schema_version") != SCHEMA_VERSION:
         problems.append(
@@ -384,6 +395,7 @@ def build_approval_record(
         "finops_decision": Status.FAIL.value,
         "exception_approval": "APPROVED" if approved else "REJECTED",
         "exception_id": record.get("exception_id"),
+        "stack": record.get("stack"),
         "pr": pr_number if pr_number is not None else record.get("pr"),
         "head_sha": head_sha or record.get("head_sha"),
         "verified_commit": verified_commit,
