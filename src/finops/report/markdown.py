@@ -52,7 +52,15 @@ def render_markdown(result: GateResult) -> str:
             lines.append(f"`lock_id: {result.cost_lock.get('lock_id')}`")
             lines.append(f"`plan_fingerprint: {result.cost_lock.get('plan_fingerprint')}`")
     elif result.status is Status.FAIL:
-        lines.append("**Peer review is required before proceeding.** No cost lock was created.")
+        lines += [
+            "### `FINOPS: BLOCKED`",
+            "",
+            "**Peer approval required.** Peer review is required before proceeding. "
+            "No cost lock was created.",
+            "",
+            "This change exceeds the budget threshold and cannot continue on the normal "
+            "path. A budget exception approved by another collaborator is required.",
+        ]
     else:
         lines.append(
             "The cost impact could not be established, so the pipeline failed safe. "
@@ -98,6 +106,74 @@ def render_markdown(result: GateResult) -> str:
             f"({estimate.trust.value}) · execution `{result.execution_id}` · commit `{result.commit[:12]}`</sub>",
         ]
 
+    return "\n".join(lines) + "\n"
+
+
+def render_console(result: GateResult) -> str:
+    decision = result.decision
+    estimate = result.estimate
+    if not decision or not estimate:
+        header = f"FinOps gate: {result.status.value}"
+        errors = "\n".join(
+            f"  ! {e.get('category')}: {e.get('message')}" for e in result.errors
+        )
+        return f"{header}\n{errors}" if errors else header
+
+    currency = estimate.currency
+    icon = {Status.PASS: "PASS", Status.FAIL: "FAIL", Status.ERROR: "ERROR"}[result.status]
+    lines = [
+        f"FinOps cost gate: {icon}",
+        f"  previous      : {_money(as_float(estimate.previous_monthly_cost), currency)}/mo",
+        f"  projected     : {_money(as_float(estimate.new_monthly_cost), currency)}/mo",
+        f"  incremental   : {_money(as_float(estimate.incremental_monthly_cost), currency)}/mo",
+        f"  metric        : {decision.metric}",
+        f"  observed      : {as_float(decision.observed_value)}",
+        f"  threshold     : {as_float(decision.threshold_value)} ({decision.unit})",
+        f"  comparison    : observed {decision.comparison} threshold",
+        f"  estimator     : {estimate.estimator} [{estimate.trust.value}]",
+    ]
+    for reason in decision.reasons:
+        lines.append(f"  reason        : {reason}")
+    for error in result.errors:
+        lines.append(f"  error         : {error.get('category')}: {error.get('message')}")
+    if result.cost_lock:
+        lines.append(f"  cost lock     : {result.cost_lock.get('lock_id')}")
+    return "\n".join(lines)
+
+
+def render_exception_banner(approval: dict) -> str:
+    """Appended after a verified exception. The FAIL above is left intact."""
+    approved = approval.get("exception_approval") == "APPROVED"
+    currency = approval.get("currency") or ""
+    lines = ["", "---", ""]
+    if approved:
+        lines += [
+            "## ✅ Budget exception APPROVED",
+            "",
+            "The FinOps decision above is unchanged. This change remains over budget and "
+            "was allowed to proceed only by an explicit, audited peer approval.",
+            "",
+            "| | |",
+            "|---|---|",
+            f"| FinOps decision | **{approval.get('finops_decision')}** (unchanged) |",
+            f"| Exception approval | **{approval.get('exception_approval')}** |",
+            f"| Approver | `{approval.get('approver')}` |",
+            f"| Approved incremental cost | {currency} {approval.get('approved_incremental_cost')}/mo |",
+            f"| Approved ceiling | {currency} {approval.get('max_incremental_cost')}/mo |",
+            f"| Expires | {approval.get('expires_at')} |",
+            f"| Exception id | `{approval.get('exception_id')}` |",
+            "",
+            "Re-approval is required if the Terraform change, the resolved configuration, "
+            "the threshold, or the cost moves above the ceiling.",
+        ]
+    else:
+        lines += [
+            "## ⛔ Budget exception REJECTED",
+            "",
+            "`FINOPS: BLOCKED` — the supplied exception does not authorise this change.",
+            "",
+        ]
+        lines += [f"- {p}" for p in approval.get("problems", [])]
     return "\n".join(lines) + "\n"
 
 

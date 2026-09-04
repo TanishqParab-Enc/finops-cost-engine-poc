@@ -104,3 +104,22 @@ cost_lock:
   # A lock is bound to the fingerprint of the normalised plan. If the Terraform
   # change is modified, the fingerprint changes and the old lock is rejected.
   bind_to_plan_fingerprint: true
+
+# ---------------------------------------------------------------------------
+# Budget exceptions (peer-approved override for an over-threshold change)
+# ---------------------------------------------------------------------------
+# An exception never turns FAIL into PASS. The FinOps decision stays FAIL and
+# the exception is recorded alongside it as a separate, audited fact.
+exceptions:
+  enabled: true
+  # Approvers are deliberately NOT listed here by default - set FINOPS_APPROVERS
+  # as a repository variable so a pull request cannot add itself to the
+  # allowlist it is about to be judged by. An empty allowlist rejects every
+  # exception.
+  approvers: []
+  max_ttl_days: 7
+  # The re-evaluated cost may drift up to this multiple of the approved cost
+  # before the exception is treated as stale.
+  max_ceiling_ratio: 1.1
+  require_non_author_approval: true
+  require_review_approval: true

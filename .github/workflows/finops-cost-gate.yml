@@ -10,6 +10,7 @@ name: FinOps Cost Gate
     paths:
       - 'terraform/**'
       - 'config/finops-policy.yaml'
+      - 'finops-exceptions/**'
       - '.github/workflows/finops-cost-gate.yml'
   # Trusted post-merge execution. The PR gate runs PR-branch code, so its cost
   # lock is audit evidence only - never an authorisation. This push run re-runs
@@ -20,6 +21,7 @@ name: FinOps Cost Gate
     paths:
       - 'terraform/**'
       - 'config/finops-policy.yaml'
+      - 'finops-exceptions/**'
       - '.github/workflows/finops-cost-gate.yml'
   workflow_dispatch:
     inputs:
@@ -319,6 +321,69 @@ jobs:
             --execution-id "${{ github.run_id }}"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
+      # An over-threshold change may proceed only with an audited, peer-approved
+      # exception. The FinOps decision stays FAIL either way - this decides
+      # whether that specific overspend was explicitly accepted for this exact
+      # change. Authorisation comes from the live GitHub reviews API, never from
+      # repository content, so a pull request cannot approve itself.
+      - name: Evaluate budget exception
+        id: exception
+        if: steps.gate.outputs.exit_code == '1'
+        working-directory: head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          PR_EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
+          FINOPS_APPROVERS: ${{ vars.FINOPS_APPROVERS }}
+        run: |
+          set -euo pipefail
+          echo "valid=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT" = "pull_request" ]; then
+            PR="$PR_EVENT_NUMBER"; HEAD_SHA="$PR_EVENT_HEAD"; AUTHOR="$PR_EVENT_AUTHOR"
+          else
+            gh api "repos/$REPO/commits/$SHA/pulls" > pr.json
+            PR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['number'] if d else '')")
+            HEAD_SHA=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['head']['sha'] if d else '')")
+            AUTHOR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['user']['login'] if d else '')")
+          fi
+
+          if [ -z "$PR" ]; then
+            echo "::error title=No pull request::Cannot authorise a budget exception without an associated pull request."
+            exit 1
+          fi
+
+          RECORD="finops-exceptions/pr-${PR}.json"
+          if [ ! -f "$RECORD" ]; then
+            echo "::notice title=FINOPS BLOCKED::No budget exception found at $RECORD. Peer approval is required."
+            exit 0
+          fi
+
+          gh api "repos/$REPO/pulls/${PR}/reviews" --paginate > reviews.json
+
+          set +e
+          finops verify-exception \
+            --exception "$RECORD" \
+            --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
+            --estimate .finops/cost-estimate.json \
+            --pr "$PR" \
+            --head-sha "$HEAD_SHA" \
+            --pr-author "$AUTHOR" \
+            --reviews reviews.json \
+            --verified-commit "$SHA"
+          RC=$?
+          set -e
+
+          if [ "$RC" -eq 0 ]; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=FINOPS BLOCKED::The budget exception does not authorise this change."
+          fi
+
       - name: Publish gate summary
         if: always()
         working-directory: head
@@ -387,15 +452,27 @@ jobs:
             --plan "$GITHUB_WORKSPACE/proposed-plan.json"
 
       # The gate is the last word: a non-zero exit stops the pipeline.
-      #   1 = threshold exceeded, peer review required
+      #   1 = threshold exceeded, peer approval required (unless an approved
+      #       budget exception authorises this exact change)
       #   2 = cost could not be trusted, failing safe
       - name: Enforce gate
         if: always()
+        env:
+          EXCEPTION_VALID: ${{ steps.exception.outputs.valid }}
         run: |
           CODE="${{ steps.gate.outputs.exit_code }}"
           case "$CODE" in
             0) echo "PASS - cost locked, pipeline may continue." ;;
-            1) echo "::error::FinOps threshold exceeded. Peer review required before merging."; exit 1 ;;
+            1)
+              if [ "$EXCEPTION_VALID" = "true" ]; then
+                echo "FINOPS: BLOCKED (finops_decision=FAIL)"
+                echo "exception_approval=APPROVED - the overspend was explicitly accepted"
+                echo "by a peer for this exact change. The FinOps decision is unchanged."
+              else
+                echo "::error::FinOps threshold exceeded. Peer approval required before merging."
+                exit 1
+              fi
+              ;;
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
           esac
 
