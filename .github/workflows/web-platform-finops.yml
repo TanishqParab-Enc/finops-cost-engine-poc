@@ -1,0 +1,349 @@
+name: FinOps Web Platform (validation)
+
+# Validation only. This workflow prices terraform/workloads/web-platform and
+# reports the result - it never applies, never writes a cost lock and never
+# touches live Terraform state. Deployment of this workload is deliberately not
+# implemented: the Dev deploy role currently has no permission for RDS, ELB,
+# CloudFront, Route 53, Auto Scaling, CloudWatch Logs, VPC creation, asset S3
+# buckets or instance profiles, and widening it needs a separate security
+# review. The existing terraform/aws path in finops-cost-gate.yml is untouched.
+
+# Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
+"on":
+  pull_request:
+    paths:
+      - 'terraform/workloads/web-platform/**'
+      - '.github/workflows/web-platform-finops.yml'
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Scenario to evaluate (validation only - this workflow cannot deploy)"
+        required: false
+        default: all
+        type: choice
+        options: [all, none]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write   # AWS OIDC, for Bedrock only - no deploy role is assumed
+
+env:
+  PYTHON_VERSION: '3.12'
+  TERRAFORM_VERSION: '1.11.0'
+  AWS_REGION: us-east-1
+  # The workload's Terraform root. Every job asserts this before planning so a
+  # copy-paste can never point this workflow at terraform/aws.
+  WORKLOAD_DIR: terraform/workloads/web-platform
+
+jobs:
+  cost-gate:
+    name: Web platform cost gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: head
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.base_ref || github.event.repository.default_branch }}
+          path: base
+
+      # Guards against this workflow ever pricing the wrong stack. The paths are
+      # literal, so this is defence in depth rather than the only control.
+      - name: Assert the Terraform root is web-platform
+        run: |
+          set -euo pipefail
+          ROOT="head/${WORKLOAD_DIR}"
+          for f in main.tf variables.tf versions.tf modules/compute/main.tf modules/database/main.tf; do
+            if [ ! -f "$ROOT/$f" ]; then
+              echo "::error title=Wrong Terraform root::${ROOT} is not the web-platform workload (missing $f)."
+              exit 1
+            fi
+          done
+          if grep -rq 'backend "s3"' "$ROOT"; then
+            echo "::error title=Unsafe backend::web-platform must not declare an S3 backend; this workflow plans hermetically."
+            exit 1
+          fi
+          if [ "$ROOT" = "head/terraform/aws" ]; then
+            echo "::error title=Wrong Terraform root::Refusing to run against the terraform/aws production stack."
+            exit 1
+          fi
+          echo "Terraform root confirmed: $ROOT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          # Same pin as finops-cost-gate.yml. The runner and parser are verified
+          # against this exact version.
+          version: "0.10.45"
+
+      - name: Record the Infracost version actually executed
+        run: infracost --version
+
+      - name: Install engine
+        working-directory: head
+        run: pip install --quiet -e '.[bedrock]'
+
+      # The plan role only. No deploy role is assumed anywhere in this workflow.
+      - name: Configure AWS credentials (OIDC, plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # This workload declares no backend at all, so `init` records a local
+      # backend and the plan runs against empty state. No override file is
+      # needed and no live state can be reached.
+      - name: Terraform validate + plan (base branch = baseline cost)
+        id: baseline
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "base/${WORKLOAD_DIR}"
+          terraform init -input=false -no-color
+          terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
+          terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/baseline-plan.json"
+
+      - name: Terraform validate + plan (PR head = proposed cost)
+        run: |
+          set -euo pipefail
+          cd "head/${WORKLOAD_DIR}"
+          terraform fmt -check -recursive
+          terraform init -input=false -no-color
+          terraform validate -no-color
+          terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
+          terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/proposed-plan.json"
+
+      - name: FinOps cost gate (web platform)
+        id: gate
+        working-directory: head
+        continue-on-error: true
+        env:
+          INFRACOST_CLI_AUTHENTICATION_TOKEN: ${{ secrets.INFRACOST_API_KEY }}
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+          FINOPS_THRESHOLD_VALUE: ${{ vars.FINOPS_THRESHOLD_VALUE || '100' }}
+          FINOPS_THRESHOLD_METRIC: ${{ vars.FINOPS_THRESHOLD_METRIC || 'incremental_monthly_cost' }}
+          FINOPS_AI_PROVIDER: bedrock
+          FINOPS_BEDROCK_MODEL: ${{ vars.FINOPS_BEDROCK_MODEL || 'us.anthropic.claude-haiku-4-5-20251001-v1:0' }}
+          FINOPS_BEDROCK_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set +e
+          BASELINE_ARG=""
+          if [ -f "$GITHUB_WORKSPACE/baseline-plan.json" ]; then
+            BASELINE_ARG="--baseline-plan $GITHUB_WORKSPACE/baseline-plan.json"
+          else
+            echo "::warning::No baseline plan for web-platform; incremental cost equals full projected cost."
+          fi
+
+          finops analyze \
+            --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
+            $BASELINE_ARG \
+            --commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --execution-id "${{ github.run_id }}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      # A lock is an authorisation to deploy. Nothing deploys from this
+      # workflow, so any lock produced here is discarded and its absence is
+      # asserted rather than assumed.
+      - name: Discard any cost lock (validation-only workflow)
+        if: always()
+        working-directory: head
+        run: |
+          set -euo pipefail
+          rm -f .finops/cost-lock.json
+          if [ -f .finops/cost-lock.json ]; then
+            echo "::error title=Unexpected cost lock::A cost lock survived in a validation-only workflow."
+            exit 1
+          fi
+          echo "No cost lock is published by this workflow."
+
+      - name: Publish gate summary
+        if: always()
+        working-directory: head
+        run: |
+          {
+            echo "## FinOps web-platform cost analysis"
+            echo ""
+            echo "Terraform root: \`${WORKLOAD_DIR}\`"
+            echo ""
+            if [ -f .finops/pr-comment.md ]; then cat .finops/pr-comment.md; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'head/.finops/pr-comment.md';
+            if (!fs.existsSync(path)) return;
+
+            const marker = '<!-- finops-web-platform -->';
+            const body = marker + '\n### Terraform root: `terraform/workloads/web-platform`\n'
+              + fs.readFileSync(path, 'utf8').replace('<!-- finops-cost-gate -->', '');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Upload FinOps artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-web-platform-${{ github.run_id }}
+          path: head/.finops/
+          retention-days: 90
+          # .finops is dot-prefixed and upload-artifact@v4 skips hidden paths.
+          include-hidden-files: true
+
+      - name: Enforce gate
+        if: always()
+        run: |
+          CODE="${{ steps.gate.outputs.exit_code }}"
+          case "$CODE" in
+            0) echo "PASS - web-platform change is within the FinOps threshold." ;;
+            1) echo "::error::FinOps threshold exceeded for web-platform. Peer review is required."; exit 1 ;;
+            *) echo "::error::Cost could not be established for web-platform. Failing safe (exit $CODE)."; exit 1 ;;
+          esac
+
+  # Prices every committed scenario against the committed baseline so the
+  # PASS and BLOCKED sides of the threshold are both demonstrated with real
+  # Infracost numbers. Informational: several scenarios are deliberately over
+  # budget, so this job must not fail the pull request.
+  scenarios:
+    name: Scenario ${{ matrix.scenario }}
+    if: github.event_name == 'pull_request' || inputs.scenario == 'all'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - 01-small-change
+          - 02-ec2-scale-up
+          - 03-s3-growth
+          - 04-rds-scale-up
+          - 05-asg-capacity
+          - 06-multi-resource
+          - 07-no-cost-change
+          - 08-resource-removal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert the Terraform root is web-platform
+        run: |
+          set -euo pipefail
+          test -f "${WORKLOAD_DIR}/modules/database/main.tf"
+          test -f "${WORKLOAD_DIR}/scenarios/${{ matrix.scenario }}.tfvars"
+          echo "Scenario ${{ matrix.scenario }} against ${WORKLOAD_DIR}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          version: "0.10.45"
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      - name: Plan baseline and scenario
+        run: |
+          set -euo pipefail
+          cd "${WORKLOAD_DIR}"
+          terraform init -input=false -no-color
+          terraform plan -input=false -no-color -refresh=false -out=base.tfplan
+          terraform show -json base.tfplan > "$GITHUB_WORKSPACE/s-baseline.json"
+          terraform plan -input=false -no-color -refresh=false \
+            -var-file="scenarios/${{ matrix.scenario }}.tfvars" -out=prop.tfplan
+          terraform show -json prop.tfplan > "$GITHUB_WORKSPACE/s-proposed.json"
+
+      - name: Price scenario with Infracost 0.10.45
+        id: price
+        continue-on-error: true
+        env:
+          INFRACOST_CLI_AUTHENTICATION_TOKEN: ${{ secrets.INFRACOST_API_KEY }}
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+          FINOPS_OUTPUT_DIR: ${{ github.workspace }}/scenario-${{ matrix.scenario }}
+          # AI is explanatory only and adds nothing to a scenario matrix.
+          FINOPS_AI_PROVIDER: none
+        run: |
+          set +e
+          finops analyze \
+            --plan "$GITHUB_WORKSPACE/s-proposed.json" \
+            --baseline-plan "$GITHUB_WORKSPACE/s-baseline.json" \
+            --commit "${{ github.sha }}" \
+            --execution-id "${{ github.run_id }}-${{ matrix.scenario }}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Discard any cost lock (validation-only workflow)
+        if: always()
+        run: rm -f "$GITHUB_WORKSPACE/scenario-${{ matrix.scenario }}/cost-lock.json"
+
+      - name: Summarise scenario decision
+        if: always()
+        run: |
+          set -euo pipefail
+          DIR="$GITHUB_WORKSPACE/scenario-${{ matrix.scenario }}"
+          CODE="${{ steps.price.outputs.exit_code }}"
+          case "$CODE" in
+            0) VERDICT="PASS" ;;
+            1) VERDICT="BLOCKED (over threshold)" ;;
+            *) VERDICT="ERROR (failed closed)" ;;
+          esac
+          {
+            echo "### ${{ matrix.scenario }} — ${VERDICT}"
+            echo ""
+            if [ -f "$DIR/pr-comment.md" ]; then
+              sed 's|<!-- finops-cost-gate -->||' "$DIR/pr-comment.md"
+            else
+              echo "_No estimate produced._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scenario artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-web-platform-scenario-${{ matrix.scenario }}-${{ github.run_id }}
+          path: scenario-${{ matrix.scenario }}/
+          retention-days: 90
+          include-hidden-files: true
