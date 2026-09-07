@@ -278,13 +278,32 @@ class TestApprovalCli:
             capture_output=True, text=True)
 
     def test_reject_emits_the_exact_states_and_message(self, tmp_path):
+        """A deliberate business rejection exits 0 - it is a decision, not an
+        infrastructure failure."""
         proc = self._approve(tmp_path, action="reject")
-        assert proc.returncode == 1
+        assert proc.returncode == 0, proc.stderr
         payload = json.loads(proc.stdout)
         assert payload["finops_decision"] == "BLOCK"
         assert payload["approval_status"] == "REJECTED"
         assert payload["deployment_authorization"] == "DENIED"
         assert payload["message"] == "Deployment cancelled because the cost estimate was rejected."
+
+    def test_reject_reports_the_required_context(self, tmp_path):
+        proc = self._approve(tmp_path, action="reject")
+        payload = json.loads(proc.stdout)
+        assert payload["pr"] == PR
+        assert payload["stack"] == STACK
+        assert payload["terraform_dir"] == TF_DIR
+        assert payload["incremental_monthly_cost"] == 259.02
+        assert payload["threshold"] == 100.0
+
+    def test_reject_is_refused_for_an_unauthorised_actor(self, tmp_path):
+        proc = self._approve(tmp_path, action="reject", actor="mallory")
+        assert proc.returncode != 0
+
+    def test_reject_is_refused_outside_workflow_dispatch(self, tmp_path):
+        proc = self._approve(tmp_path, action="reject", event="pull_request")
+        assert proc.returncode != 0
 
     def test_reject_mints_no_record(self, tmp_path):
         out = tmp_path / "approved.json"
@@ -357,28 +376,59 @@ class TestApprovalWorkflowWiring:
 
     def test_actor_is_authorised_before_any_other_step(self, gate):
         steps = [s.get("name", s.get("uses")) for s in gate["jobs"]["finops-approval"]["steps"]]
-        assert steps.index("Authorise the approver") < steps.index("Reject the cost estimate")
         assert steps.index("Authorise the approver") < steps.index(
-            "Record the approval for each blocked stack")
+            "Resolve the pull request being decided")
+        assert steps.index("Authorise the approver") < steps.index(
+            "Record the decision for each blocked stack")
 
-    def test_rejection_prints_the_exact_message_and_fails(self, gate):
+    def test_rejection_is_verified_and_bound_like_an_approval(self, gate):
+        """A rejection is a decision about a specific priced change, so it
+        goes through the same resolve/locate/download binding as approve."""
+        steps = gate["jobs"]["finops-approval"]["steps"]
+        for name in ("Resolve the pull request being decided",
+                     "Locate the pull request's cost evaluation",
+                     "Download that evaluation's artifacts",
+                     "Record the decision for each blocked stack"):
+            step = next(s for s in steps if s.get("name") == name)
+            assert "if" not in step, f"{name} must run for reject too"
+
+    def test_only_approve_uploads_a_record(self, gate):
+        upload = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                      if s.get("name") == "Upload the approval record")
+        assert upload["if"] == "inputs.finops_action == 'approve'"
+
+    def test_rejection_is_not_reported_as_an_infrastructure_failure(self, gate):
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Reject the cost estimate")
+                    if s.get("name") == "Publish the decision")
         assert "Deployment cancelled because the cost estimate was rejected." in step["run"]
-        assert "exit 1" in step["run"]
+        assert "::error" not in step["run"]
 
     def test_head_sha_comes_from_the_api_not_an_input(self, gate):
         triggers = gate.get("on") or gate.get(True)
         assert "head_sha" not in triggers["workflow_dispatch"]["inputs"]
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Resolve the pull request being approved")
+                    if s.get("name") == "Resolve the pull request being decided")
         assert "pulls/$PR_NUMBER" in step["run"]
+
+    def test_only_an_open_pull_request_can_be_decided(self, gate):
+        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                    if s.get("name") == "Resolve the pull request being decided")
+        assert '"$STATE" != "open"' in step["run"]
 
     def test_approval_binds_to_the_terraform_root(self, gate):
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Record the approval for each blocked stack")
+                    if s.get("name") == "Record the decision for each blocked stack")
         assert "--terraform-dir" in step["run"]
         assert "--run-actor" in step["run"] and "--expected-approver" in step["run"]
+
+    def test_an_approval_dispatch_runs_nothing_else(self, gate):
+        """detect-changes is skipped, and cost-gate / scenarios / deploy all
+        need it - so no Terraform, Infracost, OIDC or fixtures run."""
+        cond = " ".join(gate["jobs"]["detect-changes"]["if"].split())
+        assert cond == (
+            "github.event_name != 'workflow_dispatch' || inputs.finops_action == 'none'")
+        for jid in ("cost-gate", "scenarios"):
+            assert "detect-changes" in gate["jobs"][jid]["needs"]
 
     def test_no_sleep_or_polling_waits_for_the_decision(self, gate_text):
         code = [ln for ln in gate_text.splitlines()

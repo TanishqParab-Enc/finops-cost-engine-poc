@@ -81,6 +81,11 @@ env:
 jobs:
   detect-changes:
     name: Detect infrastructure changes
+    # An approve/reject dispatch decides on an evaluation that already
+    # happened. Skipping detection here also skips cost-gate, scenarios and
+    # deploy (all of which need it), so an approval runs finops-approval and
+    # nothing else - no Terraform, no Infracost, no AWS OIDC, no fixtures.
+    if: github.event_name != 'workflow_dispatch' || inputs.finops_action == 'none'
     runs-on: ubuntu-latest
     outputs:
       has_infra_changes: ${{ steps.detect.outputs.has_infra_changes }}
@@ -421,6 +426,7 @@ jobs:
           set -euo pipefail
           mkdir -p .finops
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/finops-cost-gate.yml"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           cat >> .finops/pr-comment.md <<EOF
 
           ---
@@ -433,14 +439,28 @@ jobs:
           deployment_authorization = DENIED
           \`\`\`
 
-          This overspend needs an explicit decision from \`$FINOPS_APPROVER\`.
+          **1.** This change is **BLOCKED**: the incremental monthly cost exceeds the
+          threshold.
+          **2.** It needs an explicit **APPROVE** or **REJECT** from \`$FINOPS_APPROVER\`.
+          Nothing deploys until then.
 
-          **[Open the FinOps Cost Gate workflow]($RUN_URL)** -> **Run workflow** -> then:
+          To decide:
 
-          | To | Set \`finops_action\` | Set \`approval_pr\` |
-          |----|----------------------|--------------------|
-          | **APPROVE** this cost | \`approve\` | \`$PR_NUMBER\` |
-          | **REJECT** this cost | \`reject\` | \`$PR_NUMBER\` |
+          **3.** Go to **[Actions -> FinOps Cost Gate]($RUN_URL)** and click **Run workflow**.
+          **4.** Under *Use workflow from*, select this pull request's branch: \`$BRANCH\`.
+          **5.** Set **finops_action** to \`approve\` or \`reject\`.
+          **6.** Set **approval_pr** to \`$PR_NUMBER\`.
+          **7.** Click **Run workflow**.
+
+          > **If the \`finops_action\` field is not shown:** GitHub builds that form from
+          > the workflow file on the default branch (\`$DEFAULT_BRANCH\`), so the field
+          > only appears once this change is merged there. Until then use the CLI, which
+          > reads the inputs from the branch you pass:
+          >
+          > \`\`\`
+          > gh workflow run finops-cost-gate.yml --repo ${{ github.repository }} \\
+          >   --ref $BRANCH -f finops_action=approve -f approval_pr=$PR_NUMBER
+          > \`\`\`
 
           Approving does **not** turn this into a PASS - \`finops_decision\` stays
           \`BLOCK\`. It only sets \`deployment_authorization = AUTHORIZED\`, bound to
@@ -770,34 +790,12 @@ jobs:
           fi
           echo "Approval action '${{ inputs.finops_action }}' requested by ${{ github.actor }}."
 
-      # Rejection short-circuits: no plan, no estimate, no record. There is
-      # deliberately no artifact a later run could mistake for authorisation.
-      - name: Reject the cost estimate
-        if: inputs.finops_action == 'reject'
-        run: |
-          set -euo pipefail
-          {
-            echo "## FinOps cost estimate REJECTED"
-            echo ""
-            echo '```'
-            echo "finops_decision          = BLOCK"
-            echo "approval_status          = REJECTED"
-            echo "deployment_authorization = DENIED"
-            echo '```'
-            echo ""
-            echo "Deployment cancelled because the cost estimate was rejected."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "finops_decision=BLOCK"
-          echo "approval_status=REJECTED"
-          echo "deployment_authorization=DENIED"
-          echo "::error title=Cost estimate rejected::Deployment cancelled because the cost estimate was rejected."
-          exit 1
-
-      # Resolves the head SHA from the live API, never from an input, so the
-      # approval cannot be bound to a SHA the dispatcher simply typed in.
-      - name: Resolve the pull request being approved
+      # Both APPROVE and REJECT are bound to the same evaluation, so the
+      # resolve/locate/download steps below run for either action - a
+      # rejection is a decision about a specific priced change, not a blanket
+      # "no". Only the record-minting step differs.
+      - name: Resolve the pull request being decided
         id: pr
-        if: inputs.finops_action == 'approve'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -805,20 +803,24 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$PR_NUMBER" ]; then
-            echo "::error title=No pull request::approval_pr is required when approving."
+            echo "::error title=No pull request::approval_pr is required for approve or reject."
             exit 1
           fi
           gh api "repos/$REPO/pulls/$PR_NUMBER" > pr.json
+          STATE=$(python3 -c "import json;print(json.load(open('pr.json'))['state'])")
+          if [ "$STATE" != "open" ]; then
+            echo "::error title=Pull request not open::PR #$PR_NUMBER is '$STATE'. Only an open pull request can be decided."
+            exit 1
+          fi
           HEAD_SHA=$(python3 -c "import json;print(json.load(open('pr.json'))['head']['sha'])")
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "Approving PR #$PR_NUMBER at head $HEAD_SHA"
+          echo "Deciding PR #$PR_NUMBER at head $HEAD_SHA"
 
-      # The evaluation being approved is the pull request's own cost-gate run
-      # for that exact head SHA. A new commit on the PR produces a new head
-      # SHA, so a stale approval can never be pointed at newer code.
+      # The evaluation being decided is the pull request's own cost-gate run
+      # for that exact head SHA. A new commit produces a new head SHA, so a
+      # stale request can never be pointed at newer code.
       - name: Locate the pull request's cost evaluation
         id: eval_run
-        if: inputs.finops_action == 'approve'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -833,14 +835,13 @@ jobs:
           print(sorted(done, key=lambda r: r['id'])[-1]['id'] if done else '')
           ")
           if [ -z "$RUN_ID" ]; then
-            echo "::error title=No cost evaluation::No completed FinOps Cost Gate run was found for $HEAD_SHA. Let the pull request's cost gate finish before approving."
+            echo "::error title=No cost evaluation::No completed FinOps Cost Gate run was found for $HEAD_SHA. Let the pull request's cost gate finish first."
             exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "Approving the cost evaluation produced by run $RUN_ID"
+          echo "Deciding the cost evaluation produced by run $RUN_ID"
 
       - name: Download that evaluation's artifacts
-        if: inputs.finops_action == 'approve'
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -849,15 +850,19 @@ jobs:
           pattern: finops-*
           path: artifacts
 
-      - name: Record the approval for each blocked stack
-        if: inputs.finops_action == 'approve'
+      # `finops approve` re-checks the attested event/actor and refuses any
+      # evaluation that is not a FAIL, so neither action can be recorded
+      # against something that was never BLOCKED.
+      - name: Record the decision for each blocked stack
+        id: decision
         env:
           PR_NUMBER: ${{ inputs.approval_pr }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          ACTION: ${{ inputs.finops_action }}
         run: |
           set -euo pipefail
           mkdir -p finops-approval
-          APPROVED=0
+          DECIDED=0
 
           for authz in artifacts/*/authorization.json; do
             [ -f "$authz" ] || continue
@@ -866,7 +871,7 @@ jobs:
             DECISION=$(python3 -c "import json;print(json.load(open('$authz'))['finops_decision'])")
 
             if [ "$DECISION" != "BLOCK" ]; then
-              echo "Stack '$STACK' is $DECISION - no approval needed."
+              echo "Stack '$STACK' is $DECISION - no decision needed."
               continue
             fi
 
@@ -877,8 +882,13 @@ jobs:
             print(get_stack(os.environ['STACK']).terraform_dir)
             ")
 
+            OUT_ARG=""
+            if [ "$ACTION" = "approve" ]; then
+              OUT_ARG="--out finops-approval/${STACK}.json"
+            fi
+
             finops approve \
-              --action approve \
+              --action "$ACTION" \
               --result "$DIR/gate-result.json" \
               --plan "$DIR/proposed-plan.json" \
               --pr "$PR_NUMBER" \
@@ -888,26 +898,51 @@ jobs:
               --run-event "${{ github.event_name }}" \
               --run-actor "${{ github.actor }}" \
               --expected-approver "$FINOPS_APPROVER" \
-              --out "finops-approval/${STACK}.json"
-            APPROVED=$((APPROVED + 1))
+              $OUT_ARG | tee "decision-${STACK}.txt"
+
+            DECIDED=$((DECIDED + 1))
           done
 
-          if [ "$APPROVED" -eq 0 ]; then
-            echo "::error title=Nothing to approve::No BLOCKED stack was found in this run."
+          if [ "$DECIDED" -eq 0 ]; then
+            echo "::error title=Nothing to decide::No BLOCKED stack was found in the evaluation for $HEAD_SHA."
             exit 1
           fi
 
-          {
-            echo "## FinOps cost estimate APPROVED"
-            echo ""
-            echo '```'
-            echo "finops_decision          = BLOCK   (unchanged - approval never rewrites the decision)"
-            echo "approval_status          = APPROVED"
-            echo "deployment_authorization = AUTHORIZED"
-            echo '```'
-            echo ""
-            echo "Approved by ${{ github.actor }} for PR #$PR_NUMBER at $HEAD_SHA."
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish the decision
+        if: always() && steps.decision.outcome == 'success'
+        env:
+          PR_NUMBER: ${{ inputs.approval_pr }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          ACTION: ${{ inputs.finops_action }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" = "approve" ]; then
+            {
+              echo "## FinOps cost estimate APPROVED"
+              echo ""
+              echo '```'
+              echo "finops_decision          = BLOCK   (unchanged - approval never rewrites the decision)"
+              echo "approval_status          = APPROVED"
+              echo "deployment_authorization = AUTHORIZED"
+              echo '```'
+              echo ""
+              echo "Approved by ${{ github.actor }} for PR #$PR_NUMBER at \`$HEAD_SHA\`."
+              echo ""
+              cat decision-*.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Deployment cancelled because the cost estimate was rejected."
+              echo ""
+              echo '```'
+              cat decision-*.txt
+              echo '```'
+              echo ""
+              echo "No approval record was produced, so no later run can treat this as authorised."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Cost estimate rejected::Deployment cancelled because the cost estimate was rejected."
+          fi
+          cat decision-*.txt
 
       - name: Upload the approval record
         if: inputs.finops_action == 'approve'

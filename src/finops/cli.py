@@ -464,8 +464,11 @@ def _rebuild_decision_from_result(result_raw: dict, config):
 def _cmd_approve(args: argparse.Namespace) -> int:
     """Record the human APPROVE/REJECT choice made in a workflow_dispatch run.
 
-    Rejection short-circuits: nothing is minted, so there is no artifact a
-    later run could mistake for an authorisation.
+    Both actions are verified identically - attested event, attested actor,
+    and an evaluation that really was a FAIL. Rejection is a deliberate
+    business outcome, so it exits 0 rather than masquerading as a system
+    failure; it simply mints no record, and nothing downstream can treat the
+    absence of a record as authorisation.
     """
     from .gate import (
         APPROVAL_APPROVED,
@@ -473,43 +476,25 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         REJECTION_MESSAGE,
     )
     from .lock.exception import create_exception
-    from .models import Status
+    from .models import Status, as_float
     from .plan.normalizer import load_plan_json
 
     config = load_config(args.config)
 
-    def emit(payload: dict, code: int) -> int:
-        if args.json:
-            print(json.dumps(payload))
-        else:
-            for key, value in payload.items():
-                print(f"{key}: {value}")
-        return code
-
-    if args.action == "reject":
-        return emit(
-            {
-                "finops_decision": "BLOCK",
-                "approval_status": APPROVAL_REJECTED,
-                "deployment_authorization": "DENIED",
-                "message": REJECTION_MESSAGE,
-            },
-            EXIT_FAIL,
-        )
-
-    actor = (args.run_actor or "").strip().lower()
-    expected = (args.expected_approver or "").strip().lower()
     if args.run_event != "workflow_dispatch":
         print(
-            f"::error::Approval must come from a workflow_dispatch run, not "
+            f"::error::A decision must come from a workflow_dispatch run, not "
             f"{args.run_event!r}.",
             file=sys.stderr,
         )
         return EXIT_ERROR
+
+    actor = (args.run_actor or "").strip().lower()
+    expected = (args.expected_approver or "").strip().lower()
     if not expected or actor != expected:
         print(
             f"::error::{args.run_actor!r} is not the authorised approver "
-            f"({args.expected_approver!r}). Refusing to record an approval.",
+            f"({args.expected_approver!r}). Refusing to record a decision.",
             file=sys.stderr,
         )
         return EXIT_ERROR
@@ -517,14 +502,44 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     result_raw = json.loads(Path(args.result).read_text(encoding="utf-8"))
     if result_raw.get("status") != Status.FAIL.value:
         print(
-            f"Refusing to approve: gate status is {result_raw.get('status')!r}, "
-            f"expected FAIL (nothing to approve).",
+            f"Refusing to decide: gate status is {result_raw.get('status')!r}, "
+            f"expected FAIL (nothing to approve or reject).",
             file=sys.stderr,
         )
         return EXIT_ERROR
 
     decision = _rebuild_decision_from_result(result_raw, config)
     estimate = _rebuild_estimate_from_dict(result_raw.get("cost") or {})
+    incremental = as_float(estimate.incremental_monthly_cost) or 0.0
+    threshold = as_float(decision.threshold_value)
+
+    if args.action == "reject":
+        payload = {
+            "message": REJECTION_MESSAGE,
+            "pr": args.pr,
+            "stack": args.stack,
+            "terraform_dir": args.terraform_dir,
+            "incremental_monthly_cost": incremental,
+            "threshold": threshold,
+            "currency": estimate.currency,
+            "finops_decision": "BLOCK",
+            "approval_status": APPROVAL_REJECTED,
+            "deployment_authorization": "DENIED",
+            "rejected_by": args.run_actor,
+        }
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print(REJECTION_MESSAGE)
+            print(f"PR:                       #{args.pr}")
+            print(f"Stack:                    {args.stack}")
+            print(f"Terraform root:           {args.terraform_dir}")
+            print(f"Incremental monthly cost: {estimate.currency} {incremental}")
+            print(f"Threshold:                {estimate.currency} {threshold}")
+            print(f"Approval:                 {APPROVAL_REJECTED} by {args.run_actor}")
+            print("Deployment authorization: DENIED")
+        return EXIT_PASS
+
     plan = normalize_plan_file(args.plan)
     plan_doc = load_plan_json(args.plan)
 
@@ -552,19 +567,26 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
-    return emit(
-        {
-            "finops_decision": "BLOCK",
-            "approval_status": APPROVAL_APPROVED,
-            "deployment_authorization": "AUTHORIZED",
-            "exception_id": record["exception_id"],
-            "approver": record["approver"],
-            "approved_incremental_cost": record["approved_incremental_cost"],
-            "max_incremental_cost": record["max_incremental_cost"],
-            "expires_at": record["expires_at"],
-        },
-        EXIT_PASS,
-    )
+    payload = {
+        "finops_decision": "BLOCK",
+        "approval_status": APPROVAL_APPROVED,
+        "deployment_authorization": "AUTHORIZED",
+        "pr": args.pr,
+        "stack": args.stack,
+        "terraform_dir": args.terraform_dir,
+        "exception_id": record["exception_id"],
+        "approver": record["approver"],
+        "approved_incremental_cost": record["approved_incremental_cost"],
+        "max_incremental_cost": record["max_incremental_cost"],
+        "threshold": threshold,
+        "expires_at": record["expires_at"],
+    }
+    if args.json:
+        print(json.dumps(payload))
+    else:
+        for key, value in payload.items():
+            print(f"{key}: {value}")
+    return EXIT_PASS
 
 
 def _cmd_approval_verify(args: argparse.Namespace) -> int:

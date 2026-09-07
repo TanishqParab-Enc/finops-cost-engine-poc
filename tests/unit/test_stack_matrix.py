@@ -805,27 +805,26 @@ class TestExplicitDispatchIsTheApprovalMechanism:
 
     def test_the_actor_is_checked_before_any_decision_is_recorded(self, gate):
         steps = [s.get("name") for s in gate["jobs"]["finops-approval"]["steps"]]
-        assert steps.index("Authorise the approver") < steps.index("Reject the cost estimate")
+        assert steps.index("Authorise the approver") < steps.index(
+            "Record the decision for each blocked stack")
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
                     if s.get("name") == "Authorise the approver")
         assert 'github.actor }}" != "$FINOPS_APPROVER"' in step["run"]
 
     def test_rejection_states_the_exact_required_message(self, gate):
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Reject the cost estimate")
+                    if s.get("name") == "Publish the decision")
         assert "Deployment cancelled because the cost estimate was rejected." in step["run"]
-        assert "approval_status=REJECTED" in step["run"]
-        assert "deployment_authorization=DENIED" in step["run"]
-        assert "exit 1" in step["run"]
 
     def test_rejection_mints_no_record_anything_could_later_consume(self, gate):
-        steps = gate["jobs"]["finops-approval"]["steps"]
-        reject = next(s for s in steps if s.get("name") == "Reject the cost estimate")
-        assert reject["if"] == "inputs.finops_action == 'reject'"
-        # every record-producing step is approve-only
-        for name in ("Record the approval for each blocked stack", "Upload the approval record"):
-            step = next(s for s in steps if s.get("name") == name)
-            assert step["if"] == "inputs.finops_action == 'approve'"
+        """Only an approve uploads the artifact trusted main looks for, so a
+        rejection leaves nothing that could later read as authorisation."""
+        upload = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                      if s.get("name") == "Upload the approval record")
+        assert upload["if"] == "inputs.finops_action == 'approve'"
+        record = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                      if s.get("name") == "Record the decision for each blocked stack")
+        assert 'if [ "$ACTION" = "approve" ]' in record["run"]
 
     def test_enforce_gate_reports_all_three_states(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
@@ -884,7 +883,7 @@ class TestApprovalDispatchIsSelfContained:
 
     def test_terraform_root_comes_from_the_trusted_registry(self, gate):
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Record the approval for each blocked stack")
+                    if s.get("name") == "Record the decision for each blocked stack")
         assert "from finops.stacks import get_stack" in step["run"]
 
 
@@ -913,10 +912,25 @@ class TestApprovalRequestIsSurfacedOnThePullRequest:
     def test_request_tells_the_approver_both_choices(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Request cost approval")
-        assert "**APPROVE** this cost" in step["run"]
-        assert "**REJECT** this cost" in step["run"]
         assert "finops_action" in step["run"]
         assert "approval_pr" in step["run"]
+        assert "approve" in step["run"] and "reject" in step["run"]
+
+    def test_request_gives_the_full_ui_procedure(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        assert "Actions -> FinOps Cost Gate" in step["run"]
+        assert "Run workflow" in step["run"]
+        assert "Use workflow from" in step["run"]
+
+    def test_request_is_honest_that_the_field_needs_the_default_branch(self, gate):
+        """GitHub builds the dispatch form from the default branch, so the
+        comment must not promise a dropdown that will not be there yet."""
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        assert "is not shown" in step["run"]
+        assert "default branch" in step["run"]
+        assert "gh workflow run" in step["run"]
 
     def test_request_says_approval_does_not_become_a_pass(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
