@@ -192,6 +192,17 @@ def load_exception(path: str | Path) -> dict:
     return loaded
 
 
+def environment_approval_review(*, approver_login: str, head_sha: str) -> dict:
+    """Represents one GitHub Actions environment approval (from
+    GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals) as the same
+    review shape verify_exception already validates, so a real PR review and
+    a real environment approval both go through the exact same non-author /
+    allowlist / commit-SHA-binding checks - one authorisation engine, two
+    possible sources of the human click, neither trusted merely for
+    existing."""
+    return {"state": "APPROVED", "commit_id": head_sha, "user": {"login": approver_login}}
+
+
 def _authorising_review(
     record: dict,
     reviews: list[dict],

@@ -49,6 +49,9 @@ permissions:
   contents: read
   pull-requests: write
   id-token: write   # required for AWS OIDC
+  # Read the Approvals API (who approved an environment) and download an
+  # attestation artifact from a different, earlier workflow run.
+  actions: read
 
 env:
   PYTHON_VERSION: '3.12'
@@ -472,6 +475,7 @@ jobs:
           cat authz.json
 
           mkdir -p .finops
+          cp "$GITHUB_WORKSPACE/proposed-plan.json" .finops/proposed-plan.json
           python3 - <<'PY'
           import json
           import os
@@ -491,6 +495,10 @@ jobs:
               out.write(f"deployment_authorization={data['deployment_authorization']}\n")
           PY
 
+      # Includes the raw Terraform plan (copied into .finops/ above, not just
+      # the engine's own artifacts) so finops-approval (PR) and
+      # authorize-deploy (trusted main) can each independently rebuild the
+      # exact plan/estimate this run produced - never trust a cached number.
       - name: Upload FinOps artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -679,79 +687,139 @@ jobs:
   # the whole job 'failure', which is a reliable, matrix-free signal that at
   # least one stack needs the approval gate below - it never runs otherwise.
   #
-  # The protected GitHub Actions environment IS the approval gate: reaching
-  # any step below requires a human to click Approve against the
-  # finops-cost-approval environment's required reviewers (Settings ->
-  # Environments, not this file). Reject cancels the job before any step
-  # runs. There is no workflow input, no repository file, no sleep/poll loop
-  # standing in for that click.
+  # The protected GitHub Actions environment IS the approval gate, and it
+  # runs ON THE PR ITSELF - not on trusted main - so the over-threshold PR's
+  # own workflow run visibly reaches a waiting-for-approval state and shows
+  # GitHub's native control. Reaching any step below requires a human to
+  # click Approve against finops-cost-approval's required reviewers
+  # (Settings -> Environments, not this file); Reject cancels the job before
+  # any step runs. There is no workflow input, no repository file, no
+  # sleep/poll loop standing in for that click.
   #
-  # Environment approvals are per job-run, not persistent across separate
-  # workflow runs - GitHub cannot carry an approval recorded on a PR run
-  # forward into a later, separate trusted-main run. So this job runs ON the
-  # trusted push-to-main (or explicit workflow_dispatch deploy) run itself,
-  # never on `pull_request` - a PR can reach BLOCK, but never this gate, and
-  # therefore never deployment_authorization=AUTHORIZED.
+  # A GitHub Actions environment approval is scoped to the run it was
+  # granted on - it cannot be assumed to authorise a later, separate
+  # trusted-main run. So this job does not itself decide anything about
+  # deployment: it records a signed, PR/head-SHA/stack/cost-bound exception
+  # attestation (`finops create-exception`, unchanged CLI) using the
+  # environment's own approver identity - resolved from the live
+  # GET .../actions/runs/{run_id}/approvals endpoint, never a workflow input
+  # or a guess - and uploads it as an artifact. Trusted main
+  # (authorize-deploy) independently re-verifies this attestation from
+  # scratch, including a fresh Infracost result, before ever authorising a
+  # deployment. finops_decision itself is never touched here: create-exception
+  # refuses to run against anything but a FAIL, and never rewrites it.
   finops-approval:
     name: FinOps cost exception approval
     needs: [detect-changes, cost-gate]
-    if: |
-      always() && needs.cost-gate.result == 'failure' && (
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
-      )
+    if: always() && needs.cost-gate.result == 'failure' && github.event_name == 'pull_request'
     environment:
       name: finops-cost-approval
     runs-on: ubuntu-latest
-    outputs:
-      approved_stacks: ${{ steps.record.outputs.approved_stacks }}
     steps:
-      - name: Download per-stack authorization artifacts
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      - name: Download this run's per-stack cost-gate artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: finops-*-${{ github.run_id }}
           path: artifacts
           if-no-artifact-found: ignore
 
-      # Reaching this step at all already proves the environment was
-      # approved - GitHub does not start the job otherwise. This step only
-      # records WHICH stacks were BLOCKED in this run, for authorize-deploy.
-      - name: Record environment-approved stacks
-        id: record
+      # Reaching this step at all already proves a human approved the
+      # environment - GitHub does not start the job otherwise. This resolves
+      # WHO, from the run's own authoritative review history, never a
+      # workflow input or the PR author's own identity.
+      - name: Resolve the environment approver identity
+        id: approver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import glob
+          gh api "repos/$REPO/actions/runs/${{ github.run_id }}/approvals" > approvals.json
+          LOGIN=$(python3 -c "
           import json
-          import os
+          data = json.load(open('approvals.json'))
+          approved = [a for a in data if a.get('state') == 'approved']
+          print(approved[-1]['user']['login'] if approved else '')
+          ")
+          if [ -z "$LOGIN" ]; then
+            echo "::error title=No recorded approval::Reaching this job requires an environment approval, but none was found via the Actions API."
+            exit 1
+          fi
+          echo "login=$LOGIN" >> "$GITHUB_OUTPUT"
+          echo "Approved by: $LOGIN"
 
-          blocked = []
-          for path in glob.glob("artifacts/*/authorization.json"):
-              with open(path, encoding="utf-8") as fh:
-                  data = json.load(fh)
-              if data.get("finops_decision") == "BLOCK":
-                  blocked.append(data["stack"])
+      - name: Create the exception attestation for each blocked stack
+        env:
+          APPROVER: ${{ steps.approver.outputs.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p finops-attestation
+          for authz in artifacts/*/authorization.json; do
+            [ -f "$authz" ] || continue
+            STACK=$(python3 -c "import json;print(json.load(open('$authz'))['stack'])")
+            DECISION=$(python3 -c "import json;print(json.load(open('$authz'))['finops_decision'])")
+            if [ "$DECISION" != "BLOCK" ]; then
+              echo "Skipping '$STACK' - not BLOCKed, no attestation needed."
+              continue
+            fi
+            DIR=$(dirname "$authz")
+            finops create-exception \
+              --result "$DIR/gate-result.json" \
+              --plan "$DIR/proposed-plan.json" \
+              --pr "$PR_NUMBER" \
+              --head-sha "$PR_HEAD_SHA" \
+              --approver "$APPROVER" \
+              --justification "Approved via the finops-cost-approval GitHub Actions environment (run ${{ github.run_id }})" \
+              --stack "$STACK" \
+              --out "finops-attestation/${STACK}.json"
+          done
+          ls -la finops-attestation/
 
-          print("finops-cost-approval environment approved this run for:", blocked)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write(f"approved_stacks={json.dumps(blocked)}\n")
-          PY
+      - name: Upload the exception attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-attestation-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: finops-attestation/
+          retention-days: 90
 
+  # This job never itself requests approval - it independently re-verifies,
+  # from scratch, the attestation the PR's own finops-approval job created:
+  #   1. resolves the exact PR + PR head SHA this trusted commit came from
+  #      (GET .../commits/{sha}/pulls - GitHub's own merge-tracking, not a
+  #      user-controlled input);
+  #   2. locates that PR's completed finops-cost-gate run for that exact
+  #      head SHA and re-checks (via the Actions Jobs API, fresh, right now)
+  #      that its finops-approval job actually succeeded - the mere
+  #      existence of an attestation artifact is never trusted alone;
+  #   3. re-fetches that source run's Approvals API fresh (not a field baked
+  #      into the artifact) to learn who approved;
+  #   4. downloads the attestation from that specific earlier run (a GitHub
+  #      Actions environment approval is scoped to the run it was granted
+  #      on and cannot be assumed to carry over - this cross-run download,
+  #      re-verified below, is the secure handoff, not an assumption);
+  #   5. re-derives a FRESH plan/estimate from THIS push's own cost-gate
+  #      artifacts (never the PR's cached numbers) and runs the attestation
+  #      through the exact same verify_exception binding checks a PR review
+  #      would face - PR/head-SHA/stack, plan fingerprint, resolved-variable
+  #      hash, cost ceiling, expiry, integrity, non-author, allowlist.
   # cost-gate is matrixed by stack, so its own job conclusion is all-or-
-  # nothing across every stack a push touched: one BLOCKED-without-exception
-  # stack would make the whole job 'failure', which must not stop an
-  # unrelated, already-authorized stack from deploying. This job aggregates
-  # each matrix instance's authorization.json (published in its own "Upload
-  # FinOps artifacts" artifact) into one per-stack map, so `deploy` can depend
-  # on an explicit authorization result instead of cost-gate's raw pass/fail.
-  # A BLOCKED stack is only upgraded to AUTHORIZED here if finops-approval
-  # actually succeeded (a human approved the finops-cost-approval
-  # environment) AND that exact stack was in its approved set - never from
-  # cost-gate's own output. Always runs (`always()`) so it aggregates the
-  # DENIED/rejected case too, not just skip past it.
+  # nothing across every stack a push touched; this job aggregates each
+  # matrix instance's authorization.json into one per-stack map so `deploy`
+  # depends on an explicit result, never cost-gate's raw pass/fail.
   authorize-deploy:
     name: Aggregate deployment authorization
-    needs: [detect-changes, cost-gate, finops-approval]
+    needs: [detect-changes, cost-gate]
     if: |
       always() && needs.detect-changes.result == 'success' && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
@@ -770,43 +838,149 @@ jobs:
       - name: Install engine
         run: pip install --quiet -e .
 
-      - name: Download per-stack authorization artifacts
+      - name: Download this run's per-stack cost-gate artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: finops-*-${{ github.run_id }}
           path: artifacts
           if-no-artifact-found: ignore
 
+      - name: Resolve the pull request this trusted commit came from
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/commits/$SHA/pulls" > pr.json
+          PR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['number'] if d else '')")
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR" ]; then
+            gh api "repos/$REPO/pulls/$PR" > pr-detail.json
+            echo "head_sha=$(python3 -c "import json;print(json.load(open('pr-detail.json'))['head']['sha'])")" >> "$GITHUB_OUTPUT"
+            echo "author=$(python3 -c "import json;print(json.load(open('pr-detail.json'))['user']['login'])")" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fresh, right now - never a field carried in the attestation artifact.
+      - name: Locate and re-verify the pull request's finops-approval run
+        id: source_run
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/actions/workflows/finops-cost-gate.yml/runs?event=pull_request&head_sha=$PR_HEAD_SHA&status=success" \
+            > runs.json
+          RUN_ID=$(python3 -c "
+          import json
+          data = json.load(open('runs.json'))
+          matches = [r['id'] for r in data.get('workflow_runs', [])
+                     if any(p.get('number') == int('$PR_NUMBER') for p in (r.get('pull_requests') or []))]
+          print(sorted(matches)[-1] if matches else '')
+          ")
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          if [ -z "$RUN_ID" ]; then
+            echo "approval_job_conclusion=" >> "$GITHUB_OUTPUT"
+            echo "approver_logins=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" > jobs.json
+          CONCLUSION=$(python3 -c "
+          import json
+          jobs = json.load(open('jobs.json'))['jobs']
+          match = [j['conclusion'] for j in jobs if j['name'] == 'FinOps cost exception approval']
+          print(match[0] if match else '')
+          ")
+          echo "approval_job_conclusion=$CONCLUSION" >> "$GITHUB_OUTPUT"
+
+          gh api "repos/$REPO/actions/runs/$RUN_ID/approvals" > approvals.json
+          LOGINS=$(python3 -c "
+          import json
+          data = json.load(open('approvals.json'))
+          logins = [a['user']['login'] for a in data if a.get('state') == 'approved']
+          print(','.join(logins))
+          ")
+          echo "approver_logins=$LOGINS" >> "$GITHUB_OUTPUT"
+
+      - name: Download the pull request's exception attestation
+        if: steps.source_run.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.source_run.outputs.run_id }}
+          repository: ${{ github.repository }}
+          pattern: finops-attestation-${{ steps.pr.outputs.number }}-*
+          path: attestation
+          if-no-artifact-found: ignore
+
       - name: Aggregate per-stack authorization
         id: aggregate
         env:
-          APPROVAL_RESULT: ${{ needs.finops-approval.result }}
-          APPROVED_STACKS: ${{ needs.finops-approval.outputs.approved_stacks }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_AUTHOR: ${{ steps.pr.outputs.author }}
+          APPROVAL_JOB_CONCLUSION: ${{ steps.source_run.outputs.approval_job_conclusion }}
+          APPROVER_LOGINS: ${{ steps.source_run.outputs.approver_logins }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import glob
           import json
           import os
-
-          from finops.gate import resolve_stack_authorization
-
-          approval_result = os.environ.get("APPROVAL_RESULT", "skipped")
-          approved_stacks = json.loads(os.environ.get("APPROVED_STACKS") or "[]")
+          import subprocess
+          import sys
 
           merged = {}
-          for path in glob.glob("artifacts/*/authorization.json"):
-              with open(path, encoding="utf-8") as fh:
-                  data = json.load(fh)
-              stack = data.get("stack")
+          for authz_path in glob.glob("artifacts/*/authorization.json"):
+              with open(authz_path, encoding="utf-8") as fh:
+                  entry = json.load(fh)
+              stack = entry.get("stack")
               if not stack:
                   continue
-              merged[stack] = resolve_stack_authorization(
-                  data, approval_result=approval_result, approved_stacks=approved_stacks)
+
+              if entry.get("finops_decision") != "BLOCK":
+                  merged[stack] = entry
+                  continue
+
+              plan_dir = os.path.dirname(authz_path)
+              # download-artifact@v4 with a `pattern:` gives each matched
+              # artifact its own subfolder, even when only one artifact
+              # matches - never assume a flat path.
+              attestation_matches = glob.glob(f"attestation/*/{stack}.json")
+              cmd = [
+                  "finops", "evaluate-attestation",
+                  "--exception", attestation_matches[0] if attestation_matches else f"attestation/{stack}.json",
+                  "--stack", stack,
+                  "--approval-job-conclusion", os.environ.get("APPROVAL_JOB_CONCLUSION", ""),
+                  "--approver-logins", os.environ.get("APPROVER_LOGINS", ""),
+                  "--json",
+              ]
+              if os.path.isfile(f"{plan_dir}/proposed-plan.json"):
+                  cmd += ["--plan", f"{plan_dir}/proposed-plan.json"]
+              if os.path.isfile(f"{plan_dir}/gate-result.json"):
+                  cmd += ["--gate-result", f"{plan_dir}/gate-result.json"]
+              if os.environ.get("PR_NUMBER"):
+                  cmd += ["--pr", os.environ["PR_NUMBER"]]
+              if os.environ.get("PR_HEAD_SHA"):
+                  cmd += ["--head-sha", os.environ["PR_HEAD_SHA"]]
+              if os.environ.get("PR_AUTHOR"):
+                  cmd += ["--pr-author", os.environ["PR_AUTHOR"]]
+
+              proc = subprocess.run(cmd, capture_output=True, text=True)
+              print(f"evaluate-attestation[{stack}]:", proc.stdout.strip(), proc.stderr.strip(), file=sys.stderr)
+              try:
+                  entry["deployment_authorization"] = json.loads(proc.stdout)["deployment_authorization"]
+              except (json.JSONDecodeError, KeyError):
+                  entry["deployment_authorization"] = "DENIED"
+              merged[stack] = entry
 
           print("Aggregated deployment authorization:")
           print(json.dumps(merged, indent=2))
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"authorizations={json.dumps(merged)}\n")
           PY

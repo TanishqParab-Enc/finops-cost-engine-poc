@@ -189,25 +189,53 @@ def authorize_deployment(
     return "DENIED"
 
 
-def resolve_stack_authorization(
-    entry: dict, *, approval_result: str, approved_stacks: list,
-) -> dict:
-    """Upgrades one stack's authorization.json using the finops-approval
-    job's outcome - the protected `finops-cost-approval` GitHub Actions
-    environment, never a PR review, workflow input, or repository content.
+def evaluate_pr_attestation(
+    attestation: dict | None,
+    *,
+    plan,
+    plan_doc: dict | None,
+    estimate,
+    config: Config,
+    pr_number: int | None,
+    pr_author: str | None,
+    head_sha: str | None,
+    stack: str | None,
+    approval_job_succeeded: bool,
+    approver_logins: list,
+) -> str:
+    """AUTHORIZED or DENIED for one BLOCKed stack on trusted `main`, given the
+    exception attestation created on the PR run (only reachable after a real
+    finops-cost-approval GitHub Actions environment approval) and a plan/
+    estimate freshly computed on THIS trusted run - never the PR's cached
+    numbers, so cost creep and configuration drift since approval are always
+    caught.
 
-    A PASS entry (deployment_authorization already AUTHORIZED/DENIED from
-    the normal exit_code/lock check in cost-gate) passes through untouched.
-    A BLOCK entry is only upgraded to AUTHORIZED when the approval job
-    itself succeeded (a human clicked Approve) AND this exact stack was
-    among the ones it recorded as blocked in this run; anything else -
-    rejected, cancelled, or the approval job never ran - is DENIED.
-    finops_decision is never rewritten: an authorised BLOCK is still BLOCK.
+    A GitHub Actions environment approval is scoped to the run it was
+    granted on - it cannot be assumed to authorise a later, separate
+    trusted-main run. So this never trusts the attestation merely for
+    existing: `approval_job_succeeded` must independently confirm (via the
+    Actions API, on the run that produced the attestation) that the
+    finops-approval job for that PR actually succeeded, and `approver_logins`
+    must come from that SAME run's live Approvals API - not a field baked
+    into the attestation. The attestation itself is then run through the
+    exact same verify_exception binding checks a PR review would face:
+    stack, PR number, head SHA, plan fingerprint, resolved-variable hash,
+    cost ceiling, expiry, integrity, non-author, allowlist.
     """
-    updated = dict(entry)
-    if entry.get("finops_decision") == "BLOCK":
-        if approval_result == "success" and entry.get("stack") in approved_stacks:
-            updated["deployment_authorization"] = "AUTHORIZED"
-        else:
-            updated["deployment_authorization"] = "DENIED"
-    return updated
+    from .lock.exception import environment_approval_review, verify_exception
+
+    if not approval_job_succeeded or attestation is None or not approver_logins:
+        return "DENIED"
+    if plan is None or plan_doc is None or estimate is None:
+        return "DENIED"
+
+    reviews = [
+        environment_approval_review(approver_login=login, head_sha=head_sha or "")
+        for login in approver_logins
+    ]
+    problems = verify_exception(
+        attestation, plan, plan_doc, estimate, config,
+        pr_number=pr_number, pr_author=pr_author, head_sha=head_sha,
+        stack=stack, reviews=reviews,
+    )
+    return authorize_deployment(analyze_exit_code=1, exception_valid=not problems)
