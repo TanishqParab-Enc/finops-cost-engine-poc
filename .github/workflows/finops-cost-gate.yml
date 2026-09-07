@@ -403,69 +403,10 @@ jobs:
           fi
           echo "Confirmed: no deployment authorisation was created for ${{ matrix.stack.name }}."
 
-      # An over-threshold change may proceed only with an audited, peer-approved
-      # exception. The FinOps decision stays BLOCK either way - this decides
-      # whether that specific overspend was explicitly accepted for this exact
-      # change. Authorisation comes from the live GitHub reviews API, never from
-      # repository content, so a pull request cannot approve itself.
-      - name: Evaluate budget exception
-        id: exception
-        if: steps.gate.outputs.exit_code == '1'
-        working-directory: head
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
-          SHA: ${{ github.sha }}
-          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
-          PR_EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
-          PR_EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
-          FINOPS_APPROVERS: ${{ vars.FINOPS_APPROVERS }}
-        run: |
-          set -euo pipefail
-          echo "valid=false" >> "$GITHUB_OUTPUT"
-
-          if [ "$EVENT" = "pull_request" ]; then
-            PR="$PR_EVENT_NUMBER"; HEAD_SHA="$PR_EVENT_HEAD"; AUTHOR="$PR_EVENT_AUTHOR"
-          else
-            gh api "repos/$REPO/commits/$SHA/pulls" > pr.json
-            PR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['number'] if d else '')")
-            HEAD_SHA=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['head']['sha'] if d else '')")
-            AUTHOR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['user']['login'] if d else '')")
-          fi
-
-          if [ -z "$PR" ]; then
-            echo "::error title=No pull request::Cannot authorise a budget exception without an associated pull request."
-            exit 1
-          fi
-
-          RECORD="finops-exceptions/pr-${PR}.json"
-          if [ ! -f "$RECORD" ]; then
-            echo "::notice title=FINOPS BLOCKED::No budget exception found at $RECORD. Peer approval is required."
-            exit 0
-          fi
-
-          gh api "repos/$REPO/pulls/${PR}/reviews" --paginate > reviews.json
-
-          set +e
-          finops verify-exception \
-            --exception "$RECORD" \
-            --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
-            --estimate .finops/cost-estimate.json \
-            --stack "${{ matrix.stack.name }}" \
-            --pr "$PR" \
-            --head-sha "$HEAD_SHA" \
-            --pr-author "$AUTHOR" \
-            --reviews reviews.json \
-            --verified-commit "$SHA"
-          RC=$?
-          set -e
-
-          if [ "$RC" -eq 0 ]; then
-            echo "valid=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice title=FINOPS BLOCKED::The budget exception does not authorise this change."
-          fi
+      # A BLOCK is always PENDING/DENIED here. The only thing that can move it
+      # is an explicit APPROVE from the finops-approval job, and that is
+      # re-verified from scratch on trusted main before any apply - so nothing
+      # in the pull request's own run can authorise a deployment.
 
       # The approval request itself. A BLOCK is not actionable unless the PR
       # says exactly how to approve or reject it, so append the instructions to
@@ -565,22 +506,18 @@ jobs:
             --stack "${{ matrix.stack.name }}" \
             --plan "$GITHUB_WORKSPACE/proposed-plan.json"
 
-      # finops_decision (was this within budget) and deployment_authorization
-      # (may trusted main deploy it) are deliberately separate signals. An
-      # approved exception authorises deployment without ever turning a BLOCK
-      # into a PASS. Calls the same `finops authorize-deployment` CLI command
-      # the unit tests exercise directly, so CI runs tested code rather than
-      # parallel bash logic.
+      # finops_decision (was this within budget), approval_status (has a human
+      # decided) and deployment_authorization (may trusted main deploy it) are
+      # deliberately separate signals. An approval never turns a BLOCK into a
+      # PASS. Calls the same `finops authorize-deployment` CLI command the unit
+      # tests exercise directly, so CI runs tested code rather than parallel
+      # bash logic.
       - name: Compute deployment authorization
         id: authz
         if: always()
         working-directory: head
         run: |
           set -euo pipefail
-          EXC_FLAG=""
-          if [ "${{ steps.exception.outputs.valid }}" = "true" ]; then
-            EXC_FLAG="--exception-valid"
-          fi
           LOCK_FLAG=""
           if [ "${{ steps.verify_lock.outcome }}" = "failure" ]; then
             LOCK_FLAG="--lock-not-verified"
@@ -589,7 +526,7 @@ jobs:
           set +e
           finops authorize-deployment \
             --exit-code "${{ steps.gate.outputs.exit_code }}" \
-            $EXC_FLAG $LOCK_FLAG --json > authz.json
+            $LOCK_FLAG --json > authz.json
           set -e
           cat authz.json
 
@@ -613,6 +550,7 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"finops_decision={data['finops_decision']}\n")
+              out.write(f"approval_status={data['approval_status']}\n")
               out.write(f"deployment_authorization={data['deployment_authorization']}\n")
           PY
 
@@ -628,26 +566,21 @@ jobs:
           include-hidden-files: true
 
       # The gate is the last word: a non-zero exit stops the pipeline.
-      #   1 = threshold exceeded, peer approval required (unless an approved
-      #       budget exception authorises this exact change)
+      #   1 = threshold exceeded - needs an explicit APPROVE via the
+      #       finops-approval job before anything can deploy
       #   2 = cost could not be trusted, failing safe
       - name: Enforce gate
         if: always()
         run: |
           CODE="${{ steps.gate.outputs.exit_code }}"
           echo "finops_decision=${{ steps.authz.outputs.finops_decision }}"
+          echo "approval_status=${{ steps.authz.outputs.approval_status }}"
           echo "deployment_authorization=${{ steps.authz.outputs.deployment_authorization }}"
           case "$CODE" in
             0) echo "PASS - cost locked, pipeline may continue." ;;
             1)
-              if [ "${{ steps.authz.outputs.deployment_authorization }}" = "AUTHORIZED" ]; then
-                echo "FINOPS: BLOCKED (finops_decision=BLOCK)"
-                echo "exception_approval=APPROVED - the overspend was explicitly accepted"
-                echo "by a peer for this exact change. The FinOps decision is unchanged."
-              else
-                echo "::error::FinOps threshold exceeded. Peer approval required before merging."
-                exit 1
-              fi
+              echo "::error::FinOps threshold exceeded (finops_decision=BLOCK, approval_status=PENDING). Run the FinOps Cost Gate workflow with finops_action=approve or reject - see the approval request on the pull request."
+              exit 1
               ;;
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
           esac

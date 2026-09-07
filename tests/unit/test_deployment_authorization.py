@@ -209,23 +209,39 @@ class TestAuthorizeDeploymentCli:
         proc = self._run("--exit-code", "0", "--json")
         assert proc.returncode == 0
         payload = json.loads(proc.stdout)
-        assert payload == {"finops_decision": "PASS", "deployment_authorization": "AUTHORIZED"}
+        assert payload == {
+            "finops_decision": "PASS",
+            "approval_status": "NOT_REQUIRED",
+            "deployment_authorization": "AUTHORIZED",
+        }
 
     def test_above_threshold_no_exception_json(self):
         proc = self._run("--exit-code", "1", "--json")
         assert proc.returncode == 1
         payload = json.loads(proc.stdout)
-        assert payload == {"finops_decision": "BLOCK", "deployment_authorization": "DENIED"}
+        assert payload == {
+            "finops_decision": "BLOCK",
+            "approval_status": "PENDING",
+            "deployment_authorization": "DENIED",
+        }
 
     def test_above_threshold_valid_exception_json(self):
         proc = self._run("--exit-code", "1", "--exception-valid", "--json")
         assert proc.returncode == 0
         payload = json.loads(proc.stdout)
-        assert payload == {"finops_decision": "BLOCK", "deployment_authorization": "AUTHORIZED"}
+        assert payload == {
+            "finops_decision": "BLOCK",
+            "approval_status": "APPROVED",
+            "deployment_authorization": "AUTHORIZED",
+        }
 
     def test_non_authoritative_exit_code_json(self):
         proc = self._run("--exit-code", "2", "--json")
         assert proc.returncode == 1
         payload = json.loads(proc.stdout)
-        assert payload == {"finops_decision": "BLOCK", "deployment_authorization": "DENIED"}
+        assert payload == {
+            "finops_decision": "BLOCK",
+            "approval_status": "PENDING",
+            "deployment_authorization": "DENIED",
+        }
 

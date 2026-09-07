@@ -457,9 +457,12 @@ class TestPreservedSemantics:
     def test_gate_fails_closed(self, gate_text):
         assert "Failing safe (exit $CODE)" in gate_text
 
-    def test_exception_path_preserved(self, gate_text):
-        assert "Evaluate budget exception" in gate_text
-        assert "finops verify-exception" in gate_text
+    def test_pr_review_is_not_the_approval_mechanism(self, gate_text):
+        """Superseded by the explicit finops_action dispatch - no step reads
+        the reviews API or a committed exception record to authorise."""
+        assert "Evaluate budget exception" not in gate_text
+        assert "finops verify-exception" not in gate_text
+        assert "pulls/${PR}/reviews" not in gate_text
 
     def test_drift_assertion_preserved_and_scoped_to_aws(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
@@ -690,15 +693,19 @@ class TestDeploymentAuthorizationArchitecture:
                     if s.get("name") == "Compute deployment authorization")
         assert "steps.verify_lock.outcome" in step["run"]
 
-    def test_compute_authorization_considers_pr_review_exception_validity(self, gate):
-        """The genuine GitHub PR review exception check (Evaluate budget
-        exception) is the primary mechanism for upgrading a BLOCK to
-        AUTHORIZED - restored as the primary path, not a GitHub Actions
-        environment approval."""
+    def test_compute_authorization_never_consults_a_pr_review(self, gate):
+        """A BLOCK always leaves the pull request PENDING/DENIED; only the
+        finops_action dispatch can move it, re-verified on trusted main."""
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Compute deployment authorization")
-        assert "steps.exception.outputs.valid" in step["run"]
-        assert "--exception-valid" in step["run"]
+        assert "steps.exception" not in step["run"]
+        assert "--exception-valid" not in step["run"]
+
+    def test_compute_authorization_emits_all_three_states(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Compute deployment authorization")
+        for state in ("finops_decision", "approval_status", "deployment_authorization"):
+            assert f"{state}={{data['{state}']}}" in step["run"]
 
     def test_a_non_deployable_stack_is_never_authorized_however_cheap_it_prices(self, gate):
         """deployment_authorization is forced DENIED for a non-deployable
@@ -781,39 +788,65 @@ class TestNoEnvironmentApprovalExperimentRemains:
         assert gate["jobs"]["authorize-deploy"]["needs"] == ["detect-changes", "cost-gate"]
 
 
-class TestGenuinePrReviewIsThePrimaryApprovalMechanism:
-    """Restores the original mechanism: a real GitHub PR review, verified
-    live via the reviews API against a committed, integrity-checked
-    exception record - never a workflow input, never environment job
-    success, never a bare repository boolean."""
+class TestExplicitDispatchIsTheApprovalMechanism:
+    """The human decision is an explicit finops_action=approve|reject
+    workflow_dispatch, restricted to one GitHub-attested account - never a
+    PR review, an environment job, or a bare repository boolean."""
 
-    def test_evaluate_budget_exception_step_exists(self, gate):
-        job = gate["jobs"]["cost-gate"]
-        step = next(s for s in job["steps"] if s.get("name") == "Evaluate budget exception")
-        assert step["if"] == "steps.gate.outputs.exit_code == '1'"
+    def test_approve_and_reject_are_the_only_actions_offered(self, gate):
+        triggers = gate.get("on") or gate.get(True)
+        options = triggers["workflow_dispatch"]["inputs"]["finops_action"]["options"]
+        assert options == ["none", "approve", "reject"]
 
-    def test_reviews_are_fetched_live_from_the_github_api(self, gate):
-        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
-                    if s.get("name") == "Evaluate budget exception")
-        assert "pulls/${PR}/reviews" in step["run"]
-        assert "finops verify-exception" in step["run"]
+    def test_the_approver_is_repository_configuration_not_an_input(self, gate):
+        approver = gate["env"]["FINOPS_APPROVER"]
+        assert "vars.FINOPS_APPROVER" in approver
+        assert "inputs." not in approver
 
-    def test_exception_requires_a_committed_record_not_a_bare_boolean(self, gate):
-        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
-                    if s.get("name") == "Evaluate budget exception")
-        assert "finops-exceptions/pr-${PR}.json" in step["run"]
+    def test_the_actor_is_checked_before_any_decision_is_recorded(self, gate):
+        steps = [s.get("name") for s in gate["jobs"]["finops-approval"]["steps"]]
+        assert steps.index("Authorise the approver") < steps.index("Reject the cost estimate")
+        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                    if s.get("name") == "Authorise the approver")
+        assert 'github.actor }}" != "$FINOPS_APPROVER"' in step["run"]
 
-    def test_valid_exception_lets_the_pr_check_go_green(self, gate):
-        """So the PR becomes mergeable once genuinely approved - the
-        decision itself (finops_decision) is still never rewritten."""
+    def test_rejection_states_the_exact_required_message(self, gate):
+        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                    if s.get("name") == "Reject the cost estimate")
+        assert "Deployment cancelled because the cost estimate was rejected." in step["run"]
+        assert "approval_status=REJECTED" in step["run"]
+        assert "deployment_authorization=DENIED" in step["run"]
+        assert "exit 1" in step["run"]
+
+    def test_rejection_mints_no_record_anything_could_later_consume(self, gate):
+        steps = gate["jobs"]["finops-approval"]["steps"]
+        reject = next(s for s in steps if s.get("name") == "Reject the cost estimate")
+        assert reject["if"] == "inputs.finops_action == 'reject'"
+        # every record-producing step is approve-only
+        for name in ("Record the approval for each blocked stack", "Upload the approval record"):
+            step = next(s for s in steps if s.get("name") == name)
+            assert step["if"] == "inputs.finops_action == 'approve'"
+
+    def test_enforce_gate_reports_all_three_states(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
-        assert 'exception_approval=APPROVED' in step["run"]
-        assert "FINOPS: BLOCKED (finops_decision=BLOCK)" in step["run"]
+        for state in ("finops_decision", "approval_status", "deployment_authorization"):
+            assert f"steps.authz.outputs.{state}" in step["run"]
 
-    def test_no_workflow_input_or_bare_boolean_substitutes_for_a_review(self, gate_text):
-        assert "inputs.approve" not in gate_text
+    def test_enforce_gate_points_at_the_dispatch_not_a_peer_review(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
+        assert "finops_action=approve" in step["run"]
+        assert "Peer approval required" not in step["run"]
+
+    def test_a_block_never_goes_green_on_the_pull_request(self, gate):
+        """Nothing in the PR's own run can authorise it - the BLOCK branch
+        always exits non-zero."""
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
+        assert "AUTHORIZED" not in step["run"]
+
+    def test_no_workflow_input_or_bare_boolean_substitutes_for_the_decision(self, gate_text):
         assert "inputs.approved" not in gate_text
         assert "inputs.exception_valid" not in gate_text
+        assert "inputs.force_deploy" not in gate_text
 
 
 class TestApprovalDispatchIsSelfContained:

@@ -428,22 +428,21 @@ def _cmd_verify_exception(args: argparse.Namespace) -> int:
 
 
 def _cmd_authorize_deployment(args: argparse.Namespace) -> int:
-    from .gate import authorize_deployment, finops_decision_label
+    from .gate import evaluate_approval
 
-    decision = finops_decision_label(args.exit_code)
-    authorization = authorize_deployment(
+    states = evaluate_approval(
         analyze_exit_code=args.exit_code,
-        exception_valid=args.exception_valid,
+        approval_action="approve" if args.exception_valid else None,
         lock_verified=not args.lock_not_verified,
     )
 
     if args.json:
-        print(json.dumps({"finops_decision": decision, "deployment_authorization": authorization}))
+        print(json.dumps(states))
     else:
-        print(f"finops_decision: {decision}")
-        print(f"deployment_authorization: {authorization}")
+        for key, value in states.items():
+            print(f"{key}: {value}")
 
-    return EXIT_PASS if authorization == "AUTHORIZED" else EXIT_FAIL
+    return EXIT_PASS if states["deployment_authorization"] == "AUTHORIZED" else EXIT_FAIL
 
 
 def _rebuild_decision_from_result(result_raw: dict, config):
