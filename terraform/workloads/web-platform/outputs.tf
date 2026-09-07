@@ -1,3 +1,6 @@
+# Outputs are metadata only - they create no resource and carry no cost, so
+# touching this file exercises the gate without moving the estimate.
+
 output "vpc_id" {
   description = "VPC hosting the platform."
   value       = module.networking.vpc_id
