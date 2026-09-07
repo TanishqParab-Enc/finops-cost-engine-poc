@@ -427,11 +427,32 @@ jobs:
           mkdir -p .finops
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/finops-cost-gate.yml"
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+
+          # Restate the figures the decision is about, from this run's own
+          # artifacts. The rendered table above omits a labelled incremental
+          # row, and that is the number the threshold is actually applied to.
+          python3 - <<'PY' > costs.txt
+          import json
+          cost = json.load(open(".finops/cost-estimate.json"))
+          policy = (json.load(open(".finops/gate-result.json")).get("policy") or {})
+          print(cost["previous_monthly_cost"], cost["new_monthly_cost"],
+                cost["incremental_monthly_cost"], cost.get("currency", "USD"),
+                policy.get("threshold_value"))
+          PY
+          read -r CUR PROJ INC CCY THRESH < costs.txt
+
           cat >> .finops/pr-comment.md <<EOF
 
           ---
 
           ### Cost approval required
+
+          | | |
+          |---|---|
+          | Current monthly cost | $CCY $CUR |
+          | Projected monthly cost | $CCY $PROJ |
+          | **Incremental monthly cost** | **$CCY $INC** |
+          | Threshold | $CCY $THRESH |
 
           \`\`\`
           finops_decision          = BLOCK
@@ -443,6 +464,12 @@ jobs:
           threshold.
           **2.** It needs an explicit **APPROVE** or **REJECT** from \`$FINOPS_APPROVER\`.
           Nothing deploys until then.
+
+          > The decision is a **separate manual workflow run**. It does not re-plan or
+          > re-price anything - it consumes *this* blocked evaluation for PR
+          > #$PR_NUMBER at this exact commit, and refuses to run if that evaluation is
+          > not a BLOCK. It is therefore logically downstream of this run even though
+          > GitHub shows it as its own run.
 
           To decide:
 
@@ -761,7 +788,7 @@ jobs:
   # rewrites the decision: `finops approve` refuses anything but a FAIL and the
   # record it mints keeps finops_decision=FAIL.
   finops-approval:
-    name: FinOps cost approval (${{ inputs.finops_action }})
+    name: Manual cost approval (APPROVE / REJECT)
     # Deliberately depends on nothing. An approval must not re-plan, re-price
     # or touch AWS: it consumes the artifacts the pull request's own cost-gate
     # run already produced, so what is approved is exactly what was priced.

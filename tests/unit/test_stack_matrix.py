@@ -909,6 +909,23 @@ class TestApprovalRequestIsSurfacedOnThePullRequest:
         assert "approval_status          = PENDING" in step["run"]
         assert "deployment_authorization = DENIED" in step["run"]
 
+    def test_request_states_all_four_cost_figures(self, gate):
+        """The rendered table omits a labelled incremental row, and that is
+        the number the threshold is applied to - so restate all four."""
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        for label in ("Current monthly cost", "Projected monthly cost",
+                      "Incremental monthly cost", "Threshold"):
+            assert label in step["run"]
+        assert "cost-estimate.json" in step["run"]
+        assert "gate-result.json" in step["run"]
+
+    def test_request_explains_the_decision_is_a_separate_manual_run(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        assert "separate manual workflow run" in step["run"]
+        assert "logically downstream" in step["run"]
+
     def test_request_tells_the_approver_both_choices(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Request cost approval")

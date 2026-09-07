@@ -421,6 +421,22 @@ class TestApprovalWorkflowWiring:
         assert "--terraform-dir" in step["run"]
         assert "--run-actor" in step["run"] and "--expected-approver" in step["run"]
 
+    def test_the_dispatch_requires_a_blocked_evaluation(self, gate):
+        """The decision is only meaningful against an evaluation that really
+        was a BLOCK - a PASS stack is skipped and an all-PASS run errors."""
+        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                    if s.get("name") == "Record the decision for each blocked stack")
+        assert '"$DECISION" != "BLOCK"' in step["run"]
+        assert "Nothing to decide" in step["run"]
+
+    def test_the_dispatch_consumes_the_prs_own_evaluation_run(self, gate):
+        locate = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                      if s.get("name") == "Locate the pull request's cost evaluation")
+        assert "event=pull_request&head_sha=$HEAD_SHA" in locate["run"]
+        download = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                        if s.get("name") == "Download that evaluation's artifacts")
+        assert download["with"]["run-id"] == "${{ steps.eval_run.outputs.run_id }}"
+
     def test_an_approval_dispatch_runs_nothing_else(self, gate):
         """detect-changes is skipped, and cost-gate / scenarios / deploy all
         need it - so no Terraform, Infracost, OIDC or fixtures run."""
