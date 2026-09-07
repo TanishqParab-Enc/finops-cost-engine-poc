@@ -260,6 +260,40 @@ class TestNonDeployableStacksMintNoAuthorisation:
         assert "matrix.stack.deployable == true" in step["if"]
 
 
+class TestInitialDeploymentDetection:
+    """A stack absent from the base ref is a new deployment, determined by
+    directory existence - never by resource_changes actions, which would
+    conflate 'new stack' with 'stack full of creates for another reason'."""
+
+    def _steps(self, gate):
+        return {s.get("name"): s for s in gate["jobs"]["cost-gate"]["steps"]}
+
+    def test_detection_step_exists_before_baseline_planning(self, gate):
+        names = [s.get("name") for s in gate["jobs"]["cost-gate"]["steps"]]
+        assert names.index("Detect initial deployment") < names.index(
+            "Terraform plan (base branch = baseline cost)")
+
+    def test_detection_is_directory_existence_not_plan_output(self, gate):
+        step = self._steps(gate)["Detect initial deployment"]
+        assert 'if [ -d "base/${{ matrix.stack.dir }}" ]' in step["run"]
+        assert "resource_changes" not in step["run"]
+
+    def test_detection_uses_the_matrix_stack_directory(self, gate):
+        step = self._steps(gate)["Detect initial deployment"]
+        assert "matrix.stack.dir" in step["run"]
+        assert "matrix.stack.name" in step["run"]
+
+    def test_baseline_plan_is_skipped_for_a_new_stack(self, gate):
+        step = self._steps(gate)["Terraform plan (base branch = baseline cost)"]
+        assert step["if"] == "steps.initial.outputs.is_initial != 'true'"
+
+    def test_gate_message_distinguishes_initial_deployment_from_plan_failure(self, gate):
+        step = self._steps(gate)["FinOps cost gate"]
+        assert "Initial deployment for" in step["run"]
+        assert "steps.initial.outputs.is_initial" in step["run"]
+        assert "No baseline plan; incremental cost equals full projected cost." in step["run"]
+
+
 class TestSingleCentralWorkflow:
     def test_only_one_finops_workflow_exists(self):
         workflows = {p.name for p in (REPO / ".github/workflows").glob("*.yml")}
