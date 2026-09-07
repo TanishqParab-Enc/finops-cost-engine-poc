@@ -6,6 +6,9 @@
 #
 # Every cost-significant value is a variable so a pull request can move exactly
 # one lever and the incremental cost can be attributed to a single resource.
+#
+# Comment-only touch: makes this root a changed path so the cost gate evaluates
+# it, without altering a single resource - the estimate must stay identical.
 
 module "networking" {
   source = "./modules/networking"
