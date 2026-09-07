@@ -352,15 +352,29 @@ class TestDeployGating:
         matrix = gate["jobs"]["deploy"]["strategy"]["matrix"]["stack"]
         assert matrix == "${{ fromJSON(needs.detect-changes.outputs.stacks) }}"
 
-    def test_push_path_requires_matrix_stack_deployable(self, gate):
+    def test_push_path_no_longer_depends_on_the_removed_aws_evaluated_output(self, gate):
         cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert "matrix.stack.deployable == true" in cond
         assert "aws_evaluated" not in cond
 
-    def test_workflow_dispatch_path_still_restricted_to_aws_only(self, gate):
+    def test_job_if_never_references_matrix(self, gate):
+        """The `matrix` context is only valid in `strategy` and `steps`, never
+        in a job-level `if:` - referencing it there is a GitHub Actions
+        schema error the workflow would silently fail to even start with."""
+        cond = gate["jobs"]["deploy"]["if"]
+        assert "matrix." not in cond
+
+    def test_deployability_is_enforced_by_a_step_not_the_job_if(self, gate):
+        step = next(s for s in gate["jobs"]["deploy"]["steps"]
+                    if s.get("name") == "Verify the stack is deployable (trusted registry)")
+        assert "deployable" in step["run"]
+
+    def test_workflow_dispatch_aws_only_restriction_is_enforced_by_a_step(self, gate):
         cond = " ".join(gate["jobs"]["deploy"]["if"].split())
         assert "inputs.cloud == 'aws'" in cond
-        assert "matrix.stack.name == 'aws'" in cond
+        pin = next(s for s in gate["jobs"]["deploy"]["steps"]
+                   if s.get("name") == "Pin and validate deployment target")
+        assert "matrix.stack.name" in pin["run"]
+        assert "aws-only" in pin["run"].lower()
 
     def test_deploy_reverifies_deployability_from_the_registry(self, gate):
         names = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]

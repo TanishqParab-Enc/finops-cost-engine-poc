@@ -699,15 +699,20 @@ jobs:
       fail-fast: false
       matrix:
         stack: ${{ fromJSON(needs.detect-changes.outputs.stacks) }}
+    # The `matrix` context is only available in `strategy` and `steps`, never
+    # in a job-level `if:` - so deployability (matrix.stack.deployable) and
+    # the workflow_dispatch aws-only restriction (matrix.stack.name) cannot be
+    # checked here. Both are instead enforced, per matrix instance, by the
+    # first two steps below - "Pin and validate deployment target" and
+    # "Verify the stack is deployable (trusted registry)" - which fail
+    # closed before any Terraform command runs.
     if: |
       needs.cost-gate.result == 'success' && (
         (github.event_name == 'push' &&
-         github.ref == 'refs/heads/main' &&
-         matrix.stack.deployable == true) ||
+         github.ref == 'refs/heads/main') ||
         (github.event_name == 'workflow_dispatch' &&
          inputs.deploy == true &&
-         inputs.cloud == 'aws' &&
-         matrix.stack.name == 'aws')
+         inputs.cloud == 'aws')
       )
     runs-on: ubuntu-latest
     environment:
@@ -727,6 +732,10 @@ jobs:
       - name: Pin and validate deployment target
         run: |
           set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ matrix.stack.name }}" != "aws" ]; then
+            echo "::error title=Manual dispatch is aws-only::workflow_dispatch may only deploy the aws stack (got '${{ matrix.stack.name }}')."
+            exit 1
+          fi
           if [ "${{ github.event_name }}" = "push" ] && [ "$TARGET_ENV" != "dev" ]; then
             echo "::error title=Environment pin violated::Automatic push deployments are restricted to dev (got '$TARGET_ENV')."
             exit 1
