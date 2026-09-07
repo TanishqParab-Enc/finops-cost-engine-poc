@@ -677,24 +677,37 @@ jobs:
   # Apply is NEVER reachable from a pull request - PR branches run untrusted
   # code, and `terraform apply` on untrusted code is arbitrary code execution
   # against AWS. Two mutually exclusive paths reach here:
-  #   push to main    -> automatic, hard-pinned to dev, trusted code only
-  #   workflow_dispatch -> explicit opt-in, may target dev or prod
-  # Both additionally require that AWS itself was the stack the gate priced -
-  # this job applies terraform/aws, so an Azure-only or GCP-only evaluation
-  # must not reach it. Apply also targets an environment-specific workload
-  # state and var-file, so dev and prod are genuinely isolated - not just
+  #   push to main    -> automatic, hard-pinned to dev, trusted code only,
+  #                      one job per stack the push actually touched
+  #   workflow_dispatch -> explicit opt-in, aws only, may target dev or prod
+  # `matrix.stack.deployable` is read from the SAME trusted registry JSON
+  # detect-changes already built for cost-gate - a PR cannot flip it, since it
+  # is never taken from workflow input. The job also re-reads
+  # config/finops-stacks.yml directly below, so deployability is checked
+  # twice, independently. Apply targets an environment-specific workload state
+  # and var-file, so dev and prod are genuinely isolated - not just
   # IAM-role-labelled copies of the same shared state.
+  #
+  # Cost creep is rejected before this job is even eligible: verify-lock /
+  # verify-exception (in cost-gate, on this same push) re-derive the plan
+  # fingerprint from a plan generated fresh in THIS run, not the PR's cached
+  # numbers - any cost-relevant change invalidates the authorisation.
   deploy:
-    name: Deploy (gated)
+    name: Deploy (gated) [${{ matrix.stack.name }}]
     needs: [detect-changes, cost-gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.detect-changes.outputs.stacks) }}
     if: |
       needs.cost-gate.result == 'success' && (
         (github.event_name == 'push' &&
          github.ref == 'refs/heads/main' &&
-         needs.detect-changes.outputs.aws_evaluated == 'true') ||
+         matrix.stack.deployable == true) ||
         (github.event_name == 'workflow_dispatch' &&
          inputs.deploy == true &&
-         inputs.cloud == 'aws')
+         inputs.cloud == 'aws' &&
+         matrix.stack.name == 'aws')
       )
     runs-on: ubuntu-latest
     environment:
@@ -704,21 +717,16 @@ jobs:
       # push this is the literal 'dev' and inputs.* is never read, so the
       # automatic path cannot resolve to prod even if an input were forged.
       TARGET_ENV: ${{ (github.event_name == 'push' && 'dev') || inputs.deploy_environment }}
-      GATED_CLOUD: ${{ (github.event_name == 'workflow_dispatch' && inputs.cloud) || (needs.detect-changes.outputs.aws_evaluated == 'true' && 'aws') || 'none' }}
-      # This job applies exactly one stack. The name is fixed here, never taken
-      # from an input, and its deployability is re-read from the trusted
-      # registry below rather than trusted from the gate's matrix.
-      DEPLOY_STACK: aws
+      # Which stack this specific matrix job applies. Comes from the trusted
+      # stacks JSON (registry + changed paths), never a workflow input, and is
+      # re-verified against the registry file itself in the next step.
+      DEPLOY_STACK: ${{ matrix.stack.name }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Pin and validate deployment target
         run: |
           set -euo pipefail
-          if [ "$GATED_CLOUD" != "aws" ]; then
-            echo "::error title=Ungated cloud::This job applies the aws stack, but the FinOps gate evaluated '$GATED_CLOUD'. Refusing to deploy a stack that was not cost-gated."
-            exit 1
-          fi
           if [ "${{ github.event_name }}" = "push" ] && [ "$TARGET_ENV" != "dev" ]; then
             echo "::error title=Environment pin violated::Automatic push deployments are restricted to dev (got '$TARGET_ENV')."
             exit 1
@@ -795,12 +803,14 @@ jobs:
           role-to-assume: ${{ steps.role.outputs.arn }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # State key and var-file both derive from TARGET_ENV, which is resolved
-      # by a GitHub Actions expression and validated above - not built from
-      # raw shell input. terraform.tfvars in this directory is the committed
-      # cost-gate baseline only; it is never passed as -var-file for a deploy,
-      # and the explicit -var-file below sets every variable that file also
-      # sets, so its auto-loaded values are always overridden.
+      # State key and var-file both derive from TARGET_ENV and the matrix
+      # stack, resolved by GitHub Actions expressions and validated above -
+      # never built from raw shell input. For aws this reproduces the exact
+      # prior literals (finops-poc/${TARGET_ENV}/aws/terraform.tfstate,
+      # environments/${TARGET_ENV}.tfvars) byte-for-byte, since matrix.stack.dir
+      # and matrix.stack.name equal terraform/aws and aws respectively. A stack
+      # with no environments/<env>.tfvars (web-platform today) auto-loads its
+      # own committed terraform.tfvars instead - never a scenario fixture.
       #
       # Plan to a file first, then apply exactly that plan - the same
       # save-then-apply pattern already used by
@@ -809,17 +819,22 @@ jobs:
       # generated at apply time.
       - name: Terraform plan
         id: plan
-        working-directory: terraform/aws
+        working-directory: ${{ matrix.stack.dir }}
         run: |
           set -euo pipefail
           terraform init -input=false -no-color \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=finops-poc/${TARGET_ENV}/aws/terraform.tfstate" \
+            -backend-config="key=finops-poc/${TARGET_ENV}/${{ matrix.stack.name }}/terraform.tfstate" \
             -backend-config="use_lockfile=true" \
             -backend-config="encrypt=true" \
             -backend-config="region=${{ env.AWS_REGION }}"
+
+          VAR_ARG=""
+          if [ -f "environments/${TARGET_ENV}.tfvars" ]; then
+            VAR_ARG="-var-file=environments/${TARGET_ENV}.tfvars"
+          fi
           terraform plan -input=false -no-color -lock-timeout=5m \
-            -var-file="environments/${TARGET_ENV}.tfvars" \
+            $VAR_ARG \
             -out=tfplan.binary
           terraform show -json tfplan.binary > plan.json
 
@@ -839,7 +854,7 @@ jobs:
           exit 1
 
       - name: Terraform apply
-        working-directory: terraform/aws
+        working-directory: ${{ matrix.stack.dir }}
         run: |
           set -euo pipefail
           terraform apply -input=false -no-color -lock-timeout=5m tfplan.binary

@@ -345,8 +345,22 @@ class TestDeployGating:
     def test_deploy_job_still_exists_as_the_boundary(self, gate):
         assert "deploy" in gate["jobs"]
 
-    def test_deploy_stack_is_fixed_not_an_input(self, gate):
-        assert gate["jobs"]["deploy"]["env"]["DEPLOY_STACK"] == "aws"
+    def test_deploy_stack_comes_from_the_matrix_not_an_input(self, gate):
+        assert gate["jobs"]["deploy"]["env"]["DEPLOY_STACK"] == "${{ matrix.stack.name }}"
+
+    def test_deploy_job_is_stack_matrixed_from_the_trusted_registry(self, gate):
+        matrix = gate["jobs"]["deploy"]["strategy"]["matrix"]["stack"]
+        assert matrix == "${{ fromJSON(needs.detect-changes.outputs.stacks) }}"
+
+    def test_push_path_requires_matrix_stack_deployable(self, gate):
+        cond = " ".join(gate["jobs"]["deploy"]["if"].split())
+        assert "matrix.stack.deployable == true" in cond
+        assert "aws_evaluated" not in cond
+
+    def test_workflow_dispatch_path_still_restricted_to_aws_only(self, gate):
+        cond = " ".join(gate["jobs"]["deploy"]["if"].split())
+        assert "inputs.cloud == 'aws'" in cond
+        assert "matrix.stack.name == 'aws'" in cond
 
     def test_deploy_reverifies_deployability_from_the_registry(self, gate):
         names = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]
@@ -382,8 +396,31 @@ class TestDeployGating:
                          "Block destructive apply", "Terraform apply"):
             assert required in steps
         plan = next(s for s in gate["jobs"]["deploy"]["steps"] if s.get("name") == "Terraform plan")
-        assert plan["working-directory"] == "terraform/aws"
-        assert "key=finops-poc/${TARGET_ENV}/aws/terraform.tfstate" in plan["run"]
+        # Generalized to the matrix stack, but for the aws entry
+        # (name=aws, dir=terraform/aws) this interpolates to the exact
+        # literals the job used before generalization.
+        assert plan["working-directory"] == "${{ matrix.stack.dir }}"
+        assert "key=finops-poc/${TARGET_ENV}/${{ matrix.stack.name }}/terraform.tfstate" in plan["run"]
+        aws = load_stacks(REGISTRY)["aws"]
+        assert aws.terraform_dir == "terraform/aws"
+        assert aws.name == "aws"
+
+    def test_var_file_is_conditional_on_existence_not_hardcoded(self, gate):
+        plan = next(s for s in gate["jobs"]["deploy"]["steps"] if s.get("name") == "Terraform plan")
+        assert 'if [ -f "environments/${TARGET_ENV}.tfvars" ]' in plan["run"]
+        assert 'VAR_ARG="-var-file=environments/${TARGET_ENV}.tfvars"' in plan["run"]
+
+    def test_apply_working_directory_matches_the_matrix_stack(self, gate):
+        apply = next(s for s in gate["jobs"]["deploy"]["steps"]
+                     if s.get("name") == "Terraform apply")
+        assert apply["working-directory"] == "${{ matrix.stack.dir }}"
+
+    def test_web_platform_cannot_reach_deploy_on_push(self):
+        """web-platform is deployable=false, so the matrix.stack.deployable
+        check in the job `if` excludes it even though it may appear in the
+        same push's selected stacks alongside aws."""
+        registry = load_stacks(REGISTRY)
+        assert registry["web-platform"].deployable is False
 
     def test_destroy_guard_precedes_apply(self, gate):
         steps = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]
@@ -557,6 +594,41 @@ class TestCostCreep:
         assert "Terraform plan" in names
         plan = next(s for s in gate["jobs"]["deploy"]["steps"] if s.get("name") == "Terraform plan")
         assert "terraform plan" in plan["run"]
+
+
+class TestApprovalBeforeDeploymentOrdering:
+    """Deployment must be structurally unreachable until cost-gate resolves
+    (where the exception/lock authorisation lives), never merely 'usually
+    resolved first' by job listing order."""
+
+    def test_deploy_needs_cost_gate_to_have_finished(self, gate):
+        assert gate["jobs"]["deploy"]["needs"] == ["detect-changes", "cost-gate"]
+
+    def test_deploy_requires_cost_gate_success_not_just_completion(self, gate):
+        cond = " ".join(gate["jobs"]["deploy"]["if"].split())
+        assert cond.startswith("needs.cost-gate.result == 'success' &&")
+
+    def test_no_sleep_or_wait_based_approval_inside_the_pr_job(self, gate_text):
+        """Approval must never be a workflow pausing to wait for a review to
+        arrive - a PR run finishes BLOCKED and a later trusted run deploys."""
+        assert "sleep" not in gate_text.lower()
+
+    def test_no_workflow_provided_approved_boolean_is_ever_trusted(self, gate_text):
+        """A PR must never be able to just assert 'approved=true' - deploy's
+        own conditions never read an `inputs.approved`-style flag."""
+        assert "inputs.approved" not in gate_text
+        assert "inputs.force_deploy" not in gate_text
+
+
+class TestNoTerraformTargeting:
+    def test_workflow_never_uses_target(self, gate_text):
+        assert "-target" not in gate_text
+
+    def test_apply_always_uses_a_previously_saved_plan_file(self, gate):
+        apply = next(s for s in gate["jobs"]["deploy"]["steps"]
+                     if s.get("name") == "Terraform apply")
+        assert "tfplan.binary" in apply["run"]
+        assert "-target" not in apply["run"]
 
 
 class TestStackedPRSelection:
