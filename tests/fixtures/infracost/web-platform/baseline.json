@@ -1,0 +1,2162 @@
+{
+  "currency": "USD",
+  "summary": {
+    "projects": 1,
+    "resources": 40,
+    "costed_resources": 16,
+    "free_resources": 24,
+    "total_monthly_cost": "85.555",
+    "total_potential_yearly_savings": "35.04",
+    "finops_policies": 18,
+    "failing_finops_policies": 8,
+    "distinct_failing_finops_resources": 4,
+    "tagging_policies": 1,
+    "failing_tagging_policies": 1,
+    "distinct_failing_tagging_resources": 29
+  },
+  "projects": [
+    {
+      "project_name": "baseline.json",
+      "path": "baseline.json",
+      "finops_results": [
+        {
+          "policy_id": "3689e164-3164-4844-a90d-3b807ba2bf7a",
+          "policy_name": "[CloudFront.3] CloudFront distributions should require encryption in transit",
+          "policy_slug": "aws-cloudfront-viewer-protocol-https",
+          "policy_message": "Consider requiring HTTPS or redirecting HTTP to HTTPS on CloudFront distributions to protect data in transit. Unencrypted HTTP connections expose data to interception and man-in-the-middle attacks. Corresponds to [AWS Security Hub CloudFront.3](https://docs.aws.amazon.com/securityhub/latest/userguide/cloudfront-controls.html#cloudfront-3).",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "bf6ec7e0-95cc-480c-9d39-b7a74b262eb7",
+          "policy_name": "CloudFront - distributions should have WAF enabled",
+          "policy_slug": "aws-cloudfront-waf-enabled",
+          "policy_message": "CloudFront distributions should have WAF enabled to help protect against malicious attacks. AWS WAF is a web application firewall that lets you monitor HTTP(S) requests and control access to your content. Corresponds to [AWS Security Hub CloudFront.6](https://docs.aws.amazon.com/securityhub/latest/userguide/cloudfront-controls.html#cloudfront-6).",
+          "failing_resources": [
+            {
+              "name": "module.cdn.aws_cloudfront_distribution.main[0]",
+              "issues": [
+                {
+                  "description": "Set the `web_acl_id` argument in the CloudFront distribution configuration to reference the ARN of your custom WAF Web ACL.",
+                  "yearly_savings": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "address": "module.cdn.aws_cloudfront_distribution.main[0]",
+                  "attribute": "web_acl_id"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "3f85167b-9c3c-46a9-b63d-b60f6ce1997f",
+          "policy_name": "S3 - consider deleting incomplete multi-part uploads",
+          "policy_slug": "aws-delete-multi-part-uploads-s3-lifecycle-configuration",
+          "policy_message": "When S3 uploads fail, the incomplete multi-part data still lives in S3 and costs money even though it's not a usable S3 object. You can avoid paying for that by setting the number of days after which these are deleted. We suggest 7 days.",
+          "failing_resources": [
+            {
+              "name": "module.object_storage.aws_s3_bucket.assets",
+              "issues": [
+                {
+                  "description": "Add a lifecycle rule which specifies a configuration to abort incomplete multipart uploads",
+                  "yearly_savings": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "address": "module.object_storage.aws_s3_bucket.assets"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "7256f4d5-d4a2-46a7-a96e-525289b87dcb",
+          "policy_name": "S3 - consider deleting or moving non-current object versions to a cheaper storage class",
+          "policy_slug": "aws-delete-non-current-object-versions-s3-lifecycle-configuration",
+          "policy_message": "S3 can store multiple versions of the same object. However, most of the time, you only need the current version. So you could set the number of days after which non-current objects are deleted. Ensure that you do not need non-current object versions first.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "b75f1686-0084-4c65-b3aa-6b8495ca7299",
+          "policy_name": "[ELB.1] Application Load Balancer should be configured to redirect all HTTP requests to HTTPS",
+          "policy_slug": "aws-elb-https-redirect",
+          "policy_message": "Consider configuring Application Load Balancer to redirect all HTTP requests to HTTPS to encrypt data in transit. Corresponds to [AWS Security Hub ELB.1](https://docs.aws.amazon.com/securityhub/latest/userguide/elb-controls.html#elb-1).",
+          "failing_resources": [
+            {
+              "name": "module.alb.aws_lb_listener.http",
+              "issues": [
+                {
+                  "description": "Configure the listener's default action to redirect to the HTTPS protocol",
+                  "yearly_savings": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "address": "module.alb.aws_lb_listener.http",
+                  "attribute": "default_action[0].type"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "34273636-13fd-4dfe-97e2-743d137f5662",
+          "policy_name": "S3 - consider using Intelligent-Tiering or adding a lifecycle policy",
+          "policy_slug": "aws-ensure-transition-rules-defined-s3-lifecycle-configuration",
+          "policy_message": "Use a lifecycle policy to reduce object storage costs. You can reduce storage costs by defining policies that remove or move objects to a less expensive S3 storage class. For example, a bucket storing 1TB of data in a standard storage class would have a monthly cost of $23. If the same data was moved to Glacier Flexible Retrieval storage class it would have a monthly cost of just $3.60. That's a 84% cost saving.",
+          "failing_resources": [
+            {
+              "name": "module.object_storage.aws_s3_bucket.assets",
+              "issues": [
+                {
+                  "description": "Add a lifecycle rule which specifies a transition or expiration configuration",
+                  "yearly_savings": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "address": "module.object_storage.aws_s3_bucket.assets"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "f022b6d4-87d5-4f16-947a-3ec2e459bcf9",
+          "policy_name": "EBS - consider upgrading gp2 volumes to gp3",
+          "policy_slug": "aws-gp2-to-gp3",
+          "policy_message": "gp3 volumes are the latest generation of general-purpose SSD-based EBS volumes that enable you to provision performance independent of storage capacity, while providing up to **20% lower price per GB** than existing gp2 volumes. With gp3 volumes, you can scale IOPS (input/output operations per second) and throughput without needing to provision additional block storage capacity. This means you only pay for the storage you need.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "a6e0e47f-7179-40b4-ba1d-e0cdbd26fa16",
+          "policy_name": "EBS - consider updating io1/io2 volumes to gp3",
+          "policy_slug": "aws-io1-io2-to-gp3",
+          "policy_message": "io1 and io2 volume types that need less than 16K IOPS, and less than 1000 MB/s Throughput, and don\u2019t use Multi-Attach should be switched to gp3 as that is **at least 2X cheaper**. For example, a gp3 volume with 16TB storage, 16K IOPS and 1000 MB/s Throughput costs $1.4K/month vs $3K/month on io1 or io2.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "0dabf1ca-cfb2-4462-a611-35668a27e6c3",
+          "policy_name": "RDS Cluster - consider enabling CloudWatch log exports",
+          "policy_slug": "aws-rds-cluster-enable-cloudwatch-logs",
+          "policy_message": "Consider enabling CloudWatch log exports for RDS clusters and instances to enable monitoring and auditing capabilities. This helps with troubleshooting, performance analysis, and compliance requirements. See [RDS.9](https://docs.aws.amazon.com/securityhub/latest/userguide/rds-controls.html#rds-9) for more information.",
+          "failing_resources": [
+            {
+              "name": "module.database.aws_db_instance.main",
+              "issues": [
+                {
+                  "description": "Set `enabled_cloudwatch_logs_exports` to include all required log types for this RDS instance to enable monitoring and auditing capabilities. Export list should be [\"postgresql\", \"upgrade\"], but currently is: [].",
+                  "yearly_savings": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "address": "module.database.aws_db_instance.main",
+                  "attribute": "enabled_cloudwatch_logs_exports"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "7444d43a-a38f-4436-95ca-978ec803e0bb",
+          "policy_name": "[RDS.16, RDS.17] RDS instances and clusters should be configured to copy tags to DB snapshots",
+          "policy_slug": "aws-rds-copy-tags-to-snapshot",
+          "policy_message": "Consider configuring RDS DB instances and clusters to copy tags to snapshots to maintain consistent resource tagging and support asset tracking. Corresponds to AWS Security Hub [RDS.16](https://docs.aws.amazon.com/securityhub/latest/userguide/rds-controls.html#rds-16) (Aurora clusters) and [RDS.17](https://docs.aws.amazon.com/securityhub/latest/userguide/rds-controls.html#rds-17) (DB instances).",
+          "failing_resources": [
+            {
+              "name": "module.database.aws_db_instance.main",
+              "issues": [
+                {
+                  "description": "Set `copy_tags_to_snapshot` to `true`",
+                  "yearly_savings": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "address": "module.database.aws_db_instance.main",
+                  "attribute": "copy_tags_to_snapshot"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "dc55c312-6754-4a50-a0be-7f2a2f41012b",
+          "policy_name": "[RDS.3] RDS DB instances should have encryption at-rest enabled",
+          "policy_slug": "aws-rds-encrypted-at-rest",
+          "policy_message": "RDS DB instances and clusters should have encryption at rest enabled to protect sensitive data and meet compliance requirements. Corresponds to [AWS Security Hub RDS.3](https://docs.aws.amazon.com/securityhub/latest/userguide/rds-controls.html#rds-3).\n\nNOTE: Encryption at rest cannot be enabled on existing unencrypted databases. To enable encryption on an existing database, you must create a snapshot, create an encrypted copy of the snapshot, restore from the encrypted snapshot to a new database instance, and migrate applications. This process requires downtime and careful planning.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "1026236c-9312-4917-9755-a49b766f831e",
+          "policy_name": "RDS - consider upgrading gp2 storage type to gp3",
+          "policy_slug": "aws-rds-gp2-to-gp3",
+          "policy_message": "gp3 is the latest generation storage type with general-purpose SSDs that enable you to provision performance independent of storage capacity, while providing up to **20% lower price per GB** than the existing gp2 storage type. With gp3, you can scale IOPS (input/output operations per second) and throughput without needing to provision additional block storage capacity. This means you only pay for the storage you need.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "07d97053-cfa8-44ad-870c-6e64f89bf51c",
+          "policy_name": "[S3.5] S3 buckets should require requests to use SSL",
+          "policy_slug": "aws-s3-bucket-ssl-requests-only",
+          "policy_message": "S3 buckets should have a bucket policy that denies non-SSL (HTTP) requests. Without this policy, data in transit is not protected from interception. Add a bucket policy with a Deny statement for requests where aws:SecureTransport is false.",
+          "failing_resources": [
+            {
+              "name": "module.object_storage.aws_s3_bucket.assets",
+              "issues": [
+                {
+                  "description": "Attach a bucket policy with a `Deny` statement for requests where `aws:SecureTransport` is `false`, so non-SSL requests are rejected.",
+                  "yearly_savings": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0",
+                  "address": "module.object_storage.aws_s3_bucket.assets",
+                  "attribute": "bucket"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "4f1c6f5a-d7be-4a88-98c1-fbfc97401ec9",
+          "policy_name": "RDS - consider upgrading version to avoid extended support costs",
+          "policy_slug": "aws-upgrade-rds-engine-version-for-extended-support-policy",
+          "policy_message": "Consider upgrading your RDS database engine version to avoid extended support costs. Extended support costs can add a significant additional cost to your database.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "cad0d856-35ee-4cf2-8599-f645a5355e5e",
+          "policy_name": "RDS - consider using latest generation instances for t family instances",
+          "policy_slug": "aws-upgrade-t-to-t3-rds-instance-family",
+          "policy_message": "Upgrade to the latest generation of Amazon RDS instances in the T family for improved CPU performance while maintaining cost efficiency.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "7574eb2b-9a4f-44bf-b912-de34e69a42ed",
+          "policy_name": "Cloudwatch - consider using a retention policy to reduce storage costs",
+          "policy_slug": "aws-use-cloudwatch-retention-policy",
+          "policy_message": "Use a retention policy to avoid retaining logs indefinitely and accumulating storage costs. For example, if an application generates 5GB of logs daily, in a year without retention, you'd store 1.8TB of logs. In the AWS US East (N. Virginia) region, where storage costs $0.03 per GB per month, you'll incur a cumulative yearly cost of ~$802. This cost will continually grow as more logs are added.",
+          "failing_resources": []
+        },
+        {
+          "policy_id": "24d22585-cfa0-4d9b-9eb5-d820d59d1d5b",
+          "policy_name": "RDS - consider using Graviton instances",
+          "policy_slug": "aws-use-graviton-rds-instance",
+          "policy_message": "Graviton instances are around 20% cheaper than equivalent x86 instances.",
+          "failing_resources": [
+            {
+              "name": "module.database.aws_db_instance.main",
+              "issues": [
+                {
+                  "description": "Switch `instance_class` from `db.t3.small` to Graviton instance `db.t4g.small`",
+                  "yearly_savings": "35.04",
+                  "monthly_carbon_savings_grams_co2e": "168.8024114",
+                  "monthly_water_savings_liters": "2.5076376000000002",
+                  "address": "module.database.aws_db_instance.main",
+                  "attribute": "instance_class"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "policy_id": "b8d20d8b-8141-4950-a84d-12357863fad9",
+          "policy_name": "RDS - consider using single-AZ databases in non-production projects",
+          "policy_slug": "aws-use-single-az-rds-outside-prod",
+          "policy_message": "Limit your RDS databases to a single availability zone in non-prod environments to reduce costs by around half. For example, a db.m4.large utilizing multi-AZ costs ~$310/month, whereas single-AZ costs ~$166/month.",
+          "failing_resources": []
+        }
+      ],
+      "tagging_results": [
+        {
+          "policy_id": "d9d6a664-485f-4851-adb0-3fb150eb0aa9",
+          "policy_name": "FinOps tags",
+          "message": "This example Tagging policy shows how you can enforce required FinOps tag keys/values in pull requests. This example checks for the tags 'Service' (can have any value) and 'Environment' (must be Dev/Stage/Prod) on all taggable resources being changed in the pull request. You can adjust it from https://dashboard.infracost.io > Governance > Tagging policies. You have a 14 day trial of this feature as it's part of Infracost Cloud.",
+          "tag_schema": [
+            {
+              "key": "Service",
+              "mandatory": true
+            },
+            {
+              "key": "Environment",
+              "valid_values": [
+                "Dev",
+                "Prod",
+                "Stage"
+              ],
+              "mandatory": true
+            }
+          ],
+          "failing_resources": [
+            {
+              "address": "module.iam.aws_iam_instance_profile.instance",
+              "resource_type": "aws_iam_instance_profile",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.iam.aws_iam_role.instance",
+              "resource_type": "aws_iam_role",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_internet_gateway.main",
+              "resource_type": "aws_internet_gateway",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_route_table.private[0]",
+              "resource_type": "aws_route_table",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_route_table.private[1]",
+              "resource_type": "aws_route_table",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_route_table.public",
+              "resource_type": "aws_route_table",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_security_group.alb",
+              "resource_type": "aws_security_group",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_security_group.app",
+              "resource_type": "aws_security_group",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_security_group.database",
+              "resource_type": "aws_security_group",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.alb.aws_lb_target_group.app",
+              "resource_type": "aws_lb_target_group",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.database.aws_db_subnet_group.main",
+              "resource_type": "aws_db_subnet_group",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.compute.aws_autoscaling_group.app",
+              "resource_type": "aws_autoscaling_group",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_eip.nat[0]",
+              "resource_type": "aws_eip",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.compute.aws_launch_template.app",
+              "resource_type": "aws_launch_template",
+              "invalid_tags": [
+                {
+                  "key": "Environment",
+                  "value": ""
+                }
+              ],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.alb.aws_lb_listener.http",
+              "resource_type": "aws_lb_listener",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.alb.aws_lb.main",
+              "resource_type": "aws_lb",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_nat_gateway.main[0]",
+              "resource_type": "aws_nat_gateway",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_subnet.private[0]",
+              "resource_type": "aws_subnet",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_subnet.private[1]",
+              "resource_type": "aws_subnet",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_subnet.public[0]",
+              "resource_type": "aws_subnet",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_subnet.public[1]",
+              "resource_type": "aws_subnet",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.networking.aws_vpc.main",
+              "resource_type": "aws_vpc",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.cdn.aws_cloudfront_distribution.main[0]",
+              "resource_type": "aws_cloudfront_distribution",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.monitoring.aws_cloudwatch_log_group.access",
+              "resource_type": "aws_cloudwatch_log_group",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.monitoring.aws_cloudwatch_log_group.app",
+              "resource_type": "aws_cloudwatch_log_group",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.monitoring.aws_cloudwatch_metric_alarm.high_cpu",
+              "resource_type": "aws_cloudwatch_metric_alarm",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.database.aws_db_instance.main",
+              "resource_type": "aws_db_instance",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.dns.aws_route53_zone.main[0]",
+              "resource_type": "aws_route53_zone",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            },
+            {
+              "address": "module.object_storage.aws_s3_bucket.assets",
+              "resource_type": "aws_s3_bucket",
+              "invalid_tags": [],
+              "path": "",
+              "line": 0,
+              "missing_mandatory_tags": [
+                "Service"
+              ],
+              "propagation_problems": []
+            }
+          ]
+        }
+      ],
+      "resources": [
+        {
+          "name": "module.iam.aws_iam_instance_profile.instance",
+          "type": "aws_iam_instance_profile",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "c964e64d34ef9404"
+          }
+        },
+        {
+          "name": "module.iam.aws_iam_role.instance",
+          "type": "aws_iam_role",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "1c0aa75d182c65d"
+          }
+        },
+        {
+          "name": "module.iam.aws_iam_role_policy.instance",
+          "type": "aws_iam_role_policy",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "7abd328cc897b721"
+          }
+        },
+        {
+          "name": "module.cdn.aws_cloudfront_origin_access_control.assets[0]",
+          "type": "aws_cloudfront_origin_access_control",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "faa8b1e785e95af8"
+          }
+        },
+        {
+          "name": "module.networking.aws_internet_gateway.main",
+          "type": "aws_internet_gateway",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-igw",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "af97ceca7b98e7a9"
+          }
+        },
+        {
+          "name": "module.networking.aws_route_table.private[0]",
+          "type": "aws_route_table",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-rt-private-0",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "2c30f39169617d56"
+          }
+        },
+        {
+          "name": "module.networking.aws_route_table.private[1]",
+          "type": "aws_route_table",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-rt-private-1",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "bda9f5741777106b"
+          }
+        },
+        {
+          "name": "module.networking.aws_route_table.public",
+          "type": "aws_route_table",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-rt-public",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "43e7e16b8bf9ae96"
+          }
+        },
+        {
+          "name": "module.networking.aws_route_table_association.private[0]",
+          "type": "aws_route_table_association",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "274a817976c4f0e8"
+          }
+        },
+        {
+          "name": "module.networking.aws_route_table_association.private[1]",
+          "type": "aws_route_table_association",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "274a817976c4f0e8"
+          }
+        },
+        {
+          "name": "module.networking.aws_route_table_association.public[0]",
+          "type": "aws_route_table_association",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "274a817976c4f0e8"
+          }
+        },
+        {
+          "name": "module.networking.aws_route_table_association.public[1]",
+          "type": "aws_route_table_association",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "274a817976c4f0e8"
+          }
+        },
+        {
+          "name": "module.networking.aws_security_group.alb",
+          "type": "aws_security_group",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-alb-sg",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "9500d4755f65adf8"
+          }
+        },
+        {
+          "name": "module.networking.aws_security_group.app",
+          "type": "aws_security_group",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-app-sg",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "fefc6fde6dc31d48"
+          }
+        },
+        {
+          "name": "module.networking.aws_security_group.database",
+          "type": "aws_security_group",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-db-sg",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "3a7a44136aede320"
+          }
+        },
+        {
+          "name": "module.alb.aws_lb_target_group.app",
+          "type": "aws_lb_target_group",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "9504063968c825d3"
+          }
+        },
+        {
+          "name": "module.database.aws_db_subnet_group.main",
+          "type": "aws_db_subnet_group",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "4a8937161fef0d65"
+          }
+        },
+        {
+          "name": "module.object_storage.aws_s3_bucket_public_access_block.assets",
+          "type": "aws_s3_bucket_public_access_block",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "56d5f39fcad9ed09"
+          }
+        },
+        {
+          "name": "module.object_storage.aws_s3_bucket_server_side_encryption_configuration.assets",
+          "type": "aws_s3_bucket_server_side_encryption_configuration",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "294454a68332fd21"
+          }
+        },
+        {
+          "name": "module.compute.aws_autoscaling_group.app",
+          "type": "aws_autoscaling_group",
+          "is_supported": true,
+          "is_free": true,
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "dad33cb060fac1b3"
+          }
+        },
+        {
+          "name": "module.networking.aws_eip.nat[0]",
+          "type": "aws_eip",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "IP address (if unused)",
+              "unit": "hours",
+              "price": "0.005",
+              "quantity": "730",
+              "base_monthly_cost": "3.65",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "3.65",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-nat-eip-0",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "9928ecebf3339675"
+          }
+        },
+        {
+          "name": "module.compute.aws_launch_template.app",
+          "type": "aws_launch_template",
+          "is_supported": true,
+          "is_free": true,
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "dd1f31a508be0968"
+          }
+        },
+        {
+          "name": "module.alb.aws_lb_listener.http",
+          "type": "aws_lb_listener",
+          "is_supported": true,
+          "is_free": true,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "197371ec84e7f897"
+          }
+        },
+        {
+          "name": "module.alb.aws_lb.main",
+          "type": "aws_lb",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Application load balancer",
+              "unit": "hours",
+              "price": "0.0225",
+              "quantity": "730",
+              "base_monthly_cost": "16.425",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "16.425",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Load balancer capacity units",
+              "unit": "LCU",
+              "price": "5.84",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-alb",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "a247d02560988bbc"
+          }
+        },
+        {
+          "name": "module.networking.aws_nat_gateway.main[0]",
+          "type": "aws_nat_gateway",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "NAT gateway",
+              "unit": "hours",
+              "price": "0.045",
+              "quantity": "730",
+              "base_monthly_cost": "32.85",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "32.85",
+              "monthly_carbon_savings_grams_co2e": "235.3808861",
+              "monthly_water_savings_liters": "1.4367568"
+            },
+            {
+              "name": "Data processed",
+              "unit": "GB",
+              "price": "0.045",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-nat-0",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "8ef5d39e773c83db"
+          }
+        },
+        {
+          "name": "module.networking.aws_subnet.private[0]",
+          "type": "aws_subnet",
+          "is_supported": false,
+          "is_free": false,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-private-0",
+            "Tier": "private",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "66a8b0246813c4e0"
+          }
+        },
+        {
+          "name": "module.networking.aws_subnet.private[1]",
+          "type": "aws_subnet",
+          "is_supported": false,
+          "is_free": false,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-private-1",
+            "Tier": "private",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "a806b4eddfdd8122"
+          }
+        },
+        {
+          "name": "module.networking.aws_subnet.public[0]",
+          "type": "aws_subnet",
+          "is_supported": false,
+          "is_free": false,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-public-0",
+            "Tier": "public",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "3683f7d42d62f313"
+          }
+        },
+        {
+          "name": "module.networking.aws_subnet.public[1]",
+          "type": "aws_subnet",
+          "is_supported": false,
+          "is_free": false,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-public-1",
+            "Tier": "public",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "6690e12bcfd2073f"
+          }
+        },
+        {
+          "name": "module.networking.aws_vpc.main",
+          "type": "aws_vpc",
+          "is_supported": false,
+          "is_free": false,
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-vpc",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "d7620607ac3a51a9"
+          }
+        },
+        {
+          "name": "module.cdn.aws_cloudfront_distribution.main[0]",
+          "type": "aws_cloudfront_distribution",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Invalidation requests (first 1k)",
+              "unit": "paths",
+              "price": "0",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "subresources": [
+            {
+              "name": "US, Mexico, Canada",
+              "type": "",
+              "is_supported": false,
+              "is_free": false,
+              "cost_components": [
+                {
+                  "name": "Data transfer out to internet (first 10TB)",
+                  "unit": "GB",
+                  "price": "0.085",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Data transfer out to origin",
+                  "unit": "GB",
+                  "price": "0.02",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "HTTP requests",
+                  "unit": "10k requests",
+                  "price": "0.0075",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "HTTPS requests",
+                  "unit": "10k requests",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                }
+              ],
+              "metadata": {}
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "2349ca0d73eb9414"
+          }
+        },
+        {
+          "name": "module.monitoring.aws_cloudwatch_log_group.access",
+          "type": "aws_cloudwatch_log_group",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Data ingested",
+              "unit": "GB",
+              "price": "0.5",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Archival Storage",
+              "unit": "GB",
+              "price": "0.03",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Insights queries data scanned",
+              "unit": "GB",
+              "price": "0.005",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "e62fab24e9539053"
+          }
+        },
+        {
+          "name": "module.monitoring.aws_cloudwatch_log_group.app",
+          "type": "aws_cloudwatch_log_group",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Data ingested",
+              "unit": "GB",
+              "price": "0.5",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Archival Storage",
+              "unit": "GB",
+              "price": "0.03",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Insights queries data scanned",
+              "unit": "GB",
+              "price": "0.005",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "33cf964ab53c38ab"
+          }
+        },
+        {
+          "name": "module.monitoring.aws_cloudwatch_metric_alarm.high_cpu",
+          "type": "aws_cloudwatch_metric_alarm",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Standard resolution",
+              "unit": "alarm metrics",
+              "price": "0.1",
+              "quantity": "1",
+              "base_monthly_cost": "0.1",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0.1",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "0ed94d8b640f52f2"
+          }
+        },
+        {
+          "name": "module.database.aws_db_instance.main",
+          "type": "aws_db_instance",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Database instance (on-demand, Single-AZ, db.t3.small)",
+              "unit": "hours",
+              "price": "0.036",
+              "quantity": "730",
+              "base_monthly_cost": "26.28",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "26.28",
+              "monthly_carbon_savings_grams_co2e": "1178.4945603",
+              "monthly_water_savings_liters": "3.5924395"
+            },
+            {
+              "name": "Storage (general purpose SSD, gp3)",
+              "unit": "GB",
+              "price": "0.115",
+              "quantity": "50",
+              "base_monthly_cost": "5.75",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "5.75",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Additional backup storage",
+              "unit": "GB",
+              "price": "0.095",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-db",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "6c525c57e0eb3dd8"
+          }
+        },
+        {
+          "name": "module.dns.aws_route53_record.app[0]",
+          "type": "aws_route53_record",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Standard queries (first 1B)",
+              "unit": "1M queries",
+              "price": "0.4",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Latency based routing queries (first 1B)",
+              "unit": "1M queries",
+              "price": "0.6",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            },
+            {
+              "name": "Geo DNS queries (first 1B)",
+              "unit": "1M queries",
+              "price": "0.7",
+              "quantity": "0",
+              "base_monthly_cost": "0",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "metadata": {
+            "deep_checksum": "c9d5f22f6cded209"
+          }
+        },
+        {
+          "name": "module.dns.aws_route53_zone.main[0]",
+          "type": "aws_route53_zone",
+          "is_supported": true,
+          "is_free": false,
+          "cost_components": [
+            {
+              "name": "Hosted zone",
+              "unit": "months",
+              "price": "0.5",
+              "quantity": "1",
+              "base_monthly_cost": "0.5",
+              "usage_monthly_cost": "0",
+              "total_monthly_cost": "0.5",
+              "monthly_carbon_savings_grams_co2e": "0",
+              "monthly_water_savings_liters": "0"
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "489f14cc0aca2546"
+          }
+        },
+        {
+          "name": "module.object_storage.aws_s3_bucket.assets",
+          "type": "aws_s3_bucket",
+          "is_supported": true,
+          "is_free": false,
+          "subresources": [
+            {
+              "name": "Standard",
+              "type": "",
+              "is_supported": false,
+              "is_free": false,
+              "cost_components": [
+                {
+                  "name": "Storage",
+                  "unit": "GB",
+                  "price": "0.023",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "PUT, COPY, POST, LIST requests",
+                  "unit": "1k requests",
+                  "price": "0.005",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "GET, SELECT, and all other requests",
+                  "unit": "1k requests",
+                  "price": "0.0004",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data scanned",
+                  "unit": "GB",
+                  "price": "0.002",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data returned",
+                  "unit": "GB",
+                  "price": "0.0007",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                }
+              ],
+              "metadata": {}
+            },
+            {
+              "name": "Intelligent tiering",
+              "type": "",
+              "is_supported": false,
+              "is_free": false,
+              "cost_components": [
+                {
+                  "name": "Storage (frequent access)",
+                  "unit": "GB",
+                  "price": "0.023",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Storage (infrequent access)",
+                  "unit": "GB",
+                  "price": "0.0125",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Storage (archive access)",
+                  "unit": "GB",
+                  "price": "0.0036",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Storage (deep archive access)",
+                  "unit": "GB",
+                  "price": "0.00099",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Monitoring and automation",
+                  "unit": "1k objects",
+                  "price": "0.0025",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "PUT, COPY, POST, LIST requests",
+                  "unit": "1k requests",
+                  "price": "0.005",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "GET, SELECT, and all other requests",
+                  "unit": "1k requests",
+                  "price": "0.0004",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Lifecycle transition",
+                  "unit": "1k requests",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data scanned",
+                  "unit": "GB",
+                  "price": "0.002",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data returned",
+                  "unit": "GB",
+                  "price": "0.0007",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Early delete (within 30 days)",
+                  "unit": "GB",
+                  "price": "0.023",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                }
+              ],
+              "metadata": {}
+            },
+            {
+              "name": "Standard - infrequent access",
+              "type": "",
+              "is_supported": false,
+              "is_free": false,
+              "cost_components": [
+                {
+                  "name": "Storage",
+                  "unit": "GB",
+                  "price": "0.0125",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "PUT, COPY, POST, LIST requests",
+                  "unit": "1k requests",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "GET, SELECT, and all other requests",
+                  "unit": "1k requests",
+                  "price": "0.001",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Lifecycle transition",
+                  "unit": "1k requests",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrievals",
+                  "unit": "GB",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data scanned",
+                  "unit": "GB",
+                  "price": "0.002",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data returned",
+                  "unit": "GB",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                }
+              ],
+              "metadata": {}
+            },
+            {
+              "name": "One zone - infrequent access",
+              "type": "",
+              "is_supported": false,
+              "is_free": false,
+              "cost_components": [
+                {
+                  "name": "Storage",
+                  "unit": "GB",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "PUT, COPY, POST, LIST requests",
+                  "unit": "1k requests",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "GET, SELECT, and all other requests",
+                  "unit": "1k requests",
+                  "price": "0.001",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Lifecycle transition",
+                  "unit": "1k requests",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrievals",
+                  "unit": "GB",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data scanned",
+                  "unit": "GB",
+                  "price": "0.002",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data returned",
+                  "unit": "GB",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                }
+              ],
+              "metadata": {}
+            },
+            {
+              "name": "Glacier flexible retrieval",
+              "type": "",
+              "is_supported": false,
+              "is_free": false,
+              "cost_components": [
+                {
+                  "name": "Storage",
+                  "unit": "GB",
+                  "price": "0.0036",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "PUT, COPY, POST, LIST requests",
+                  "unit": "1k requests",
+                  "price": "0.03",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "GET, SELECT, and all other requests",
+                  "unit": "1k requests",
+                  "price": "0.0004",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Lifecycle transition",
+                  "unit": "1k requests",
+                  "price": "0.03",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrieval requests (standard)",
+                  "unit": "1k requests",
+                  "price": "0.03",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrievals (standard)",
+                  "unit": "GB",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data scanned (standard)",
+                  "unit": "GB",
+                  "price": "0.008",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data returned (standard)",
+                  "unit": "GB",
+                  "price": "0.01",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrieval requests (expedited)",
+                  "unit": "1k requests",
+                  "price": "10",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrievals (expedited)",
+                  "unit": "GB",
+                  "price": "0.03",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data scanned (expedited)",
+                  "unit": "GB",
+                  "price": "0.02",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data returned (expedited)",
+                  "unit": "GB",
+                  "price": "0.03",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data scanned (bulk)",
+                  "unit": "GB",
+                  "price": "0.001",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Select data returned (bulk)",
+                  "unit": "GB",
+                  "price": "0.0025",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Early delete (within 90 days)",
+                  "unit": "GB",
+                  "price": "0.0036",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                }
+              ],
+              "metadata": {}
+            },
+            {
+              "name": "Glacier deep archive",
+              "type": "",
+              "is_supported": false,
+              "is_free": false,
+              "cost_components": [
+                {
+                  "name": "Storage",
+                  "unit": "GB",
+                  "price": "0.00099",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "PUT, COPY, POST, LIST requests",
+                  "unit": "1k requests",
+                  "price": "0.05",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "GET, SELECT, and all other requests",
+                  "unit": "1k requests",
+                  "price": "0.0004",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Lifecycle transition",
+                  "unit": "1k requests",
+                  "price": "0.05",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrieval requests (standard)",
+                  "unit": "1k requests",
+                  "price": "0.1",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrievals (standard)",
+                  "unit": "GB",
+                  "price": "0.02",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrieval requests (bulk)",
+                  "unit": "1k requests",
+                  "price": "0.025",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Retrievals (bulk)",
+                  "unit": "GB",
+                  "price": "0.0025",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                },
+                {
+                  "name": "Early delete (within 180 days)",
+                  "unit": "GB",
+                  "price": "0.00099",
+                  "quantity": "0",
+                  "base_monthly_cost": "0",
+                  "usage_monthly_cost": "0",
+                  "total_monthly_cost": "0",
+                  "monthly_carbon_savings_grams_co2e": "0",
+                  "monthly_water_savings_liters": "0"
+                }
+              ],
+              "metadata": {}
+            }
+          ],
+          "tags": {
+            "Application": "webplatform",
+            "Environment": "Dev",
+            "ManagedBy": "Terraform",
+            "Name": "webplatform-dev-assets",
+            "Workload": "web-platform"
+          },
+          "supports_tags": true,
+          "supports_default_tags": true,
+          "metadata": {
+            "deep_checksum": "573f735cfd2f9e2d"
+          }
+        },
+        {
+          "name": "module.object_storage.aws_s3_bucket_lifecycle_configuration.assets",
+          "type": "aws_s3_bucket_lifecycle_configuration",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "a8f383f8ffc2f8e1"
+          }
+        },
+        {
+          "name": "module.object_storage.aws_s3_bucket_versioning.assets",
+          "type": "aws_s3_bucket_versioning",
+          "is_supported": true,
+          "is_free": true,
+          "metadata": {
+            "deep_checksum": "79fb0bebe3cedbfe"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -14,6 +14,7 @@ from finops.config import (
     Config,
     CostEstimationConfig,
     CostLockConfig,
+    ExceptionConfig,
     FailSafeConfig,
     InfracostConfig,
     ThresholdConfig,
@@ -37,6 +38,12 @@ def make_config(
     on_unknown_cost_resource: str = "WARN",
     ai_enabled: bool = True,
     ai_required: bool = False,
+    exceptions_enabled: bool = True,
+    approvers: list[str] | None = None,
+    max_ttl_days: int = 7,
+    max_ceiling_ratio: float = 1.1,
+    require_non_author_approval: bool = True,
+    require_review_approval: bool = True,
 ) -> Config:
     return Config(
         threshold=ThresholdConfig(
@@ -72,6 +79,14 @@ def make_config(
             ignore_globs=["**/.terraform/**", "**/*.md"],
         ),
         cost_lock=CostLockConfig(output_dir=output_dir, bind_to_plan_fingerprint=True),
+        exceptions=ExceptionConfig(
+            enabled=exceptions_enabled,
+            approvers=list(approvers or []),
+            max_ttl_days=max_ttl_days,
+            max_ceiling_ratio=max_ceiling_ratio,
+            require_non_author_approval=require_non_author_approval,
+            require_review_approval=require_review_approval,
+        ),
         source_path="test",
     )
 

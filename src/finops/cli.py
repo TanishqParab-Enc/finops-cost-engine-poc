@@ -62,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--json", action="store_true", help="Emit the gate result as JSON")
     analyze.add_argument("--markdown", action="store_true", help="Emit the PR comment markdown")
+    analyze.add_argument("--stack", default=None, help="Stack this evaluation belongs to")
+    analyze.add_argument(
+        "--no-cost-lock",
+        action="store_true",
+        help="Never write a cost lock (stacks that cannot be deployed)",
+    )
 
     normalize = sub.add_parser("normalize-plan", help="Show the normalised plan")
     _add_config_arg(normalize)
@@ -71,6 +77,47 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(verify)
     verify.add_argument("--lock", required=True, help="Path to cost-lock.json")
     verify.add_argument("--plan", required=True, help="Terraform plan JSON to verify against")
+    verify.add_argument("--stack", default=None, help="Stack the lock must authorise")
+
+    create_exc = sub.add_parser(
+        "create-exception",
+        help="Create a peer-approved budget exception for an over-threshold change",
+    )
+    _add_config_arg(create_exc)
+    create_exc.add_argument("--result", required=True, help="Path to gate-result.json (must be FAIL)")
+    create_exc.add_argument("--plan", required=True, help="Terraform plan JSON the exception binds to")
+    create_exc.add_argument("--pr", required=True, type=int, help="Pull request number")
+    create_exc.add_argument("--head-sha", required=True, help="Pull request head commit SHA")
+    create_exc.add_argument("--approver", required=True, help="GitHub login of the approving peer")
+    create_exc.add_argument("--justification", required=True, help="Why the overspend is accepted")
+    create_exc.add_argument(
+        "--max-incremental-cost",
+        type=float,
+        default=None,
+        help="Cost ceiling; re-evaluation above this invalidates the exception",
+    )
+    create_exc.add_argument("--ttl-days", type=int, default=None, help="Lifetime in days")
+    create_exc.add_argument("--stack", default=None, help="Stack this exception authorises")
+    create_exc.add_argument("--out", required=True, help="Where to write the exception record")
+
+    verify_exc = sub.add_parser(
+        "verify-exception",
+        help="Verify a budget exception against a freshly computed plan and estimate",
+    )
+    _add_config_arg(verify_exc)
+    verify_exc.add_argument("--exception", required=True, help="Path to the exception record")
+    verify_exc.add_argument("--plan", required=True, help="Terraform plan JSON to verify against")
+    verify_exc.add_argument("--estimate", required=True, help="Path to cost-estimate.json")
+    verify_exc.add_argument("--pr", type=int, default=None, help="Pull request number")
+    verify_exc.add_argument("--head-sha", default=None, help="Pull request head commit SHA")
+    verify_exc.add_argument("--pr-author", default=None, help="Pull request author login")
+    verify_exc.add_argument(
+        "--reviews",
+        default=None,
+        help="JSON file of GitHub pull request reviews (live API output)",
+    )
+    verify_exc.add_argument("--verified-commit", default=None, help="Commit being verified")
+    verify_exc.add_argument("--stack", default=None, help="Stack the exception must authorise")
 
     return parser
 
@@ -108,6 +155,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             baseline_plan=Path(args.baseline_plan) if args.baseline_plan else None,
             commit=args.commit,
             execution_id=args.execution_id,
+            stack=args.stack,
+            allow_cost_lock=not args.no_cost_lock,
         ),
         config,
         estimator,
@@ -140,7 +189,7 @@ def _cmd_verify_lock(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     lock = load_cost_lock(args.lock)
     plan = normalize_plan_file(args.plan)
-    problems = verify_cost_lock(lock, plan, config)
+    problems = verify_cost_lock(lock, plan, config, stack=args.stack)
 
     if problems:
         print("Cost lock is INVALID for this plan:")
@@ -156,11 +205,157 @@ def _cmd_verify_lock(args: argparse.Namespace) -> int:
     return EXIT_PASS
 
 
+def _rebuild_estimate(estimate_path: str):
+    """Reload a cost-estimate.json artifact into a CostEstimate."""
+    return _rebuild_estimate_from_dict(
+        json.loads(Path(estimate_path).read_text(encoding="utf-8"))
+    )
+
+
+def _cmd_create_exception(args: argparse.Namespace) -> int:
+    from .lock.exception import create_exception
+    from .models import PolicyDecision, Status, money
+    from .plan.normalizer import load_plan_json
+
+    config = load_config(args.config)
+    result_raw = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    if result_raw.get("status") != Status.FAIL.value:
+        print(
+            f"Refusing to create an exception: gate status is "
+            f"{result_raw.get('status')!r}, expected FAIL."
+        )
+        return EXIT_ERROR
+
+    policy_raw = result_raw.get("policy") or {}
+    cost_raw = result_raw.get("cost") or {}
+    decision = PolicyDecision(
+        status=Status.FAIL,
+        metric=policy_raw.get("metric", config.threshold.metric),
+        unit=policy_raw.get("unit", config.threshold.unit),
+        observed_value=money(policy_raw.get("observed_value")),
+        threshold_value=money(policy_raw.get("threshold_value")),
+        currency=policy_raw.get("currency", config.threshold.currency),
+        comparison=policy_raw.get("comparison", config.threshold.comparison),
+    )
+    estimate = _rebuild_estimate_from_dict(cost_raw)
+    plan = normalize_plan_file(args.plan)
+    plan_doc = load_plan_json(args.plan)
+
+    record = create_exception(
+        decision,
+        estimate,
+        plan,
+        plan_doc,
+        config,
+        pr_number=args.pr,
+        head_sha=args.head_sha,
+        approver=args.approver,
+        justification=args.justification,
+        stack=args.stack,
+        max_incremental_cost=args.max_incremental_cost,
+        ttl_days=args.ttl_days,
+    )
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    print(f"Budget exception written to {out}")
+    print(f"  exception_id           : {record['exception_id']}")
+    print(f"  finops_decision        : {record['finops_decision']}  (unchanged)")
+    print(f"  approved incremental   : {record['approved_incremental_cost']} {record['currency']}/month")
+    print(f"  ceiling                : {record['max_incremental_cost']} {record['currency']}/month")
+    print(f"  expires_at             : {record['expires_at']}")
+    return EXIT_PASS
+
+
+def _rebuild_estimate_from_dict(raw: dict):
+    from .models import CostEstimate, EstimatorTrust, money
+
+    return CostEstimate(
+        currency=raw.get("currency", "USD"),
+        estimator=raw.get("estimator", "unknown"),
+        estimator_version=raw.get("estimator_version"),
+        trust=EstimatorTrust(raw.get("trust", EstimatorTrust.NON_AUTHORITATIVE.value)),
+        previous_monthly_cost=money(raw.get("previous_monthly_cost")),
+        new_monthly_cost=money(raw.get("new_monthly_cost")),
+        incremental_monthly_cost=money(raw.get("incremental_monthly_cost")),
+    )
+
+
+def _cmd_verify_exception(args: argparse.Namespace) -> int:
+    from .lock.exception import (
+        build_approval_record,
+        load_exception,
+        verify_exception,
+        write_approval,
+    )
+    from .plan.normalizer import load_plan_json
+
+    config = load_config(args.config)
+    record = load_exception(args.exception)
+    plan = normalize_plan_file(args.plan)
+    plan_doc = load_plan_json(args.plan)
+    estimate = _rebuild_estimate(args.estimate)
+
+    reviews = None
+    if args.reviews:
+        reviews_raw = json.loads(Path(args.reviews).read_text(encoding="utf-8"))
+        reviews = reviews_raw if isinstance(reviews_raw, list) else reviews_raw.get("reviews") or []
+
+    problems = verify_exception(
+        record,
+        plan,
+        plan_doc,
+        estimate,
+        config,
+        pr_number=args.pr,
+        pr_author=args.pr_author,
+        head_sha=args.head_sha,
+        stack=args.stack,
+        reviews=reviews,
+    )
+
+    approval = build_approval_record(
+        record,
+        problems,
+        pr_number=args.pr,
+        head_sha=args.head_sha,
+        verified_commit=args.verified_commit,
+    )
+    write_approval(approval, config)
+
+    # Append to the PR comment rather than regenerating it: the FAIL verdict
+    # above must stay visible alongside the approval.
+    comment = Path(config.cost_lock.output_dir) / "pr-comment.md"
+    if comment.is_file():
+        from .report.markdown import render_exception_banner
+
+        with comment.open("a", encoding="utf-8") as handle:
+            handle.write(render_exception_banner(approval))
+
+    if problems:
+        print("Budget exception is NOT valid for this change:")
+        for problem in problems:
+            print(f"  - {problem}")
+        return EXIT_FAIL
+
+    print("Budget exception is valid.")
+    print(f"  finops_decision      : {approval['finops_decision']}  (unchanged)")
+    print(f"  exception_approval   : {approval['exception_approval']}")
+    print(f"  exception_id         : {approval['exception_id']}")
+    print(f"  approver             : {approval['approver']}")
+    print(f"  approved incremental : {approval['approved_incremental_cost']} {approval['currency']}/month")
+    print(f"  ceiling              : {approval['max_incremental_cost']} {approval['currency']}/month")
+    print(f"  expires_at           : {approval['expires_at']}")
+    return EXIT_PASS
+
+
 _COMMANDS = {
     "detect-changes": _cmd_detect_changes,
     "analyze": _cmd_analyze,
     "normalize-plan": _cmd_normalize_plan,
     "verify-lock": _cmd_verify_lock,
+    "create-exception": _cmd_create_exception,
+    "verify-exception": _cmd_verify_exception,
 }
 
 

@@ -118,6 +118,19 @@ class CostLockConfig:
 
 
 @dataclass(frozen=True)
+class ExceptionConfig:
+    """Audited override for an over-threshold change. Never turns FAIL into PASS."""
+
+    enabled: bool = True
+    # Empty by default: with no allowlist, every exception is rejected.
+    approvers: list[str] = field(default_factory=list)
+    max_ttl_days: int = 7
+    max_ceiling_ratio: float = 1.1
+    require_non_author_approval: bool = True
+    require_review_approval: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     threshold: ThresholdConfig
     cost_estimation: CostEstimationConfig
@@ -125,6 +138,7 @@ class Config:
     ai: AIConfig
     change_detection: ChangeDetectionConfig
     cost_lock: CostLockConfig
+    exceptions: ExceptionConfig = field(default_factory=ExceptionConfig)
     source_path: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -203,7 +217,8 @@ def _build(raw: dict[str, Any], source_path: str) -> Config:
             binary=_env("INFRACOST_BINARY") or infracost_raw.get("binary") or "infracost",
             command_style=command_style,
             config_file=infracost_raw.get("config_file"),
-            usage_file=infracost_raw.get("usage_file"),
+            # Usage assumptions are per stack, so CI supplies them per job.
+            usage_file=_env("FINOPS_INFRACOST_USAGE_FILE") or infracost_raw.get("usage_file"),
         ),
     )
 
@@ -244,6 +259,24 @@ def _build(raw: dict[str, Any], source_path: str) -> Config:
         bind_to_plan_fingerprint=bool(lock_raw.get("bind_to_plan_fingerprint", True)),
     )
 
+    exc_raw = raw.get("exceptions") or {}
+    # Approvers live in CI config, not the repo, so a pull request cannot add
+    # itself to the allowlist it is about to be judged by.
+    approvers_env = _env("FINOPS_APPROVERS")
+    approvers = (
+        [a.strip() for a in approvers_env.split(",") if a.strip()]
+        if approvers_env
+        else [str(a).strip() for a in (exc_raw.get("approvers") or []) if str(a).strip()]
+    )
+    exceptions = ExceptionConfig(
+        enabled=bool(exc_raw.get("enabled", True)),
+        approvers=approvers,
+        max_ttl_days=int(exc_raw.get("max_ttl_days", 7)),
+        max_ceiling_ratio=float(exc_raw.get("max_ceiling_ratio", 1.1)),
+        require_non_author_approval=bool(exc_raw.get("require_non_author_approval", True)),
+        require_review_approval=bool(exc_raw.get("require_review_approval", True)),
+    )
+
     return Config(
         threshold=threshold,
         cost_estimation=cost_estimation,
@@ -251,6 +284,7 @@ def _build(raw: dict[str, Any], source_path: str) -> Config:
         ai=ai,
         change_detection=change_detection,
         cost_lock=cost_lock,
+        exceptions=exceptions,
         source_path=source_path,
         raw=raw,
     )

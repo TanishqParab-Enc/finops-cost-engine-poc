@@ -1,0 +1,57 @@
+# Documented usage assumptions for the usage-priced parts of this workload.
+#
+# S3, CloudFront and CloudWatch bill on consumption, not on configuration, so
+# Terraform alone cannot tell Infracost how much they will cost. Without this
+# file those resources price at $0 and the breakdown silently understates the
+# bill. These are assumptions, not measurements - the parser flags every
+# resource priced this way as usage_based and the gate surfaces a coverage
+# warning.
+#
+# s3_storage_gb in terraform.tfvars mirrors standard_storage_gb below; the two
+# must be changed together.
+version: 0.1
+
+resource_usage:
+  module.object_storage.aws_s3_bucket.assets:
+    standard:
+      storage_gb: 20
+      monthly_tier_1_requests: 100000
+      monthly_tier_2_requests: 500000
+      monthly_select_data_scanned_gb: 0
+      monthly_select_data_returned_gb: 0
+
+  module.cdn.aws_cloudfront_distribution.main[0]:
+    monthly_data_transfer_to_internet_gb:
+      us: 100
+      europe: 50
+    monthly_data_transfer_to_origin_gb:
+      us: 10
+      europe: 5
+    monthly_http_requests:
+      us: 1000000
+      europe: 500000
+    monthly_https_requests:
+      us: 2000000
+      europe: 1000000
+
+  module.monitoring.aws_cloudwatch_log_group.app:
+    monthly_data_ingested_gb: 5
+    storage_gb: 5
+    monthly_data_scanned_gb: 1
+
+  module.monitoring.aws_cloudwatch_log_group.access:
+    monthly_data_ingested_gb: 10
+    storage_gb: 10
+    monthly_data_scanned_gb: 2
+
+  module.networking.aws_nat_gateway.main[0]:
+    monthly_data_processed_gb: 100
+
+  module.networking.aws_nat_gateway.main[1]:
+    monthly_data_processed_gb: 100
+
+  module.alb.aws_lb.main:
+    new_connections: 1000000
+    active_connections: 100000
+    processed_bytes_gb: 200
+    rule_evaluations: 1000000
