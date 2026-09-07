@@ -385,10 +385,11 @@ jobs:
 
       # No PR-review-backed exception is evaluated here any more - a BLOCK's
       # only path to deployment_authorization=AUTHORIZED is the finops-approval
-      # job's protected GitHub Actions environment, on the trusted main run
-      # that will actually deploy (see that job). `finops create-exception` /
-      # `verify-exception` remain available in the CLI for recording
-      # metadata/justification, but are no longer consulted for authorisation.
+      # job's protected GitHub Actions environment, reached on THIS pull
+      # request run (see that job), followed by trusted main independently
+      # re-verifying the resulting attestation before any deploy. `finops
+      # create-exception` / `verify-exception` are unchanged CLI commands
+      # reused by that flow - never consulted for authorisation here.
 
       - name: Publish gate summary
         if: always()
@@ -513,8 +514,8 @@ jobs:
       # The gate is the last word: a non-zero exit stops the pipeline.
       #   1 = threshold exceeded - a required check that demands attention.
       #       The ONLY path past this for deployment is the finops-approval
-      #       job's protected environment on the trusted main run; nothing in
-      #       this job can turn it green.
+      #       job's protected GitHub Actions environment, reached on THIS
+      #       pull request run; nothing in this job can turn it green.
       #   2 = cost could not be trusted, failing safe
       - name: Enforce gate
         if: always()
@@ -525,7 +526,7 @@ jobs:
           case "$CODE" in
             0) echo "PASS - cost locked, pipeline may continue." ;;
             1)
-              echo "::error::FinOps threshold exceeded (finops_decision=BLOCK). Deployment requires approval via the finops-cost-approval GitHub Actions environment on the trusted main run."
+              echo "::error::FinOps threshold exceeded (finops_decision=BLOCK). Deployment requires approval via the finops-cost-approval GitHub Actions environment (see the finops-approval job on this pull request)."
               exit 1
               ;;
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
@@ -730,7 +731,6 @@ jobs:
         with:
           pattern: finops-*-${{ github.run_id }}
           path: artifacts
-          if-no-artifact-found: ignore
 
       # Reaching this step at all already proves a human approved the
       # environment - GitHub does not start the job otherwise. This resolves
@@ -843,7 +843,6 @@ jobs:
         with:
           pattern: finops-*-${{ github.run_id }}
           path: artifacts
-          if-no-artifact-found: ignore
 
       - name: Resolve the pull request this trusted commit came from
         id: pr
@@ -916,7 +915,6 @@ jobs:
           repository: ${{ github.repository }}
           pattern: finops-attestation-${{ steps.pr.outputs.number }}-*
           path: attestation
-          if-no-artifact-found: ignore
 
       - name: Aggregate per-stack authorization
         id: aggregate
