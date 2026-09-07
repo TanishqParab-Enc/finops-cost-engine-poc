@@ -96,6 +96,7 @@ def create_exception(
     approver: str,
     justification: str,
     stack: str | None = None,
+    terraform_dir: str | None = None,
     max_incremental_cost: float | None = None,
     ttl_days: int | None = None,
 ) -> dict:
@@ -143,6 +144,7 @@ def create_exception(
         # Which Terraform root this authorises. An exception for one stack must
         # never be accepted for another.
         "stack": stack,
+        "terraform_dir": terraform_dir,
         "pr": int(pr_number),
         "head_sha": head_sha,
         "plan_fingerprint": plan.fingerprint(),
@@ -238,25 +240,23 @@ def _authorising_review(
     return None
 
 
-def verify_exception(
+def _binding_problems(
     record: dict,
     plan: NormalizedPlan,
     plan_doc: dict,
     estimate: CostEstimate,
     config: Config,
     *,
-    pr_number: int | None = None,
-    pr_author: str | None = None,
-    head_sha: str | None = None,
-    stack: str | None = None,
-    reviews: list[dict] | None = None,
-    now: datetime | None = None,
+    pr_number: int | None,
+    head_sha: str | None,
+    stack: str | None,
+    terraform_dir: str | None,
+    now: datetime | None,
 ) -> list[str]:
-    """Return a list of problems. Empty means the exception authorises this change."""
+    """Everything that binds a record to one exact evaluation. Deliberately
+    excludes the human-authorisation source, so the PR-review path and the
+    workflow_dispatch path share one binding engine and can never drift."""
     problems: list[str] = []
-
-    if not config.exceptions.enabled:
-        return ["Budget exceptions are disabled by policy"]
 
     # Symmetric with create_exception: a test double or otherwise untrusted
     # estimator must never authorise a real deployment, even against an
@@ -271,6 +271,12 @@ def verify_exception(
         problems.append(
             f"Exception was approved for stack {record.get('stack')!r} and cannot "
             f"authorise stack {stack!r}"
+        )
+
+    if terraform_dir is not None and record.get("terraform_dir") != terraform_dir:
+        problems.append(
+            f"Exception was approved for Terraform root {record.get('terraform_dir')!r} "
+            f"and cannot authorise {terraform_dir!r}"
         )
 
     if record.get("schema_version") != SCHEMA_VERSION:
@@ -369,6 +375,34 @@ def verify_exception(
             f"pull request head is {str(head_sha)[:12]!r}"
         )
 
+    return problems
+
+
+def verify_exception(
+    record: dict,
+    plan: NormalizedPlan,
+    plan_doc: dict,
+    estimate: CostEstimate,
+    config: Config,
+    *,
+    pr_number: int | None = None,
+    pr_author: str | None = None,
+    head_sha: str | None = None,
+    stack: str | None = None,
+    terraform_dir: str | None = None,
+    reviews: list[dict] | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """Return a list of problems. Empty means the exception authorises this change."""
+    if not config.exceptions.enabled:
+        return ["Budget exceptions are disabled by policy"]
+
+    problems = _binding_problems(
+        record, plan, plan_doc, estimate, config,
+        pr_number=pr_number, head_sha=head_sha, stack=stack,
+        terraform_dir=terraform_dir, now=now,
+    )
+
     # -- authorisation (never satisfiable by repository content) ------------
     if config.exceptions.require_review_approval:
         if reviews is None:
@@ -389,6 +423,66 @@ def verify_exception(
     return problems
 
 
+def verify_dispatch_approval(
+    record: dict,
+    plan: NormalizedPlan,
+    plan_doc: dict,
+    estimate: CostEstimate,
+    config: Config,
+    *,
+    pr_number: int | None = None,
+    head_sha: str | None = None,
+    stack: str | None = None,
+    terraform_dir: str | None = None,
+    run_event: str | None = None,
+    run_actor: str | None = None,
+    expected_approver: str | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """Same bindings as verify_exception, but the human decision comes from a
+    GitHub Actions ``workflow_dispatch`` run instead of a pull request review.
+
+    ``run_event`` and ``run_actor`` must be the GitHub-attested values for the
+    run that produced this record (``github.event_name`` / ``github.actor``,
+    re-read from the Actions API on the trusted run). They are set by GitHub,
+    cannot be forged by pull request content, and workflow_dispatch itself
+    requires write access - so this is an authorisation channel a PR cannot
+    reach, which is the same property the PR-review path relied on.
+    """
+    if not config.exceptions.enabled:
+        return ["Budget exceptions are disabled by policy"]
+
+    problems = _binding_problems(
+        record, plan, plan_doc, estimate, config,
+        pr_number=pr_number, head_sha=head_sha, stack=stack,
+        terraform_dir=terraform_dir, now=now,
+    )
+
+    if run_event != "workflow_dispatch":
+        problems.append(
+            f"Approval must come from a workflow_dispatch run, not {run_event!r}"
+        )
+
+    approver = (expected_approver or "").strip().lower()
+    actor = (run_actor or "").strip().lower()
+    recorded = str(record.get("approver") or "").strip().lower()
+
+    if not approver:
+        problems.append("No expected approver configured; refusing to authorise")
+    elif actor != approver:
+        problems.append(
+            f"Approval was triggered by {run_actor!r}, who is not the authorised "
+            f"approver {expected_approver!r}"
+        )
+    elif recorded != approver:
+        problems.append(
+            f"Exception names {record.get('approver')!r} as approver but the "
+            f"approval run was triggered by {run_actor!r}"
+        )
+
+    return problems
+
+
 def build_approval_record(
     record: dict,
     problems: list[str],
@@ -405,6 +499,7 @@ def build_approval_record(
         "exception_approval": "APPROVED" if approved else "REJECTED",
         "exception_id": record.get("exception_id"),
         "stack": record.get("stack"),
+        "terraform_dir": record.get("terraform_dir"),
         "pr": pr_number if pr_number is not None else record.get("pr"),
         "head_sha": head_sha or record.get("head_sha"),
         "verified_commit": verified_commit,

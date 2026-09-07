@@ -187,3 +187,66 @@ def authorize_deployment(
     if analyze_exit_code == 1 and exception_valid:
         return "AUTHORIZED"
     return "DENIED"
+
+
+REJECTION_MESSAGE = "Deployment cancelled because the cost estimate was rejected."
+
+APPROVAL_NOT_REQUIRED = "NOT_REQUIRED"
+APPROVAL_PENDING = "PENDING"
+APPROVAL_APPROVED = "APPROVED"
+APPROVAL_REJECTED = "REJECTED"
+
+
+def evaluate_approval(
+    *,
+    analyze_exit_code: int,
+    approval_action: str | None = None,
+    approval_problems: list | None = None,
+    lock_verified: bool = True,
+) -> dict:
+    """The three states the pipeline reports, kept deliberately separate.
+
+    ``finops_decision`` is derived only from the cost evaluation and is never
+    rewritten by an approval - an approved overspend is still a BLOCK. Only
+    ``deployment_authorization`` moves.
+
+    ``approval_action`` is the human's explicit choice ('approve'/'reject')
+    from a workflow_dispatch run; ``approval_problems`` is the result of
+    re-verifying that approval's bindings. An approval that fails any binding
+    is not an approval - it leaves the change PENDING and DENIED rather than
+    silently authorising it.
+    """
+    decision = finops_decision_label(analyze_exit_code)
+
+    if analyze_exit_code == 0:
+        authorized = lock_verified
+        return {
+            "finops_decision": decision,
+            "approval_status": APPROVAL_NOT_REQUIRED,
+            "deployment_authorization": "AUTHORIZED" if authorized else "DENIED",
+        }
+
+    action = (approval_action or "").strip().lower()
+
+    if action == "reject":
+        return {
+            "finops_decision": decision,
+            "approval_status": APPROVAL_REJECTED,
+            "deployment_authorization": "DENIED",
+            "message": REJECTION_MESSAGE,
+        }
+
+    # exit_code 2 means the cost itself could not be trusted; no approval of a
+    # number we could not establish is meaningful.
+    if action == "approve" and analyze_exit_code == 1 and not approval_problems:
+        return {
+            "finops_decision": decision,
+            "approval_status": APPROVAL_APPROVED,
+            "deployment_authorization": "AUTHORIZED",
+        }
+
+    return {
+        "finops_decision": decision,
+        "approval_status": APPROVAL_PENDING,
+        "deployment_authorization": "DENIED",
+    }

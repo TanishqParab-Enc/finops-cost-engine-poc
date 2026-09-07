@@ -719,13 +719,12 @@ class TestDeploymentAuthorizationArchitecture:
 
 
 class TestNoEnvironmentApprovalExperimentRemains:
-    """The GitHub Actions environment-approval experiment (finops-cost-
-    approval, finops-approval job) has been fully removed. A genuine GitHub
-    PR review, verified via the live reviews API, is the sole exception
-    approval mechanism - never environment job success."""
-
-    def test_finops_approval_job_does_not_exist(self, gate):
-        assert "finops-approval" not in gate["jobs"]
+    """The GitHub Actions *environment* approval experiment (the
+    finops-cost-approval environment and its Approvals-API attestation) is
+    fully removed - this repository's plan cannot enforce required
+    reviewers, so an unprotected environment must never gate a FinOps
+    exception. The approval job that exists now is dispatch-based and is
+    covered by tests/unit/test_cost_approval.py."""
 
     def test_no_finops_cost_approval_environment_reference(self, gate_text):
         assert "finops-cost-approval" not in gate_text
@@ -741,14 +740,25 @@ class TestNoEnvironmentApprovalExperimentRemains:
             name = env.get("name") if isinstance(env, dict) else env
             assert "finops" not in str(name).lower(), f"job {job_id!r} environment {name!r}"
 
-    def test_no_approvals_api_usage_remains(self, gate_text):
+    def test_approval_job_is_not_environment_gated(self, gate):
+        assert "environment" not in gate["jobs"]["finops-approval"]
+
+    def test_no_environment_approvals_api_usage_remains(self, gate_text):
+        """The removed design read GET .../actions/runs/{id}/approvals to
+        learn who clicked Approve on an environment. The dispatch design
+        reads the run's own attested actor instead."""
         assert "/approvals" not in gate_text
 
-    def test_no_cross_run_artifact_download_remains(self, gate):
-        job = gate["jobs"]["authorize-deploy"]
-        for step in job["steps"]:
-            if step.get("uses", "").startswith("actions/download-artifact"):
-                assert "run-id" not in (step.get("with") or {})
+    def test_cross_run_download_is_only_for_the_dispatch_approval_record(self, gate):
+        """A cross-run download is legitimate here - it carries the approval
+        record from the approving dispatch run to trusted main - but it must
+        only ever fetch that record, never an arbitrary artifact."""
+        for step in gate["jobs"]["authorize-deploy"]["steps"]:
+            if not step.get("uses", "").startswith("actions/download-artifact"):
+                continue
+            with_ = step.get("with") or {}
+            if "run-id" in with_:
+                assert with_["pattern"].startswith("finops-approval-pr")
 
     def test_authorize_deploy_needs_only_cost_gate(self, gate):
         assert gate["jobs"]["authorize-deploy"]["needs"] == ["detect-changes", "cost-gate"]

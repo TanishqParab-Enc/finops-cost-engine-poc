@@ -27,6 +27,22 @@ name: FinOps Cost Gate
       - '.github/workflows/finops-cost-gate.yml'
   workflow_dispatch:
     inputs:
+      # THE APPROVE / REJECT CONTROL. Actions -> FinOps Cost Gate -> Run
+      # workflow -> pick the PR's branch -> set finops_action.
+      # This is not an "approved=true" boolean a PR can set: the decision is
+      # only honoured when GitHub itself attests github.event_name ==
+      # workflow_dispatch AND github.actor == FINOPS_APPROVER, and triggering
+      # a dispatch requires write access. Repository content cannot reach it.
+      finops_action:
+        description: "Approve or reject a BLOCKED cost estimate (none = just evaluate cost)"
+        required: false
+        default: none
+        type: choice
+        options: [none, approve, reject]
+      approval_pr:
+        description: "PR number the approval applies to (required for approve/reject)"
+        required: false
+        type: string
       cloud:
         description: Cloud stack to evaluate
         required: true
@@ -49,11 +65,18 @@ permissions:
   contents: read
   pull-requests: write
   id-token: write   # required for AWS OIDC
+  # Read the approving dispatch run's attested metadata and download its
+  # approval artifact from that earlier, separate run.
+  actions: read
 
 env:
   PYTHON_VERSION: '3.12'
   TERRAFORM_VERSION: '1.11.0'
   AWS_REGION: us-east-1
+  # The only login permitted to approve a BLOCKED cost estimate. Repository
+  # configuration, never a workflow input - a dispatch cannot nominate itself
+  # as the approver.
+  FINOPS_APPROVER: ${{ vars.FINOPS_APPROVER || 'TanishqParab-Enc' }}
 
 jobs:
   detect-changes:
@@ -531,6 +554,9 @@ jobs:
           cat authz.json
 
           mkdir -p .finops
+          # Carried in the artifact so the approval job (and trusted main) can
+          # re-derive the exact plan this run priced, never a cached number.
+          cp "$GITHUB_WORKSPACE/proposed-plan.json" .finops/proposed-plan.json
           python3 - <<'PY'
           import json
           import os
@@ -723,6 +749,175 @@ jobs:
           retention-days: 90
           include-hidden-files: true
 
+  # THE APPROVE / REJECT GATE.
+  #
+  # Trigger: Actions -> FinOps Cost Gate -> "Run workflow" -> select the PR's
+  # branch -> finops_action = approve | reject, approval_pr = the PR number.
+  #
+  # Why workflow_dispatch rather than an "approved=true" file or input: the
+  # decision is only honoured when GitHub itself attests both
+  # github.event_name == workflow_dispatch and github.actor == FINOPS_APPROVER.
+  # Both are set by GitHub, neither is forgeable by pull request content, and
+  # dispatching requires write access - so this is an authorisation channel a
+  # PR simply cannot reach. Environment required-reviewers would be the
+  # native equivalent but this repository's plan does not support that rule.
+  #
+  # The approval binds to a plan and Infracost estimate produced by THIS run's
+  # own cost-gate job, so what is approved is exactly what was priced. It never
+  # rewrites the decision: `finops approve` refuses anything but a FAIL and the
+  # record it mints keeps finops_decision=FAIL.
+  finops-approval:
+    name: FinOps cost approval (${{ inputs.finops_action }})
+    needs: [detect-changes, cost-gate]
+    if: |
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.finops_action != 'none'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      # Fail closed before anything else. github.actor is GitHub-attested.
+      - name: Authorise the approver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.actor }}" != "$FINOPS_APPROVER" ]; then
+            echo "::error title=Unauthorised approver::'${{ github.actor }}' is not permitted to approve or reject FinOps cost estimates. Only '$FINOPS_APPROVER' is."
+            exit 1
+          fi
+          echo "Approval action '${{ inputs.finops_action }}' requested by ${{ github.actor }}."
+
+      # Rejection short-circuits: no plan, no estimate, no record. There is
+      # deliberately no artifact a later run could mistake for authorisation.
+      - name: Reject the cost estimate
+        if: inputs.finops_action == 'reject'
+        run: |
+          set -euo pipefail
+          {
+            echo "## FinOps cost estimate REJECTED"
+            echo ""
+            echo '```'
+            echo "finops_decision          = BLOCK"
+            echo "approval_status          = REJECTED"
+            echo "deployment_authorization = DENIED"
+            echo '```'
+            echo ""
+            echo "Deployment cancelled because the cost estimate was rejected."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "finops_decision=BLOCK"
+          echo "approval_status=REJECTED"
+          echo "deployment_authorization=DENIED"
+          echo "::error title=Cost estimate rejected::Deployment cancelled because the cost estimate was rejected."
+          exit 1
+
+      - name: Download this run's cost-gate artifacts
+        if: inputs.finops_action == 'approve'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: finops-*-${{ github.run_id }}
+          path: artifacts
+
+      # Resolves the PR head SHA from the live API, never from an input, so the
+      # approval cannot be bound to a SHA the dispatcher simply typed in.
+      - name: Resolve the pull request being approved
+        id: pr
+        if: inputs.finops_action == 'approve'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.approval_pr }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error title=No pull request::approval_pr is required when approving."
+            exit 1
+          fi
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > pr.json
+          HEAD_SHA=$(python3 -c "import json;print(json.load(open('pr.json'))['head']['sha'])")
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Approving PR #$PR_NUMBER at head $HEAD_SHA"
+
+          # The approval must describe the code that was actually priced.
+          if [ "$HEAD_SHA" != "${{ github.sha }}" ]; then
+            echo "::error title=Ref mismatch::This dispatch ran against ${{ github.sha }} but PR #$PR_NUMBER is at $HEAD_SHA. Re-run the workflow selecting that pull request's branch so the approval binds to the code that was priced."
+            exit 1
+          fi
+
+      - name: Record the approval for each blocked stack
+        if: inputs.finops_action == 'approve'
+        env:
+          PR_NUMBER: ${{ inputs.approval_pr }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          STACKS: ${{ needs.detect-changes.outputs.stacks }}
+        run: |
+          set -euo pipefail
+          mkdir -p finops-approval
+          APPROVED=0
+
+          for authz in artifacts/*/authorization.json; do
+            [ -f "$authz" ] || continue
+            DIR=$(dirname "$authz")
+            STACK=$(python3 -c "import json;print(json.load(open('$authz'))['stack'])")
+            DECISION=$(python3 -c "import json;print(json.load(open('$authz'))['finops_decision'])")
+
+            if [ "$DECISION" != "BLOCK" ]; then
+              echo "Stack '$STACK' is $DECISION - no approval needed."
+              continue
+            fi
+
+            TF_DIR=$(STACKS="$STACKS" STACK="$STACK" python3 -c "
+            import json, os
+            stacks = json.loads(os.environ['STACKS'])
+            print(next(s['dir'] for s in stacks if s['name'] == os.environ['STACK']))
+            ")
+
+            finops approve \
+              --action approve \
+              --result "$DIR/gate-result.json" \
+              --plan "$DIR/proposed-plan.json" \
+              --pr "$PR_NUMBER" \
+              --head-sha "$HEAD_SHA" \
+              --stack "$STACK" \
+              --terraform-dir "$TF_DIR" \
+              --run-event "${{ github.event_name }}" \
+              --run-actor "${{ github.actor }}" \
+              --expected-approver "$FINOPS_APPROVER" \
+              --out "finops-approval/${STACK}.json"
+            APPROVED=$((APPROVED + 1))
+          done
+
+          if [ "$APPROVED" -eq 0 ]; then
+            echo "::error title=Nothing to approve::No BLOCKED stack was found in this run."
+            exit 1
+          fi
+
+          {
+            echo "## FinOps cost estimate APPROVED"
+            echo ""
+            echo '```'
+            echo "finops_decision          = BLOCK   (unchanged - approval never rewrites the decision)"
+            echo "approval_status          = APPROVED"
+            echo "deployment_authorization = AUTHORIZED"
+            echo '```'
+            echo ""
+            echo "Approved by ${{ github.actor }} for PR #$PR_NUMBER at $HEAD_SHA."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the approval record
+        if: inputs.finops_action == 'approve'
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-approval-pr${{ inputs.approval_pr }}-${{ steps.pr.outputs.head_sha }}
+          path: finops-approval/
+          retention-days: 90
+
   # Apply is NEVER reachable from a pull request - PR branches run untrusted
   # code, and `terraform apply` on untrusted code is arbitrary code execution
   # against AWS. Two mutually exclusive paths reach here:
@@ -760,28 +955,147 @@ jobs:
     outputs:
       authorizations: ${{ steps.aggregate.outputs.authorizations }}
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
       - name: Download per-stack authorization artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: finops-*-${{ github.run_id }}
           path: artifacts
 
+      # Which PR this trusted commit came from, per GitHub's own merge
+      # tracking - not a workflow input.
+      - name: Resolve the merged pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/commits/$SHA/pulls" > pr.json
+          PR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['number'] if d else '')")
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR" ]; then
+            gh api "repos/$REPO/pulls/$PR" > detail.json
+            echo "head_sha=$(python3 -c "import json;print(json.load(open('detail.json'))['head']['sha'])")" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Merged PR: #${PR:-<none>}"
+
+      # Locates the approving dispatch run and re-reads its attested event and
+      # actor from the Actions API. The approval artifact is never trusted for
+      # merely existing - if no dispatch run by the authorised approver exists
+      # for this exact PR head, nothing below can authorise a deployment.
+      - name: Locate the approving dispatch run
+        id: approval_run
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/actions/workflows/finops-cost-gate.yml/runs?event=workflow_dispatch&head_sha=$HEAD_SHA&status=success" > runs.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          runs = json.load(open("runs.json")).get("workflow_runs", [])
+          approver = (os.environ.get("FINOPS_APPROVER") or "").strip().lower()
+          match = [
+              r for r in runs
+              if (r.get("actor") or {}).get("login", "").strip().lower() == approver
+          ]
+          run = sorted(match, key=lambda r: r["id"])[-1] if match else None
+          print(f"run_id={run['id'] if run else ''}")
+          print(f"run_event={run['event'] if run else ''}")
+          print(f"run_actor={(run['actor']['login'] if run else '')}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Download the approval record
+        if: steps.approval_run.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.approval_run.outputs.run_id }}
+          repository: ${{ github.repository }}
+          pattern: finops-approval-pr${{ steps.pr.outputs.number }}-${{ steps.pr.outputs.head_sha }}
+          path: approval
+
       - name: Aggregate per-stack authorization
         id: aggregate
+        env:
+          STACKS: ${{ needs.detect-changes.outputs.stacks }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_EVENT: ${{ steps.approval_run.outputs.run_event }}
+          RUN_ACTOR: ${{ steps.approval_run.outputs.run_actor }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import glob
           import json
           import os
+          import subprocess
+          import sys
 
+          stacks = {s["name"]: s for s in json.loads(os.environ.get("STACKS") or "[]")}
           merged = {}
+
           for path in glob.glob("artifacts/*/authorization.json"):
               with open(path, encoding="utf-8") as fh:
-                  data = json.load(fh)
-              stack = data.get("stack")
-              if stack:
-                  merged[stack] = data
+                  entry = json.load(fh)
+              stack = entry.get("stack")
+              if not stack:
+                  continue
+
+              # PASS keeps the authorization cost-gate already computed from
+              # the normal cost-lock path; only a BLOCK needs an approval.
+              if entry.get("finops_decision") != "BLOCK":
+                  merged[stack] = entry
+                  continue
+
+              art_dir = os.path.dirname(path)
+              matches = glob.glob(f"approval/*/{stack}.json") or glob.glob(f"approval/{stack}.json")
+              if not matches:
+                  entry["deployment_authorization"] = "DENIED"
+                  entry["approval_status"] = "PENDING"
+                  print(f"{stack}: no approval record -> DENIED", file=sys.stderr)
+                  merged[stack] = entry
+                  continue
+
+              cmd = [
+                  "finops", "approval-verify",
+                  "--decision", matches[0],
+                  "--plan", f"{art_dir}/proposed-plan.json",
+                  "--estimate", f"{art_dir}/cost-estimate.json",
+                  "--stack", stack,
+                  "--terraform-dir", stacks.get(stack, {}).get("dir", ""),
+                  "--run-event", os.environ.get("RUN_EVENT", ""),
+                  "--run-actor", os.environ.get("RUN_ACTOR", ""),
+                  "--expected-approver", os.environ.get("FINOPS_APPROVER", ""),
+                  "--json",
+              ]
+              if os.environ.get("PR_NUMBER"):
+                  cmd += ["--pr", os.environ["PR_NUMBER"]]
+              if os.environ.get("HEAD_SHA"):
+                  cmd += ["--head-sha", os.environ["HEAD_SHA"]]
+
+              proc = subprocess.run(cmd, capture_output=True, text=True)
+              print(f"approval-verify[{stack}]: {proc.stdout.strip()} {proc.stderr.strip()}", file=sys.stderr)
+              try:
+                  verdict = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  verdict = {"deployment_authorization": "DENIED", "approval_status": "PENDING"}
+              entry["approval_status"] = verdict.get("approval_status", "PENDING")
+              entry["deployment_authorization"] = verdict.get("deployment_authorization", "DENIED")
+              merged[stack] = entry
 
           print("Aggregated deployment authorization:")
           print(json.dumps(merged, indent=2))

@@ -98,6 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create_exc.add_argument("--ttl-days", type=int, default=None, help="Lifetime in days")
     create_exc.add_argument("--stack", default=None, help="Stack this exception authorises")
+    create_exc.add_argument(
+        "--terraform-dir", default=None, help="Terraform root this exception authorises"
+    )
     create_exc.add_argument("--out", required=True, help="Where to write the exception record")
 
     verify_exc = sub.add_parser(
@@ -133,6 +136,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="The cost lock failed re-verification against the fresh plan (normal/PASS path only)",
     )
     authorize.add_argument("--json", action="store_true")
+
+    approve = sub.add_parser(
+        "approve",
+        help="Record an APPROVE/REJECT decision for a BLOCKed evaluation (workflow_dispatch)",
+    )
+    _add_config_arg(approve)
+    approve.add_argument(
+        "--action", required=True, choices=["approve", "reject"],
+        help="The human's explicit choice",
+    )
+    approve.add_argument("--result", required=True, help="Path to gate-result.json (must be FAIL)")
+    approve.add_argument("--plan", required=True, help="Terraform plan JSON the approval binds to")
+    approve.add_argument("--pr", required=True, type=int, help="Pull request number")
+    approve.add_argument("--head-sha", required=True, help="Pull request head commit SHA")
+    approve.add_argument("--stack", required=True, help="Stack this approval authorises")
+    approve.add_argument(
+        "--terraform-dir", required=True, help="Terraform root this approval authorises"
+    )
+    approve.add_argument(
+        "--run-event", required=True,
+        help="GitHub-attested github.event_name of the approving run",
+    )
+    approve.add_argument(
+        "--run-actor", required=True, help="GitHub-attested github.actor of the approving run"
+    )
+    approve.add_argument(
+        "--expected-approver", required=True, help="The only login permitted to approve"
+    )
+    approve.add_argument(
+        "--max-incremental-cost", type=float, default=None, help="Approved cost ceiling"
+    )
+    approve.add_argument("--ttl-days", type=int, default=None, help="Lifetime in days")
+    approve.add_argument("--out", default=None, help="Where to write the approval record")
+    approve.add_argument("--json", action="store_true")
+
+    approval_verify = sub.add_parser(
+        "approval-verify",
+        help="Re-verify a dispatch approval on trusted main against a fresh plan and estimate",
+    )
+    _add_config_arg(approval_verify)
+    approval_verify.add_argument(
+        "--decision", required=True, help="Path to the approval record from the approving run"
+    )
+    approval_verify.add_argument("--plan", required=True, help="Fresh Terraform plan JSON")
+    approval_verify.add_argument("--estimate", required=True, help="Fresh cost-estimate.json")
+    approval_verify.add_argument("--pr", type=int, default=None, help="Pull request number")
+    approval_verify.add_argument("--head-sha", default=None, help="Approved PR head commit SHA")
+    approval_verify.add_argument("--stack", default=None, help="Stack being deployed")
+    approval_verify.add_argument("--terraform-dir", default=None, help="Terraform root being applied")
+    approval_verify.add_argument(
+        "--run-event", default=None, help="Attested event of the approving run"
+    )
+    approval_verify.add_argument(
+        "--run-actor", default=None, help="Attested actor of the approving run"
+    )
+    approval_verify.add_argument(
+        "--expected-approver", default=None, help="The only login permitted to approve"
+    )
+    approval_verify.add_argument("--json", action="store_true")
 
     return parser
 
@@ -267,6 +329,7 @@ def _cmd_create_exception(args: argparse.Namespace) -> int:
         approver=args.approver,
         justification=args.justification,
         stack=args.stack,
+        terraform_dir=args.terraform_dir,
         max_incremental_cost=args.max_incremental_cost,
         ttl_days=args.ttl_days,
     )
@@ -383,6 +446,172 @@ def _cmd_authorize_deployment(args: argparse.Namespace) -> int:
     return EXIT_PASS if authorization == "AUTHORIZED" else EXIT_FAIL
 
 
+def _rebuild_decision_from_result(result_raw: dict, config):
+    """Rebuild the FAIL PolicyDecision recorded in a gate-result.json."""
+    from .models import PolicyDecision, Status, money
+
+    policy_raw = result_raw.get("policy") or {}
+    return PolicyDecision(
+        status=Status.FAIL,
+        metric=policy_raw.get("metric", config.threshold.metric),
+        unit=policy_raw.get("unit", config.threshold.unit),
+        observed_value=money(policy_raw.get("observed_value")),
+        threshold_value=money(policy_raw.get("threshold_value")),
+        currency=policy_raw.get("currency", config.threshold.currency),
+        comparison=policy_raw.get("comparison", config.threshold.comparison),
+    )
+
+
+def _cmd_approve(args: argparse.Namespace) -> int:
+    """Record the human APPROVE/REJECT choice made in a workflow_dispatch run.
+
+    Rejection short-circuits: nothing is minted, so there is no artifact a
+    later run could mistake for an authorisation.
+    """
+    from .gate import (
+        APPROVAL_APPROVED,
+        APPROVAL_REJECTED,
+        REJECTION_MESSAGE,
+    )
+    from .lock.exception import create_exception
+    from .models import Status
+    from .plan.normalizer import load_plan_json
+
+    config = load_config(args.config)
+
+    def emit(payload: dict, code: int) -> int:
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            for key, value in payload.items():
+                print(f"{key}: {value}")
+        return code
+
+    if args.action == "reject":
+        return emit(
+            {
+                "finops_decision": "BLOCK",
+                "approval_status": APPROVAL_REJECTED,
+                "deployment_authorization": "DENIED",
+                "message": REJECTION_MESSAGE,
+            },
+            EXIT_FAIL,
+        )
+
+    actor = (args.run_actor or "").strip().lower()
+    expected = (args.expected_approver or "").strip().lower()
+    if args.run_event != "workflow_dispatch":
+        print(
+            f"::error::Approval must come from a workflow_dispatch run, not "
+            f"{args.run_event!r}.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    if not expected or actor != expected:
+        print(
+            f"::error::{args.run_actor!r} is not the authorised approver "
+            f"({args.expected_approver!r}). Refusing to record an approval.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    result_raw = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    if result_raw.get("status") != Status.FAIL.value:
+        print(
+            f"Refusing to approve: gate status is {result_raw.get('status')!r}, "
+            f"expected FAIL (nothing to approve).",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    decision = _rebuild_decision_from_result(result_raw, config)
+    estimate = _rebuild_estimate_from_dict(result_raw.get("cost") or {})
+    plan = normalize_plan_file(args.plan)
+    plan_doc = load_plan_json(args.plan)
+
+    record = create_exception(
+        decision,
+        estimate,
+        plan,
+        plan_doc,
+        config,
+        pr_number=args.pr,
+        head_sha=args.head_sha,
+        approver=args.run_actor,
+        justification=(
+            f"Cost estimate explicitly approved by {args.run_actor} via "
+            f"workflow_dispatch on the FinOps Cost Gate workflow."
+        ),
+        stack=args.stack,
+        terraform_dir=args.terraform_dir,
+        max_incremental_cost=args.max_incremental_cost,
+        ttl_days=args.ttl_days,
+    )
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+    return emit(
+        {
+            "finops_decision": "BLOCK",
+            "approval_status": APPROVAL_APPROVED,
+            "deployment_authorization": "AUTHORIZED",
+            "exception_id": record["exception_id"],
+            "approver": record["approver"],
+            "approved_incremental_cost": record["approved_incremental_cost"],
+            "max_incremental_cost": record["max_incremental_cost"],
+            "expires_at": record["expires_at"],
+        },
+        EXIT_PASS,
+    )
+
+
+def _cmd_approval_verify(args: argparse.Namespace) -> int:
+    """Trusted-main re-verification: the approval record is re-checked against
+    a plan and estimate computed fresh on THIS run, never the numbers the
+    approving run cached."""
+    from .gate import evaluate_approval
+    from .lock.exception import load_exception, verify_dispatch_approval
+    from .plan.normalizer import load_plan_json
+
+    config = load_config(args.config)
+    record = load_exception(args.decision)
+    plan = normalize_plan_file(args.plan)
+    plan_doc = load_plan_json(args.plan)
+    estimate = _rebuild_estimate(args.estimate)
+
+    problems = verify_dispatch_approval(
+        record,
+        plan,
+        plan_doc,
+        estimate,
+        config,
+        pr_number=args.pr,
+        head_sha=args.head_sha,
+        stack=args.stack,
+        terraform_dir=args.terraform_dir,
+        run_event=args.run_event,
+        run_actor=args.run_actor,
+        expected_approver=args.expected_approver,
+    )
+
+    states = evaluate_approval(
+        analyze_exit_code=1, approval_action="approve", approval_problems=problems
+    )
+
+    if args.json:
+        print(json.dumps({**states, "problems": problems}))
+    else:
+        for key, value in states.items():
+            print(f"{key}: {value}")
+        for problem in problems:
+            print(f"  - {problem}")
+
+    return EXIT_PASS if states["deployment_authorization"] == "AUTHORIZED" else EXIT_FAIL
+
+
 _COMMANDS = {
     "detect-changes": _cmd_detect_changes,
     "analyze": _cmd_analyze,
@@ -391,6 +620,8 @@ _COMMANDS = {
     "create-exception": _cmd_create_exception,
     "verify-exception": _cmd_verify_exception,
     "authorize-deployment": _cmd_authorize_deployment,
+    "approve": _cmd_approve,
+    "approval-verify": _cmd_approval_verify,
 }
 
 
