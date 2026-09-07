@@ -260,6 +260,40 @@ class TestNonDeployableStacksMintNoAuthorisation:
         assert "matrix.stack.deployable == true" in step["if"]
 
 
+class TestInitialDeploymentDetection:
+    """A stack absent from the base ref is a new deployment, determined by
+    directory existence - never by resource_changes actions, which would
+    conflate 'new stack' with 'stack full of creates for another reason'."""
+
+    def _steps(self, gate):
+        return {s.get("name"): s for s in gate["jobs"]["cost-gate"]["steps"]}
+
+    def test_detection_step_exists_before_baseline_planning(self, gate):
+        names = [s.get("name") for s in gate["jobs"]["cost-gate"]["steps"]]
+        assert names.index("Detect initial deployment") < names.index(
+            "Terraform plan (base branch = baseline cost)")
+
+    def test_detection_is_directory_existence_not_plan_output(self, gate):
+        step = self._steps(gate)["Detect initial deployment"]
+        assert 'if [ -d "base/${{ matrix.stack.dir }}" ]' in step["run"]
+        assert "resource_changes" not in step["run"]
+
+    def test_detection_uses_the_matrix_stack_directory(self, gate):
+        step = self._steps(gate)["Detect initial deployment"]
+        assert "matrix.stack.dir" in step["run"]
+        assert "matrix.stack.name" in step["run"]
+
+    def test_baseline_plan_is_skipped_for_a_new_stack(self, gate):
+        step = self._steps(gate)["Terraform plan (base branch = baseline cost)"]
+        assert step["if"] == "steps.initial.outputs.is_initial != 'true'"
+
+    def test_gate_message_distinguishes_initial_deployment_from_plan_failure(self, gate):
+        step = self._steps(gate)["FinOps cost gate"]
+        assert "Initial deployment for" in step["run"]
+        assert "steps.initial.outputs.is_initial" in step["run"]
+        assert "No baseline plan; incremental cost equals full projected cost." in step["run"]
+
+
 class TestSingleCentralWorkflow:
     def test_only_one_finops_workflow_exists(self):
         workflows = {p.name for p in (REPO / ".github/workflows").glob("*.yml")}
@@ -283,8 +317,20 @@ class TestSingleCentralWorkflow:
     def test_detect_uses_the_registry(self, gate):
         run = next(s for s in gate["jobs"]["detect-changes"]["steps"]
                    if s.get("id") == "detect")["run"]
-        assert "from finops.stacks import load_stacks, select_stacks" in run
+        assert "from finops.stacks import select_stacks" in run
         assert "deployable" in run
+
+    def test_detect_has_no_fallback_stack(self, gate):
+        """A change matching no stack must evaluate nothing. Defaulting to aws
+        priced an untouched stack and minted a cost lock for it."""
+        run = next(s for s in gate["jobs"]["detect-changes"]["steps"]
+                   if s.get("id") == "detect")["run"]
+        assert "load_stacks()['aws']" not in run
+        assert "found = [" not in run
+
+    def test_gate_is_skipped_when_no_stack_is_selected(self, gate):
+        cond = " ".join(gate["jobs"]["cost-gate"]["if"].split())
+        assert "needs.detect-changes.outputs.stacks != '[]'" in cond
 
     def test_reports_are_scoped_per_stack(self, gate_text):
         assert "<!-- stack:${{ matrix.stack.name }} -->" in gate_text

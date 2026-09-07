@@ -95,16 +95,16 @@ jobs:
           # arbitrary Terraform directory or mark itself deployable.
           STACKS=$(python - <<'PY'
           import json
-          from finops.stacks import load_stacks, select_stacks
+          from finops.stacks import select_stacks
           files = json.load(open('changes.json'))['infrastructure_files']
-          found = select_stacks(files)
-          if not found:
-              found = [load_stacks()['aws']]
+          # No fallback. A change that maps to no stack must evaluate nothing:
+          # defaulting to aws priced an untouched stack and minted a real cost
+          # lock for it, which is a deployment authorisation nobody asked for.
           print(json.dumps([
               {"name": s.name, "dir": s.terraform_dir, "cloud": s.cloud,
                "deployable": s.deployable, "environment": s.environment,
                "usage_file": s.usage_file or ""}
-              for s in found
+              for s in select_stacks(files)
           ]))
           PY
           )
@@ -122,9 +122,12 @@ jobs:
     name: Cost gate (${{ matrix.stack.name }})
     needs: detect-changes
     if: |
-      needs.detect-changes.outputs.has_infra_changes == 'true' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'push'
+      needs.detect-changes.outputs.stacks != '' &&
+      needs.detect-changes.outputs.stacks != '[]' && (
+        needs.detect-changes.outputs.has_infra_changes == 'true' ||
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'push'
+      )
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -191,8 +194,26 @@ jobs:
       # This file is generated at runtime and never committed. It must NOT be
       # copied into the deploy job - a `backend "local"` block there makes
       # every S3 -backend-config argument invalid and breaks deployment.
+      # A stack that does not exist on the base ref is an initial deployment,
+      # not a change to an existing one - its baseline cost is $0, not "same
+      # as proposed". Determined by directory existence, independent of
+      # whether a plan would succeed, so a real Terraform error is never
+      # mistaken for "new stack" (and vice versa).
+      - name: Detect initial deployment
+        id: initial
+        run: |
+          set -euo pipefail
+          if [ -d "base/${{ matrix.stack.dir }}" ]; then
+            echo "is_initial=false" >> "$GITHUB_OUTPUT"
+            echo "Stack '${{ matrix.stack.name }}' exists on the base ref; treating as an existing-stack change."
+          else
+            echo "is_initial=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Initial deployment::Stack '${{ matrix.stack.name }}' does not exist on the base ref (${{ github.base_ref || github.event.repository.default_branch }}). Baseline cost is \$0; the full projected cost is the incremental cost."
+          fi
+
       - name: Terraform plan (base branch = baseline cost)
         id: baseline
+        if: steps.initial.outputs.is_initial != 'true'
         continue-on-error: true
         working-directory: base/${{ matrix.stack.dir }}
         run: |
@@ -325,6 +346,8 @@ jobs:
           BASELINE_ARG=""
           if [ -f "$GITHUB_WORKSPACE/baseline-plan.json" ]; then
             BASELINE_ARG="--baseline-plan $GITHUB_WORKSPACE/baseline-plan.json"
+          elif [ "${{ steps.initial.outputs.is_initial }}" = "true" ]; then
+            echo "::notice::Initial deployment for '${{ matrix.stack.name }}' - current monthly cost is \$0.00; the full projected cost is the incremental cost."
           else
             echo "::warning::No baseline plan; incremental cost equals full projected cost."
           fi

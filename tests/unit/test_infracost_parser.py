@@ -201,3 +201,59 @@ class TestBuildEstimate:
         estimate = build_estimate(parse_document(doc), None, "infracost")
         assert estimate.coverage.unsupported_resources == 2
         assert any("not supported" in w for w in estimate.warnings)
+
+
+class TestInitialDeploymentSemantics:
+    """A stack absent from the base ref is a new deployment: baseline = $0,
+    never 'same as proposed' merely because nothing existed before."""
+
+    def test_new_stack_baseline_is_zero(self):
+        proposed = parse_document(v2_doc("258.62", [v2_resource("aws_lb.main", "aws_lb", "16.43")]))
+        estimate = build_estimate(proposed, None, "infracost")
+        assert estimate.previous_monthly_cost == Decimal("0")
+
+    def test_new_stack_proposed_is_the_full_infracost_cost(self):
+        proposed = parse_document(v2_doc("258.62"))
+        estimate = build_estimate(proposed, None, "infracost")
+        assert estimate.new_monthly_cost == Decimal("258.62")
+
+    def test_new_stack_incremental_equals_the_full_proposed_cost(self):
+        proposed = parse_document(v2_doc("258.62"))
+        estimate = build_estimate(proposed, None, "infracost")
+        assert estimate.incremental_monthly_cost == estimate.new_monthly_cost == Decimal("258.62")
+
+    def test_existing_stack_incremental_is_proposed_minus_baseline(self):
+        proposed = parse_document(v2_doc("280.00"))
+        baseline = parse_document(v2_doc("258.62"))
+        estimate = build_estimate(proposed, baseline, "infracost")
+        assert estimate.previous_monthly_cost == Decimal("258.62")
+        assert estimate.incremental_monthly_cost == Decimal("21.38")
+
+    def test_new_stack_above_threshold_is_blocked(self):
+        from finops.models import PolicyDecision, Status
+
+        proposed = parse_document(v2_doc("258.62"))
+        estimate = build_estimate(proposed, None, "infracost")
+        decision = PolicyDecision(
+            status=Status.FAIL if estimate.incremental_monthly_cost > 100 else Status.PASS,
+            metric="incremental_monthly_cost", unit="USD/month",
+            observed_value=estimate.incremental_monthly_cost, threshold_value=Decimal("100"),
+            currency="USD", comparison="<=",
+        )
+        assert decision.status is Status.FAIL
+        assert decision.exceeded_by == Decimal("158.62")
+
+    def test_new_stack_at_or_under_threshold_passes(self):
+        from finops.models import PolicyDecision, Status
+
+        proposed = parse_document(v2_doc("80.00"))
+        estimate = build_estimate(proposed, None, "infracost")
+        decision = PolicyDecision(
+            status=Status.PASS if estimate.incremental_monthly_cost <= 100 else Status.FAIL,
+            metric="incremental_monthly_cost", unit="USD/month",
+            observed_value=estimate.incremental_monthly_cost, threshold_value=Decimal("100"),
+            currency="USD", comparison="<=",
+        )
+        assert decision.status is Status.PASS
+        assert estimate.previous_monthly_cost == Decimal("0")
+        assert estimate.incremental_monthly_cost == Decimal("80.00")
