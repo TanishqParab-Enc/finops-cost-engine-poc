@@ -134,31 +134,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     authorize.add_argument("--json", action="store_true")
 
-    evaluate = sub.add_parser(
-        "evaluate-attestation",
-        help="Verify a PR's environment-approval exception attestation on trusted main",
-    )
-    _add_config_arg(evaluate)
-    evaluate.add_argument("--exception", default=None, help="Path to the PR's exception attestation, if any")
-    evaluate.add_argument("--plan", default=None, help="Fresh Terraform plan JSON from this trusted run")
-    evaluate.add_argument(
-        "--gate-result", default=None,
-        help="Fresh gate-result.json from this trusted run (source of the fresh estimate)",
-    )
-    evaluate.add_argument("--pr", type=int, default=None, help="Pull request number")
-    evaluate.add_argument("--pr-author", default=None, help="Pull request author login")
-    evaluate.add_argument("--head-sha", default=None, help="Pull request head commit SHA")
-    evaluate.add_argument("--stack", default=None, help="Stack the attestation must authorise")
-    evaluate.add_argument(
-        "--approval-job-conclusion", default="",
-        help="Conclusion of the PR's finops-approval job, from the Actions API on that run",
-    )
-    evaluate.add_argument(
-        "--approver-logins", default="",
-        help="Comma-separated logins from that same run's live Approvals API",
-    )
-    evaluate.add_argument("--json", action="store_true")
-
     return parser
 
 
@@ -408,41 +383,6 @@ def _cmd_authorize_deployment(args: argparse.Namespace) -> int:
     return EXIT_PASS if authorization == "AUTHORIZED" else EXIT_FAIL
 
 
-def _cmd_evaluate_attestation(args: argparse.Namespace) -> int:
-    from .gate import evaluate_pr_attestation
-    from .lock.exception import load_exception
-    from .plan.normalizer import load_plan_json
-
-    config = load_config(args.config)
-    approval_ok = args.approval_job_conclusion == "success"
-    approver_logins = [login for login in args.approver_logins.split(",") if login]
-
-    attestation = None
-    plan = plan_doc = estimate = None
-    if approval_ok and args.exception and Path(args.exception).is_file():
-        attestation = load_exception(args.exception)
-        if args.plan and Path(args.plan).is_file():
-            plan = normalize_plan_file(args.plan)
-            plan_doc = load_plan_json(args.plan)
-        if args.gate_result and Path(args.gate_result).is_file():
-            gate_result = json.loads(Path(args.gate_result).read_text(encoding="utf-8"))
-            estimate = _rebuild_estimate_from_dict(gate_result.get("cost") or {})
-
-    authorization = evaluate_pr_attestation(
-        attestation,
-        plan=plan, plan_doc=plan_doc, estimate=estimate, config=config,
-        pr_number=args.pr, pr_author=args.pr_author, head_sha=args.head_sha, stack=args.stack,
-        approval_job_succeeded=approval_ok, approver_logins=approver_logins,
-    )
-
-    if args.json:
-        print(json.dumps({"deployment_authorization": authorization}))
-    else:
-        print(f"deployment_authorization: {authorization}")
-
-    return EXIT_PASS if authorization == "AUTHORIZED" else EXIT_FAIL
-
-
 _COMMANDS = {
     "detect-changes": _cmd_detect_changes,
     "analyze": _cmd_analyze,
@@ -451,7 +391,6 @@ _COMMANDS = {
     "create-exception": _cmd_create_exception,
     "verify-exception": _cmd_verify_exception,
     "authorize-deployment": _cmd_authorize_deployment,
-    "evaluate-attestation": _cmd_evaluate_attestation,
 }
 
 
