@@ -611,16 +611,28 @@ class TestCostCreep:
 
 
 class TestApprovalBeforeDeploymentOrdering:
-    """Deployment must be structurally unreachable until cost-gate resolves
-    (where the exception/lock authorisation lives), never merely 'usually
-    resolved first' by job listing order."""
+    """Deployment must be structurally unreachable until authorization
+    resolves (where the exception/lock authorisation lives), never merely
+    'usually resolved first' by job listing order. deploy depends on the
+    explicit authorize-deploy result, never on cost-gate's raw pass/fail -
+    cost-gate is matrixed by stack, so its own conclusion is all-or-nothing
+    across every stack in the push, which must not gate an unrelated,
+    already-authorized stack's deployment."""
 
-    def test_deploy_needs_cost_gate_to_have_finished(self, gate):
-        assert gate["jobs"]["deploy"]["needs"] == ["detect-changes", "cost-gate"]
+    def test_deploy_needs_authorize_deploy_not_cost_gate_directly(self, gate):
+        assert gate["jobs"]["deploy"]["needs"] == ["detect-changes", "authorize-deploy"]
 
-    def test_deploy_requires_cost_gate_success_not_just_completion(self, gate):
+    def test_deploy_requires_authorize_deploy_success(self, gate):
         cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert cond.startswith("needs.cost-gate.result == 'success' &&")
+        assert cond.startswith("needs.authorize-deploy.result == 'success' &&")
+        assert "needs.cost-gate.result" not in cond
+
+    def test_authorize_deploy_always_runs_even_when_cost_gate_partially_fails(self, gate):
+        cond = " ".join(gate["jobs"]["authorize-deploy"]["if"].split())
+        assert cond.startswith("always() &&")
+
+    def test_authorize_deploy_needs_cost_gate(self, gate):
+        assert gate["jobs"]["authorize-deploy"]["needs"] == ["detect-changes", "cost-gate"]
 
     def test_no_sleep_or_wait_based_approval_inside_the_pr_job(self, gate_text):
         """Approval must never be a workflow pausing to wait for a review to
@@ -632,6 +644,68 @@ class TestApprovalBeforeDeploymentOrdering:
         own conditions never read an `inputs.approved`-style flag."""
         assert "inputs.approved" not in gate_text
         assert "inputs.force_deploy" not in gate_text
+
+
+class TestDeploymentAuthorizationArchitecture:
+    """finops_decision (PASS/BLOCK) and deployment_authorization
+    (AUTHORIZED/DENIED) are separate, explicitly named signals - an approved
+    exception must never rewrite a BLOCK into a PASS."""
+
+    def test_compute_authorization_step_exists_in_cost_gate(self, gate):
+        job = gate["jobs"]["cost-gate"]
+        step = next(s for s in job["steps"] if s.get("name") == "Compute deployment authorization")
+        assert "finops authorize-deployment" in step["run"]
+        assert step["if"] == "always()"
+
+    def test_compute_authorization_runs_before_upload_and_enforce(self, gate):
+        names = [s.get("name") for s in gate["jobs"]["cost-gate"]["steps"]]
+        assert names.index("Compute deployment authorization") < names.index("Upload FinOps artifacts")
+        assert names.index("Compute deployment authorization") < names.index("Enforce gate")
+
+    def test_compute_authorization_considers_lock_reverification(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Compute deployment authorization")
+        assert "steps.verify_lock.outcome" in step["run"]
+
+    def test_compute_authorization_considers_exception_validity(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Compute deployment authorization")
+        assert "steps.exception.outputs.valid" in step["run"]
+
+    def test_a_non_deployable_stack_is_never_authorized_however_cheap_it_prices(self, gate):
+        """deployment_authorization is forced DENIED for a non-deployable
+        stack, independent of the CLI's PASS/BLOCK computation - deployability
+        is a registry fact the authorize-deployment CLI does not consume."""
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Compute deployment authorization")
+        assert 'matrix.stack.deployable' in step["run"]
+        assert 'data["deployment_authorization"] = "DENIED"' in step["run"]
+
+    def test_enforce_gate_still_fails_the_pr_check_when_denied(self, gate):
+        """cost-gate's own required check stays red for an unauthorised
+        over-threshold change - only the (decoupled) deploy job's dependency
+        changed, not the PR-visible signal that peer review is required."""
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
+        assert "FinOps threshold exceeded" in step["run"]
+        assert "exit 1" in step["run"]
+
+    def test_authorize_deploy_aggregates_per_stack_not_a_single_boolean(self, gate):
+        job = gate["jobs"]["authorize-deploy"]
+        assert "authorizations" in job["outputs"]
+        aggregate = next(s for s in job["steps"] if s.get("name") == "Aggregate per-stack authorization")
+        assert "merged" in aggregate["run"]
+
+    def test_deploy_verifies_authorization_for_its_own_stack_before_anything_else(self, gate):
+        steps = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]
+        assert steps.index("Verify deployment authorization for this stack") < steps.index(
+            "Pin and validate deployment target")
+
+    def test_deploy_authorization_check_never_treats_block_as_pass(self, gate):
+        step = next(s for s in gate["jobs"]["deploy"]["steps"]
+                    if s.get("name") == "Verify deployment authorization for this stack")
+        assert 'auth != "AUTHORIZED"' in step["run"]
+        assert "finops_decision" in step["run"]
+
 
 
 class TestNoTerraformTargeting:

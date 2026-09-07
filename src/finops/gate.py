@@ -154,3 +154,36 @@ def write_artifacts(result: GateResult, config: Config) -> dict[str, Path]:
         written["plan"] = plan_path
 
     return written
+
+
+def finops_decision_label(analyze_exit_code: int) -> str:
+    """PASS/BLOCK vocabulary for the decision itself. Independent of, and
+    never influenced by, deployment authorisation - an approved exception
+    changes what may deploy, never what the decision was."""
+    return "PASS" if analyze_exit_code == 0 else "BLOCK"
+
+
+def authorize_deployment(
+    *, analyze_exit_code: int, exception_valid: bool | None = None, lock_verified: bool = True,
+) -> str:
+    """AUTHORIZED or DENIED for a trusted `main` deployment.
+
+    Exactly two paths authorise deployment:
+      1. Normal: the fresh analyze run PASSed (exit_code 0) and, for a
+         deployable stack, its cost lock re-verified against the fresh plan.
+      2. Exception: the fresh analyze run was BLOCKed (exit_code 1) but a
+         freshly re-validated, peer-review-backed exception covers this
+         exact PR/head SHA/stack/cost. Re-validation (non-author reviewer,
+         allow-list, APPROVED state, expiry, integrity, cost ceiling, ...)
+         happens in verify_exception; this function only consumes its
+         boolean result.
+    Anything else - no exception, an invalid/stale one, or exit_code 2
+    (cost could not be trusted, e.g. a non-authoritative/mocked estimate) -
+    is DENIED. finops_decision is never rewritten by this function: a BLOCK
+    that is AUTHORIZED via exception is still a BLOCK.
+    """
+    if analyze_exit_code == 0:
+        return "AUTHORIZED" if lock_verified else "DENIED"
+    if analyze_exit_code == 1 and exception_valid:
+        return "AUTHORIZED"
+    return "DENIED"

@@ -486,6 +486,70 @@ jobs:
               });
             }
 
+      # Only meaningful on the trusted main run: proves the lock this run just
+      # minted is untampered, APPROVED, produced by an AUTHORITATIVE estimator,
+      # and still bound to the current threshold and plan before anything is
+      # applied. Guarded on a passing gate so a threshold failure reports the
+      # real reason rather than a missing-lock error.
+      - name: Verify cost lock before deployment
+        id: verify_lock
+        if: github.event_name == 'push' && steps.gate.outputs.exit_code == '0' && matrix.stack.deployable == true
+        working-directory: head
+        run: |
+          set -euo pipefail
+          finops verify-lock \
+            --lock .finops/cost-lock.json \
+            --stack "${{ matrix.stack.name }}" \
+            --plan "$GITHUB_WORKSPACE/proposed-plan.json"
+
+      # finops_decision (was this within budget) and deployment_authorization
+      # (may trusted main deploy it) are deliberately separate signals. An
+      # approved exception authorises deployment without ever turning a BLOCK
+      # into a PASS. Calls the same `finops authorize-deployment` CLI command
+      # the unit tests exercise directly, so CI runs tested code rather than
+      # parallel bash logic.
+      - name: Compute deployment authorization
+        id: authz
+        if: always()
+        working-directory: head
+        run: |
+          set -euo pipefail
+          EXC_FLAG=""
+          if [ "${{ steps.exception.outputs.valid }}" = "true" ]; then
+            EXC_FLAG="--exception-valid"
+          fi
+          LOCK_FLAG=""
+          if [ "${{ steps.verify_lock.outcome }}" = "failure" ]; then
+            LOCK_FLAG="--lock-not-verified"
+          fi
+
+          set +e
+          finops authorize-deployment \
+            --exit-code "${{ steps.gate.outputs.exit_code }}" \
+            $EXC_FLAG $LOCK_FLAG --json > authz.json
+          set -e
+          cat authz.json
+
+          mkdir -p .finops
+          python3 - <<'PY'
+          import json
+          import os
+
+          data = json.load(open("authz.json"))
+          # A stack the trusted registry marks non-deployable can never be
+          # authorized to deploy, whatever it priced - deployability is a
+          # registry fact the authorize-deployment CLI does not know about.
+          if "${{ matrix.stack.deployable }}" != "true":
+              data["deployment_authorization"] = "DENIED"
+          data["stack"] = "${{ matrix.stack.name }}"
+          data["run_id"] = "${{ github.run_id }}"
+          json.dump(data, open(".finops/authorization.json", "w"), indent=2)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"finops_decision={data['finops_decision']}\n")
+              out.write(f"deployment_authorization={data['deployment_authorization']}\n")
+          PY
+
       - name: Upload FinOps artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -497,36 +561,25 @@ jobs:
           # by default, which silently discarded the whole audit trail.
           include-hidden-files: true
 
-      # Only meaningful on the trusted main run: proves the lock this run just
-      # minted is untampered, APPROVED, produced by an AUTHORITATIVE estimator,
-      # and still bound to the current threshold and plan before anything is
-      # applied. Guarded on a passing gate so a threshold failure reports the
-      # real reason rather than a missing-lock error.
-      - name: Verify cost lock before deployment
-        if: github.event_name == 'push' && steps.gate.outputs.exit_code == '0' && matrix.stack.deployable == true
-        working-directory: head
-        run: |
-          set -euo pipefail
-          finops verify-lock \
-            --lock .finops/cost-lock.json \
-            --stack "${{ matrix.stack.name }}" \
-            --plan "$GITHUB_WORKSPACE/proposed-plan.json"
-
       # The gate is the last word: a non-zero exit stops the pipeline.
       #   1 = threshold exceeded, peer approval required (unless an approved
       #       budget exception authorises this exact change)
       #   2 = cost could not be trusted, failing safe
+      # This step's own pass/fail is independent of deployment_authorization -
+      # deploy no longer depends on it (see the deploy job). It still fails
+      # closed here so an over-threshold, unauthorised PR keeps showing a
+      # failing required check that demands peer review.
       - name: Enforce gate
         if: always()
-        env:
-          EXCEPTION_VALID: ${{ steps.exception.outputs.valid }}
         run: |
           CODE="${{ steps.gate.outputs.exit_code }}"
+          echo "finops_decision=${{ steps.authz.outputs.finops_decision }}"
+          echo "deployment_authorization=${{ steps.authz.outputs.deployment_authorization }}"
           case "$CODE" in
             0) echo "PASS - cost locked, pipeline may continue." ;;
             1)
-              if [ "$EXCEPTION_VALID" = "true" ]; then
-                echo "FINOPS: BLOCKED (finops_decision=FAIL)"
+              if [ "${{ steps.authz.outputs.deployment_authorization }}" = "AUTHORIZED" ]; then
+                echo "FINOPS: BLOCKED (finops_decision=BLOCK)"
                 echo "exception_approval=APPROVED - the overspend was explicitly accepted"
                 echo "by a peer for this exact change. The FinOps decision is unchanged."
               else
@@ -682,19 +735,67 @@ jobs:
   #   workflow_dispatch -> explicit opt-in, aws only, may target dev or prod
   # `matrix.stack.deployable` is read from the SAME trusted registry JSON
   # detect-changes already built for cost-gate - a PR cannot flip it, since it
-  # is never taken from workflow input. The job also re-reads
-  # config/finops-stacks.yml directly below, so deployability is checked
-  # twice, independently. Apply targets an environment-specific workload state
-  # and var-file, so dev and prod are genuinely isolated - not just
-  # IAM-role-labelled copies of the same shared state.
+  # is never taken from workflow input. The deploy job also re-reads
+  # config/finops-stacks.yml directly, so deployability is checked twice,
+  # independently. Apply targets an environment-specific workload state and
+  # var-file, so dev and prod are genuinely isolated - not just IAM-role-
+  # labelled copies of the same shared state.
   #
-  # Cost creep is rejected before this job is even eligible: verify-lock /
-  # verify-exception (in cost-gate, on this same push) re-derive the plan
-  # fingerprint from a plan generated fresh in THIS run, not the PR's cached
-  # numbers - any cost-relevant change invalidates the authorisation.
+  # cost-gate is matrixed by stack, so its own job conclusion is all-or-
+  # nothing across every stack a push touched: one BLOCKED-without-exception
+  # stack would make the whole job 'failure', which must not stop an
+  # unrelated, already-authorized stack from deploying. This job aggregates
+  # each matrix instance's authorization.json (published in its own "Upload
+  # FinOps artifacts" artifact) into one per-stack map, so `deploy` can depend
+  # on an explicit authorization result instead of cost-gate's raw pass/fail.
+  # Always runs (`always()`) so it aggregates the DENIED case too, not just
+  # skip past it.
+  authorize-deploy:
+    name: Aggregate deployment authorization
+    needs: [detect-changes, cost-gate]
+    if: |
+      always() && needs.detect-changes.result == 'success' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      authorizations: ${{ steps.aggregate.outputs.authorizations }}
+    steps:
+      - name: Download per-stack authorization artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: finops-*-${{ github.run_id }}
+          path: artifacts
+          if-no-artifact-found: ignore
+
+      - name: Aggregate per-stack authorization
+        id: aggregate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+
+          merged = {}
+          for path in glob.glob("artifacts/*/authorization.json"):
+              with open(path, encoding="utf-8") as fh:
+                  data = json.load(fh)
+              stack = data.get("stack")
+              if stack:
+                  merged[stack] = data
+
+          print("Aggregated deployment authorization:")
+          print(json.dumps(merged, indent=2))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"authorizations={json.dumps(merged)}\n")
+          PY
+
   deploy:
     name: Deploy (gated) [${{ matrix.stack.name }}]
-    needs: [detect-changes, cost-gate]
+    needs: [detect-changes, authorize-deploy]
     strategy:
       fail-fast: false
       matrix:
@@ -702,12 +803,14 @@ jobs:
     # The `matrix` context is only available in `strategy` and `steps`, never
     # in a job-level `if:` - so deployability (matrix.stack.deployable) and
     # the workflow_dispatch aws-only restriction (matrix.stack.name) cannot be
-    # checked here. Both are instead enforced, per matrix instance, by the
-    # first two steps below - "Pin and validate deployment target" and
+    # checked here. Both are instead enforced, per matrix instance, by steps
+    # below - "Verify deployment authorization for this stack" and
     # "Verify the stack is deployable (trusted registry)" - which fail
-    # closed before any Terraform command runs.
+    # closed before any Terraform command runs. Deliberately depends on
+    # authorize-deploy's explicit result, never on cost-gate's raw pass/fail
+    # (see the comment on authorize-deploy).
     if: |
-      needs.cost-gate.result == 'success' && (
+      needs.authorize-deploy.result == 'success' && (
         (github.event_name == 'push' &&
          github.ref == 'refs/heads/main') ||
         (github.event_name == 'workflow_dispatch' &&
@@ -728,6 +831,41 @@ jobs:
       DEPLOY_STACK: ${{ matrix.stack.name }}
     steps:
       - uses: actions/checkout@v4
+
+      # The actual authorization gate. finops_decision stays BLOCK for an
+      # over-threshold change even when deployment_authorization is
+      # AUTHORIZED via an approved exception - this step never treats those
+      # as interchangeable, it only acts on deployment_authorization.
+      - name: Verify deployment authorization for this stack
+        env:
+          AUTHORIZATIONS: ${{ needs.authorize-deploy.outputs.authorizations }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          stack = "${{ matrix.stack.name }}"
+          data = json.loads(os.environ.get("AUTHORIZATIONS") or "{}")
+          entry = data.get(stack)
+          if entry is None:
+              sys.exit(
+                  f"::error title=No authorization record::No deployment "
+                  f"authorization was computed for stack {stack!r}. Refusing to deploy."
+              )
+
+          decision = entry.get("finops_decision")
+          auth = entry.get("deployment_authorization")
+          print(f"finops_decision={decision}")
+          print(f"deployment_authorization={auth}")
+          if auth != "AUTHORIZED":
+              sys.exit(
+                  f"::error title=Deployment not authorized::Stack {stack!r} is not "
+                  f"authorized to deploy (finops_decision={decision}, "
+                  f"deployment_authorization={auth})."
+              )
+          PY
 
       - name: Pin and validate deployment target
         run: |

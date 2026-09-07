@@ -119,6 +119,21 @@ def build_parser() -> argparse.ArgumentParser:
     verify_exc.add_argument("--verified-commit", default=None, help="Commit being verified")
     verify_exc.add_argument("--stack", default=None, help="Stack the exception must authorise")
 
+    authorize = sub.add_parser(
+        "authorize-deployment",
+        help="Compute finops_decision/deployment_authorization for a trusted-main deploy",
+    )
+    authorize.add_argument("--exit-code", required=True, type=int, help="finops analyze exit code")
+    authorize.add_argument(
+        "--exception-valid", action="store_true",
+        help="A fresh, peer-review-backed exception re-validated for this exact change",
+    )
+    authorize.add_argument(
+        "--lock-not-verified", action="store_true",
+        help="The cost lock failed re-verification against the fresh plan (normal/PASS path only)",
+    )
+    authorize.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -349,6 +364,25 @@ def _cmd_verify_exception(args: argparse.Namespace) -> int:
     return EXIT_PASS
 
 
+def _cmd_authorize_deployment(args: argparse.Namespace) -> int:
+    from .gate import authorize_deployment, finops_decision_label
+
+    decision = finops_decision_label(args.exit_code)
+    authorization = authorize_deployment(
+        analyze_exit_code=args.exit_code,
+        exception_valid=args.exception_valid,
+        lock_verified=not args.lock_not_verified,
+    )
+
+    if args.json:
+        print(json.dumps({"finops_decision": decision, "deployment_authorization": authorization}))
+    else:
+        print(f"finops_decision: {decision}")
+        print(f"deployment_authorization: {authorization}")
+
+    return EXIT_PASS if authorization == "AUTHORIZED" else EXIT_FAIL
+
+
 _COMMANDS = {
     "detect-changes": _cmd_detect_changes,
     "analyze": _cmd_analyze,
@@ -356,6 +390,7 @@ _COMMANDS = {
     "verify-lock": _cmd_verify_lock,
     "create-exception": _cmd_create_exception,
     "verify-exception": _cmd_verify_exception,
+    "authorize-deployment": _cmd_authorize_deployment,
 }
 
 

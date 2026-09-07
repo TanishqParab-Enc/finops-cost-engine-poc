@@ -258,6 +258,15 @@ def verify_exception(
     if not config.exceptions.enabled:
         return ["Budget exceptions are disabled by policy"]
 
+    # Symmetric with create_exception: a test double or otherwise untrusted
+    # estimator must never authorise a real deployment, even against an
+    # otherwise-valid exception.
+    if not estimate.is_authoritative:
+        problems.append(
+            f"Refusing to authorise from a non-authoritative estimator "
+            f"'{estimate.estimator}'"
+        )
+
     if stack is not None and record.get("stack") != stack:
         problems.append(
             f"Exception was approved for stack {record.get('stack')!r} and cannot "
