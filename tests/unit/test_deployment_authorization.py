@@ -12,7 +12,7 @@ from decimal import Decimal
 
 import pytest
 
-from finops.gate import authorize_deployment, finops_decision_label
+from finops.gate import authorize_deployment, finops_decision_label, resolve_stack_authorization
 from finops.lock.exception import create_exception, verify_exception
 from finops.models import CostEstimate, EstimatorTrust, PolicyDecision, Status
 from finops.plan.normalizer import NormalizedPlan
@@ -228,3 +228,73 @@ class TestAuthorizeDeploymentCli:
         assert proc.returncode == 1
         payload = json.loads(proc.stdout)
         assert payload == {"finops_decision": "BLOCK", "deployment_authorization": "DENIED"}
+
+
+class TestResolveStackAuthorizationEnvironmentApproval:
+    """The finops-cost-approval GitHub Actions environment - not a PR review,
+    not a workflow input, not repository content - is the only thing that
+    can upgrade a BLOCKed stack's deployment_authorization to AUTHORIZED."""
+
+    def _entry(self, stack="aws", decision="BLOCK", auth="DENIED"):
+        return {"stack": stack, "finops_decision": decision, "deployment_authorization": auth}
+
+    def test_pass_entry_is_untouched(self):
+        entry = self._entry(decision="PASS", auth="AUTHORIZED")
+        out = resolve_stack_authorization(entry, approval_result="skipped", approved_stacks=[])
+        assert out["deployment_authorization"] == "AUTHORIZED"
+        assert out["finops_decision"] == "PASS"
+
+    def test_pass_entry_that_was_denied_stays_denied(self):
+        """PASS's own authorization (lock re-verification) is decided in
+        cost-gate, before this function ever runs - it must not be
+        second-guessed here."""
+        entry = self._entry(decision="PASS", auth="DENIED")
+        out = resolve_stack_authorization(entry, approval_result="success", approved_stacks=["aws"])
+        assert out["deployment_authorization"] == "DENIED"
+
+    def test_block_with_successful_approval_and_stack_listed_is_authorized(self):
+        entry = self._entry()
+        out = resolve_stack_authorization(entry, approval_result="success", approved_stacks=["aws"])
+        assert out["deployment_authorization"] == "AUTHORIZED"
+
+    def test_approval_never_changes_block_to_pass(self):
+        entry = self._entry()
+        out = resolve_stack_authorization(entry, approval_result="success", approved_stacks=["aws"])
+        assert out["finops_decision"] == "BLOCK"
+
+    def test_block_with_rejected_approval_is_denied(self):
+        """A GitHub Actions environment 'Reject' cancels the finops-approval
+        job before any step runs - its result is not 'success'."""
+        entry = self._entry()
+        out = resolve_stack_authorization(entry, approval_result="failure", approved_stacks=[])
+        assert out["deployment_authorization"] == "DENIED"
+        assert out["finops_decision"] == "BLOCK"
+
+    def test_block_with_cancelled_approval_is_denied(self):
+        entry = self._entry()
+        out = resolve_stack_authorization(entry, approval_result="cancelled", approved_stacks=[])
+        assert out["deployment_authorization"] == "DENIED"
+
+    def test_block_with_no_approval_job_run_is_denied(self):
+        """Nothing approved this run at all (e.g. finops-approval was
+        skipped) - fail closed, never default to AUTHORIZED."""
+        entry = self._entry()
+        out = resolve_stack_authorization(entry, approval_result="skipped", approved_stacks=[])
+        assert out["deployment_authorization"] == "DENIED"
+
+    def test_block_approved_for_a_different_stack_is_still_denied(self):
+        """One environment approval covers only the stacks finops-approval
+        actually recorded as blocked in this run - not every stack."""
+        entry = self._entry(stack="aws")
+        out = resolve_stack_authorization(
+            entry, approval_result="success", approved_stacks=["web-platform"])
+        assert out["deployment_authorization"] == "DENIED"
+
+    def test_non_deployable_stack_denial_from_cost_gate_survives_untouched(self):
+        """cost-gate already forces DENIED for a non-deployable stack
+        regardless of decision - this function must not override that back
+        to AUTHORIZED just because the run happened to be approved."""
+        entry = self._entry(decision="PASS", auth="DENIED")
+        out = resolve_stack_authorization(entry, approval_result="success", approved_stacks=["aws"])
+        assert out["deployment_authorization"] == "DENIED"
+

@@ -187,3 +187,27 @@ def authorize_deployment(
     if analyze_exit_code == 1 and exception_valid:
         return "AUTHORIZED"
     return "DENIED"
+
+
+def resolve_stack_authorization(
+    entry: dict, *, approval_result: str, approved_stacks: list,
+) -> dict:
+    """Upgrades one stack's authorization.json using the finops-approval
+    job's outcome - the protected `finops-cost-approval` GitHub Actions
+    environment, never a PR review, workflow input, or repository content.
+
+    A PASS entry (deployment_authorization already AUTHORIZED/DENIED from
+    the normal exit_code/lock check in cost-gate) passes through untouched.
+    A BLOCK entry is only upgraded to AUTHORIZED when the approval job
+    itself succeeded (a human clicked Approve) AND this exact stack was
+    among the ones it recorded as blocked in this run; anything else -
+    rejected, cancelled, or the approval job never ran - is DENIED.
+    finops_decision is never rewritten: an authorised BLOCK is still BLOCK.
+    """
+    updated = dict(entry)
+    if entry.get("finops_decision") == "BLOCK":
+        if approval_result == "success" and entry.get("stack") in approved_stacks:
+            updated["deployment_authorization"] = "AUTHORIZED"
+        else:
+            updated["deployment_authorization"] = "DENIED"
+    return updated

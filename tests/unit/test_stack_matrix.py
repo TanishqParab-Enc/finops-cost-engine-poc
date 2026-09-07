@@ -338,7 +338,7 @@ class TestSingleCentralWorkflow:
 
     def test_authorisation_checks_pass_the_stack(self, gate_text):
         assert '--stack "${{ matrix.stack.name }}"' in gate_text
-        assert gate_text.count('--stack "${{ matrix.stack.name }}"') >= 3
+        assert gate_text.count('--stack "${{ matrix.stack.name }}"') >= 2
 
 
 class TestDeployGating:
@@ -457,9 +457,12 @@ class TestPreservedSemantics:
     def test_gate_fails_closed(self, gate_text):
         assert "Failing safe (exit $CODE)" in gate_text
 
-    def test_exception_path_preserved(self, gate_text):
-        assert "Evaluate budget exception" in gate_text
-        assert "finops verify-exception" in gate_text
+    def test_pr_review_exception_is_no_longer_the_primary_authorisation_mechanism(self, gate_text):
+        """Superseded by the finops-cost-approval GitHub Actions environment -
+        no step in the workflow calls verify-exception or reads PR reviews."""
+        assert "Evaluate budget exception" not in gate_text
+        assert "finops verify-exception" not in gate_text
+        assert "pulls/${PR}/reviews" not in gate_text
 
     def test_drift_assertion_preserved_and_scoped_to_aws(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
@@ -631,13 +634,20 @@ class TestApprovalBeforeDeploymentOrdering:
         cond = " ".join(gate["jobs"]["authorize-deploy"]["if"].split())
         assert cond.startswith("always() &&")
 
-    def test_authorize_deploy_needs_cost_gate(self, gate):
-        assert gate["jobs"]["authorize-deploy"]["needs"] == ["detect-changes", "cost-gate"]
+    def test_authorize_deploy_needs_cost_gate_and_finops_approval(self, gate):
+        assert gate["jobs"]["authorize-deploy"]["needs"] == [
+            "detect-changes", "cost-gate", "finops-approval"]
 
     def test_no_sleep_or_wait_based_approval_inside_the_pr_job(self, gate_text):
         """Approval must never be a workflow pausing to wait for a review to
-        arrive - a PR run finishes BLOCKED and a later trusted run deploys."""
-        assert "sleep" not in gate_text.lower()
+        arrive - a PR run finishes BLOCKED and a later trusted run deploys.
+        The only wait is GitHub's own environment protection UI, not a
+        command this workflow runs."""
+        code_lines = [
+            line for line in gate_text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert not any("sleep" in line.lower() for line in code_lines)
 
     def test_no_workflow_provided_approved_boolean_is_ever_trusted(self, gate_text):
         """A PR must never be able to just assert 'approved=true' - deploy's
@@ -667,10 +677,13 @@ class TestDeploymentAuthorizationArchitecture:
                     if s.get("name") == "Compute deployment authorization")
         assert "steps.verify_lock.outcome" in step["run"]
 
-    def test_compute_authorization_considers_exception_validity(self, gate):
+    def test_compute_authorization_no_longer_consults_pr_review_exceptions(self, gate):
+        """A BLOCK always starts DENIED in cost-gate - only finops-approval's
+        protected environment (via authorize-deploy) can upgrade it."""
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Compute deployment authorization")
-        assert "steps.exception.outputs.valid" in step["run"]
+        assert "steps.exception" not in step["run"]
+        assert "--exception-valid" not in step["run"]
 
     def test_a_non_deployable_stack_is_never_authorized_however_cheap_it_prices(self, gate):
         """deployment_authorization is forced DENIED for a non-deployable
@@ -706,6 +719,71 @@ class TestDeploymentAuthorizationArchitecture:
         assert 'auth != "AUTHORIZED"' in step["run"]
         assert "finops_decision" in step["run"]
 
+
+class TestFinopsApprovalEnvironmentGate:
+    """The finops-cost-approval GitHub Actions environment is the actual
+    human approval gate for a BLOCKed stack - not a PR review, not a
+    workflow input, not repository content, not a sleep/poll loop."""
+
+    def test_job_exists_with_the_protected_environment(self, gate):
+        job = gate["jobs"]["finops-approval"]
+        assert job["environment"] == {"name": "finops-cost-approval"}
+
+    def test_only_reachable_when_cost_gate_actually_blocked(self, gate):
+        cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
+        assert "needs.cost-gate.result == 'failure'" in cond
+
+    def test_never_reachable_from_a_pull_request(self, gate):
+        cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
+        assert "pull_request" not in cond
+        assert "github.event_name == 'push'" in cond
+
+    def test_reachable_from_trusted_push_or_explicit_dispatch_only(self, gate):
+        cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
+        assert "refs/heads/main" in cond
+        assert "workflow_dispatch" in cond and "inputs.deploy == true" in cond
+
+    def test_runs_even_when_cost_gate_partially_failed(self, gate):
+        cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
+        assert cond.startswith("always() &&")
+
+    def test_no_workflow_input_stands_in_for_the_environment_click(self, gate):
+        triggers = gate.get("on") or gate.get(True)
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        for forbidden in ("approve", "reject", "approved", "finops_approval"):
+            assert forbidden not in inputs
+
+    def test_no_polling_loop_waits_for_approval(self, gate):
+        job_text = json.dumps(gate["jobs"]["finops-approval"])
+        assert "while" not in job_text
+        assert "poll" not in job_text.lower()
+
+    def test_no_self_approval_logic_exists(self, gate_text):
+        """The workflow contains no code path that grants approval to itself -
+        the only mechanism is GitHub's own required-reviewers UI, external to
+        this file entirely."""
+        assert "self_approve" not in gate_text.lower()
+        assert "auto_approve" not in gate_text.lower()
+        assert "auto-approve\"" not in gate_text  # terraform's own flag, unrelated
+        assert "-auto-approve" not in gate_text
+
+    def test_authorize_deploy_needs_the_approval_job_result(self, gate):
+        aggregate = next(s for s in gate["jobs"]["authorize-deploy"]["steps"]
+                         if s.get("name") == "Aggregate per-stack authorization")
+        assert "needs.finops-approval.result" in aggregate["env"]["APPROVAL_RESULT"]
+        assert "needs.finops-approval.outputs.approved_stacks" in aggregate["env"]["APPROVED_STACKS"]
+
+    def test_authorize_deploy_calls_the_tested_resolution_function(self, gate):
+        aggregate = next(s for s in gate["jobs"]["authorize-deploy"]["steps"]
+                         if s.get("name") == "Aggregate per-stack authorization")
+        assert "from finops.gate import resolve_stack_authorization" in aggregate["run"]
+
+    def test_finops_approval_records_which_stacks_were_blocked(self, gate):
+        job = gate["jobs"]["finops-approval"]
+        step = next(s for s in job["steps"] if s.get("name") == "Record environment-approved stacks")
+        assert "finops_decision" in step["run"]
+        assert "BLOCK" in step["run"]
+        assert job["outputs"]["approved_stacks"] == "${{ steps.record.outputs.approved_stacks }}"
 
 
 class TestNoTerraformTargeting:

@@ -380,69 +380,12 @@ jobs:
           fi
           echo "Confirmed: no deployment authorisation was created for ${{ matrix.stack.name }}."
 
-      # An over-threshold change may proceed only with an audited, peer-approved
-      # exception. The FinOps decision stays FAIL either way - this decides
-      # whether that specific overspend was explicitly accepted for this exact
-      # change. Authorisation comes from the live GitHub reviews API, never from
-      # repository content, so a pull request cannot approve itself.
-      - name: Evaluate budget exception
-        id: exception
-        if: steps.gate.outputs.exit_code == '1'
-        working-directory: head
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
-          SHA: ${{ github.sha }}
-          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
-          PR_EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
-          PR_EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
-          FINOPS_APPROVERS: ${{ vars.FINOPS_APPROVERS }}
-        run: |
-          set -euo pipefail
-          echo "valid=false" >> "$GITHUB_OUTPUT"
-
-          if [ "$EVENT" = "pull_request" ]; then
-            PR="$PR_EVENT_NUMBER"; HEAD_SHA="$PR_EVENT_HEAD"; AUTHOR="$PR_EVENT_AUTHOR"
-          else
-            gh api "repos/$REPO/commits/$SHA/pulls" > pr.json
-            PR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['number'] if d else '')")
-            HEAD_SHA=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['head']['sha'] if d else '')")
-            AUTHOR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['user']['login'] if d else '')")
-          fi
-
-          if [ -z "$PR" ]; then
-            echo "::error title=No pull request::Cannot authorise a budget exception without an associated pull request."
-            exit 1
-          fi
-
-          RECORD="finops-exceptions/pr-${PR}.json"
-          if [ ! -f "$RECORD" ]; then
-            echo "::notice title=FINOPS BLOCKED::No budget exception found at $RECORD. Peer approval is required."
-            exit 0
-          fi
-
-          gh api "repos/$REPO/pulls/${PR}/reviews" --paginate > reviews.json
-
-          set +e
-          finops verify-exception \
-            --exception "$RECORD" \
-            --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
-            --estimate .finops/cost-estimate.json \
-            --stack "${{ matrix.stack.name }}" \
-            --pr "$PR" \
-            --head-sha "$HEAD_SHA" \
-            --pr-author "$AUTHOR" \
-            --reviews reviews.json \
-            --verified-commit "$SHA"
-          RC=$?
-          set -e
-
-          if [ "$RC" -eq 0 ]; then
-            echo "valid=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice title=FINOPS BLOCKED::The budget exception does not authorise this change."
-          fi
+      # No PR-review-backed exception is evaluated here any more - a BLOCK's
+      # only path to deployment_authorization=AUTHORIZED is the finops-approval
+      # job's protected GitHub Actions environment, on the trusted main run
+      # that will actually deploy (see that job). `finops create-exception` /
+      # `verify-exception` remain available in the CLI for recording
+      # metadata/justification, but are no longer consulted for authorisation.
 
       - name: Publish gate summary
         if: always()
@@ -503,21 +446,19 @@ jobs:
             --plan "$GITHUB_WORKSPACE/proposed-plan.json"
 
       # finops_decision (was this within budget) and deployment_authorization
-      # (may trusted main deploy it) are deliberately separate signals. An
-      # approved exception authorises deployment without ever turning a BLOCK
-      # into a PASS. Calls the same `finops authorize-deployment` CLI command
-      # the unit tests exercise directly, so CI runs tested code rather than
-      # parallel bash logic.
+      # (may trusted main deploy it) are deliberately separate signals. A
+      # BLOCK's deployment_authorization always starts DENIED here - the only
+      # way to upgrade it to AUTHORIZED is the finops-approval job's protected
+      # GitHub Actions environment, downstream in authorize-deploy, never a
+      # PR review or repository content. Calls the same
+      # `finops authorize-deployment` CLI command the unit tests exercise
+      # directly, so CI runs tested code rather than parallel bash logic.
       - name: Compute deployment authorization
         id: authz
         if: always()
         working-directory: head
         run: |
           set -euo pipefail
-          EXC_FLAG=""
-          if [ "${{ steps.exception.outputs.valid }}" = "true" ]; then
-            EXC_FLAG="--exception-valid"
-          fi
           LOCK_FLAG=""
           if [ "${{ steps.verify_lock.outcome }}" = "failure" ]; then
             LOCK_FLAG="--lock-not-verified"
@@ -526,7 +467,7 @@ jobs:
           set +e
           finops authorize-deployment \
             --exit-code "${{ steps.gate.outputs.exit_code }}" \
-            $EXC_FLAG $LOCK_FLAG --json > authz.json
+            $LOCK_FLAG --json > authz.json
           set -e
           cat authz.json
 
@@ -562,13 +503,11 @@ jobs:
           include-hidden-files: true
 
       # The gate is the last word: a non-zero exit stops the pipeline.
-      #   1 = threshold exceeded, peer approval required (unless an approved
-      #       budget exception authorises this exact change)
+      #   1 = threshold exceeded - a required check that demands attention.
+      #       The ONLY path past this for deployment is the finops-approval
+      #       job's protected environment on the trusted main run; nothing in
+      #       this job can turn it green.
       #   2 = cost could not be trusted, failing safe
-      # This step's own pass/fail is independent of deployment_authorization -
-      # deploy no longer depends on it (see the deploy job). It still fails
-      # closed here so an over-threshold, unauthorised PR keeps showing a
-      # failing required check that demands peer review.
       - name: Enforce gate
         if: always()
         run: |
@@ -578,14 +517,8 @@ jobs:
           case "$CODE" in
             0) echo "PASS - cost locked, pipeline may continue." ;;
             1)
-              if [ "${{ steps.authz.outputs.deployment_authorization }}" = "AUTHORIZED" ]; then
-                echo "FINOPS: BLOCKED (finops_decision=BLOCK)"
-                echo "exception_approval=APPROVED - the overspend was explicitly accepted"
-                echo "by a peer for this exact change. The FinOps decision is unchanged."
-              else
-                echo "::error::FinOps threshold exceeded. Peer approval required before merging."
-                exit 1
-              fi
+              echo "::error::FinOps threshold exceeded (finops_decision=BLOCK). Deployment requires approval via the finops-cost-approval GitHub Actions environment on the trusted main run."
+              exit 1
               ;;
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
           esac
@@ -742,17 +675,83 @@ jobs:
   # labelled copies of the same shared state.
   #
   # cost-gate is matrixed by stack, so its own job conclusion is all-or-
+  # nothing across every stack a push touched: one BLOCKed stack would make
+  # the whole job 'failure', which is a reliable, matrix-free signal that at
+  # least one stack needs the approval gate below - it never runs otherwise.
+  #
+  # The protected GitHub Actions environment IS the approval gate: reaching
+  # any step below requires a human to click Approve against the
+  # finops-cost-approval environment's required reviewers (Settings ->
+  # Environments, not this file). Reject cancels the job before any step
+  # runs. There is no workflow input, no repository file, no sleep/poll loop
+  # standing in for that click.
+  #
+  # Environment approvals are per job-run, not persistent across separate
+  # workflow runs - GitHub cannot carry an approval recorded on a PR run
+  # forward into a later, separate trusted-main run. So this job runs ON the
+  # trusted push-to-main (or explicit workflow_dispatch deploy) run itself,
+  # never on `pull_request` - a PR can reach BLOCK, but never this gate, and
+  # therefore never deployment_authorization=AUTHORIZED.
+  finops-approval:
+    name: FinOps cost exception approval
+    needs: [detect-changes, cost-gate]
+    if: |
+      always() && needs.cost-gate.result == 'failure' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
+      )
+    environment:
+      name: finops-cost-approval
+    runs-on: ubuntu-latest
+    outputs:
+      approved_stacks: ${{ steps.record.outputs.approved_stacks }}
+    steps:
+      - name: Download per-stack authorization artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: finops-*-${{ github.run_id }}
+          path: artifacts
+          if-no-artifact-found: ignore
+
+      # Reaching this step at all already proves the environment was
+      # approved - GitHub does not start the job otherwise. This step only
+      # records WHICH stacks were BLOCKED in this run, for authorize-deploy.
+      - name: Record environment-approved stacks
+        id: record
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+
+          blocked = []
+          for path in glob.glob("artifacts/*/authorization.json"):
+              with open(path, encoding="utf-8") as fh:
+                  data = json.load(fh)
+              if data.get("finops_decision") == "BLOCK":
+                  blocked.append(data["stack"])
+
+          print("finops-cost-approval environment approved this run for:", blocked)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"approved_stacks={json.dumps(blocked)}\n")
+          PY
+
+  # cost-gate is matrixed by stack, so its own job conclusion is all-or-
   # nothing across every stack a push touched: one BLOCKED-without-exception
   # stack would make the whole job 'failure', which must not stop an
   # unrelated, already-authorized stack from deploying. This job aggregates
   # each matrix instance's authorization.json (published in its own "Upload
   # FinOps artifacts" artifact) into one per-stack map, so `deploy` can depend
   # on an explicit authorization result instead of cost-gate's raw pass/fail.
-  # Always runs (`always()`) so it aggregates the DENIED case too, not just
-  # skip past it.
+  # A BLOCKED stack is only upgraded to AUTHORIZED here if finops-approval
+  # actually succeeded (a human approved the finops-cost-approval
+  # environment) AND that exact stack was in its approved set - never from
+  # cost-gate's own output. Always runs (`always()`) so it aggregates the
+  # DENIED/rejected case too, not just skip past it.
   authorize-deploy:
     name: Aggregate deployment authorization
-    needs: [detect-changes, cost-gate]
+    needs: [detect-changes, cost-gate, finops-approval]
     if: |
       always() && needs.detect-changes.result == 'success' && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
@@ -762,6 +761,15 @@ jobs:
     outputs:
       authorizations: ${{ steps.aggregate.outputs.authorizations }}
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
       - name: Download per-stack authorization artifacts
         uses: actions/download-artifact@v4
         with:
@@ -771,6 +779,9 @@ jobs:
 
       - name: Aggregate per-stack authorization
         id: aggregate
+        env:
+          APPROVAL_RESULT: ${{ needs.finops-approval.result }}
+          APPROVED_STACKS: ${{ needs.finops-approval.outputs.approved_stacks }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -778,13 +789,20 @@ jobs:
           import json
           import os
 
+          from finops.gate import resolve_stack_authorization
+
+          approval_result = os.environ.get("APPROVAL_RESULT", "skipped")
+          approved_stacks = json.loads(os.environ.get("APPROVED_STACKS") or "[]")
+
           merged = {}
           for path in glob.glob("artifacts/*/authorization.json"):
               with open(path, encoding="utf-8") as fh:
                   data = json.load(fh)
               stack = data.get("stack")
-              if stack:
-                  merged[stack] = data
+              if not stack:
+                  continue
+              merged[stack] = resolve_stack_authorization(
+                  data, approval_result=approval_result, approved_stacks=approved_stacks)
 
           print("Aggregated deployment authorization:")
           print(json.dumps(merged, indent=2))
