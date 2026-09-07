@@ -424,13 +424,34 @@ class TestPreservedSemantics:
 class TestScenarioValidation:
     """Scenario matrix inside the central workflow (no second workflow)."""
 
+    def _scenarios_would_run(self, event_name: str, stacks_json: str) -> bool:
+        """Literal re-implementation of the job's `if:` expression."""
+        return event_name == "workflow_dispatch" and '"web-platform"' in stacks_json
+
+    def test_scenarios_never_run_on_pull_request(self):
+        assert self._scenarios_would_run("pull_request", '[{"name":"web-platform"}]') is False
+
+    def test_scenarios_never_run_on_push(self):
+        assert self._scenarios_would_run("push", '[{"name":"web-platform"}]') is False
+
+    def test_scenarios_run_only_on_manual_dispatch_with_web_platform_selected(self):
+        assert self._scenarios_would_run("workflow_dispatch", '[{"name":"web-platform"}]') is True
+        assert self._scenarios_would_run("workflow_dispatch", '[{"name":"aws"}]') is False
+
     def test_scenarios_job_lives_in_the_central_workflow(self, gate):
         assert "scenarios" in gate["jobs"]
 
     def test_scenarios_only_run_when_web_platform_is_selected(self, gate):
-        assert gate["jobs"]["scenarios"]["if"] == (
-            "contains(needs.detect-changes.outputs.stacks, '\"web-platform\"')"
-        )
+        cond = " ".join(gate["jobs"]["scenarios"]["if"].split())
+        assert "contains(needs.detect-changes.outputs.stacks, '\"web-platform\"')" in cond
+
+    def test_scenarios_are_manual_only_never_automatic_on_pull_request_or_push(self, gate):
+        """The normal web-platform PR path prices only the real committed
+        workload. Scenarios are test fixtures, run on demand only."""
+        cond = " ".join(gate["jobs"]["scenarios"]["if"].split())
+        assert "github.event_name == 'workflow_dispatch'" in cond
+        assert "pull_request" not in cond
+        assert "'push'" not in cond
 
     def test_all_eight_committed_scenarios_are_covered(self, gate):
         listed = set(gate["jobs"]["scenarios"]["strategy"]["matrix"]["scenario"])

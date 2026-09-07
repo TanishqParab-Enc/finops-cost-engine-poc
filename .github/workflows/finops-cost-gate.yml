@@ -542,10 +542,16 @@ jobs:
   # pin, same engine, same OIDC plan role). Read-only and informational: it
   # never mints a cost lock, never posts a PR comment, and several scenarios
   # are deliberately over budget, so it must never fail the pull request.
+  #
+  # Manual-only (workflow_dispatch), never on pull_request or push. The
+  # normal web-platform PR path prices only the real committed workload -
+  # scenarios are test fixtures, not part of the product flow.
   scenarios:
     name: Scenario ${{ matrix.scenario }}
     needs: detect-changes
-    if: contains(needs.detect-changes.outputs.stacks, '"web-platform"')
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      contains(needs.detect-changes.outputs.stacks, '"web-platform"')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
