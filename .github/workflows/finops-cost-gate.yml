@@ -903,11 +903,9 @@ jobs:
             fi
 
             # Terraform root comes from the trusted registry, never the artifact.
-            TF_DIR=$(STACK="$STACK" python3 -c "
-            import os
-            from finops.stacks import get_stack
-            print(get_stack(os.environ['STACK']).terraform_dir)
-            ")
+            # Single line on purpose: inside this loop the block scalar keeps the
+            # leading indentation, and Python rejects an indented first line.
+            TF_DIR=$(STACK="$STACK" python3 -c "import os;from finops.stacks import get_stack;print(get_stack(os.environ['STACK']).terraform_dir)")
 
             OUT_ARG=""
             if [ "$ACTION" = "approve" ]; then

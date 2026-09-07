@@ -955,6 +955,45 @@ class TestApprovalRequestIsSurfacedOnThePullRequest:
         assert "does **not** turn this into a PASS" in step["run"]
 
 
+class TestEmbeddedPythonCompiles:
+    """Every Python snippet embedded in the workflow must actually compile.
+
+    A YAML block scalar keeps the leading indentation of its lines, so a
+    snippet written inside an indented shell construct (a for loop, an if)
+    reaches Python indented and dies with 'unexpected indent'. Asserting the
+    snippet's *text* is present cannot catch that - only compiling it can.
+    Regression test for the approval dispatch's TF_DIR lookup, which failed
+    on its first real run.
+    """
+
+    def _snippets(self, gate):
+        import re
+
+        for jid, job in gate.get("jobs", {}).items():
+            for step in job.get("steps", []) or []:
+                run = step.get("run")
+                if not run:
+                    continue
+                label = f"{jid} / {step.get('name', step.get('uses'))}"
+                for m in re.finditer(r"python3 - <<'PY'\n(.*?)\nPY", run, re.S):
+                    yield label, "heredoc", m.group(1)
+                for m in re.finditer(r'python3 -c "\n(.*?)\n\s*"', run, re.S):
+                    yield label, "-c", m.group(1)
+
+    def test_every_embedded_snippet_compiles(self, gate):
+        broken = []
+        for label, kind, source in self._snippets(gate):
+            try:
+                compile(source, "<workflow>", "exec")
+            except SyntaxError as exc:
+                broken.append(f"{label} ({kind}): {exc.msg}")
+        assert not broken, "Embedded Python does not compile:\n" + "\n".join(broken)
+
+    def test_the_scan_actually_finds_snippets(self, gate):
+        """Guards the guard - a broken regex would silently pass above."""
+        assert len(list(self._snippets(gate))) >= 5
+
+
 class TestNoTerraformTargeting:
     def test_workflow_never_uses_target(self, gate_text):
         assert "-target" not in gate_text
