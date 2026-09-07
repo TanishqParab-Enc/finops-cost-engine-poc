@@ -475,9 +475,15 @@ class TestPreservedSemantics:
 class TestScenarioValidation:
     """Scenario matrix inside the central workflow (no second workflow)."""
 
-    def _scenarios_would_run(self, event_name: str, stacks_json: str) -> bool:
+    def _scenarios_would_run(
+        self, event_name: str, stacks_json: str, finops_action: str = "none"
+    ) -> bool:
         """Literal re-implementation of the job's `if:` expression."""
-        return event_name == "workflow_dispatch" and '"web-platform"' in stacks_json
+        return (
+            event_name == "workflow_dispatch"
+            and finops_action == "none"
+            and '"web-platform"' in stacks_json
+        )
 
     def test_scenarios_never_run_on_pull_request(self):
         assert self._scenarios_would_run("pull_request", '[{"name":"web-platform"}]') is False
@@ -488,6 +494,17 @@ class TestScenarioValidation:
     def test_scenarios_run_only_on_manual_dispatch_with_web_platform_selected(self):
         assert self._scenarios_would_run("workflow_dispatch", '[{"name":"web-platform"}]') is True
         assert self._scenarios_would_run("workflow_dispatch", '[{"name":"aws"}]') is False
+
+    def test_scenarios_never_run_on_an_approve_or_reject_dispatch(self):
+        """An approval action is a decision about the real workload - firing
+        eight fixture jobs alongside it is noise and cost."""
+        for action in ("approve", "reject"):
+            assert self._scenarios_would_run(
+                "workflow_dispatch", '[{"name":"web-platform"}]', action) is False
+
+    def test_scenario_condition_matches_the_workflow(self, gate):
+        cond = " ".join(gate["jobs"]["scenarios"]["if"].split())
+        assert "inputs.finops_action == 'none'" in cond
 
     def test_scenarios_job_lives_in_the_central_workflow(self, gate):
         assert "scenarios" in gate["jobs"]
@@ -797,6 +814,81 @@ class TestGenuinePrReviewIsThePrimaryApprovalMechanism:
         assert "inputs.approve" not in gate_text
         assert "inputs.approved" not in gate_text
         assert "inputs.exception_valid" not in gate_text
+
+
+class TestApprovalDispatchIsSelfContained:
+    """An approve/reject dispatch decides on an evaluation that already
+    happened. It must not re-plan, re-price, touch AWS, or drag along the
+    scenario fixtures - workflow_dispatch cannot assume the AWS OIDC plan
+    role, so re-pricing on approval could never have worked."""
+
+    def test_approval_job_depends_on_nothing(self, gate):
+        assert "needs" not in gate["jobs"]["finops-approval"]
+
+    def test_cost_gate_does_not_run_on_an_approval_dispatch(self, gate):
+        cond = " ".join(gate["jobs"]["cost-gate"]["if"].split())
+        assert "(github.event_name == 'workflow_dispatch' && inputs.finops_action == 'none')" in cond
+
+    def test_approval_job_never_assumes_an_aws_role(self, gate):
+        job = json.dumps(gate["jobs"]["finops-approval"])
+        assert "configure-aws-credentials" not in job
+        assert "AWS_PLAN_ROLE_ARN" not in job
+        assert "AWS_DEPLOY_ROLE_ARN" not in job
+
+    def test_approval_job_never_runs_terraform(self, gate):
+        """--terraform-dir is a binding argument, not an invocation - assert on
+        actual Terraform commands."""
+        job = json.dumps(gate["jobs"]["finops-approval"]).lower()
+        for command in ("terraform plan", "terraform apply", "terraform init", "terraform show"):
+            assert command not in job
+
+    def test_approval_consumes_the_pull_requests_own_evaluation_run(self, gate):
+        steps = {s.get("name"): s for s in gate["jobs"]["finops-approval"]["steps"]}
+        locate = steps["Locate the pull request's cost evaluation"]
+        assert "event=pull_request&head_sha=$HEAD_SHA" in locate["run"]
+        download = steps["Download that evaluation's artifacts"]
+        assert download["with"]["run-id"] == "${{ steps.eval_run.outputs.run_id }}"
+
+    def test_terraform_root_comes_from_the_trusted_registry(self, gate):
+        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                    if s.get("name") == "Record the approval for each blocked stack")
+        assert "from finops.stacks import get_stack" in step["run"]
+
+
+class TestApprovalRequestIsSurfacedOnThePullRequest:
+    """A BLOCK is not actionable unless the pull request says exactly how to
+    approve or reject it."""
+
+    def test_request_step_runs_only_for_a_blocked_pull_request(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        cond = " ".join(step["if"].split())
+        assert "steps.gate.outputs.exit_code == '1'" in cond
+        assert "github.event_name == 'pull_request'" in cond
+
+    def test_request_precedes_the_comment_that_publishes_it(self, gate):
+        names = [s.get("name") for s in gate["jobs"]["cost-gate"]["steps"]]
+        assert names.index("Request cost approval") < names.index("Comment on pull request")
+
+    def test_request_states_all_three_pending_states(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        assert "finops_decision          = BLOCK" in step["run"]
+        assert "approval_status          = PENDING" in step["run"]
+        assert "deployment_authorization = DENIED" in step["run"]
+
+    def test_request_tells_the_approver_both_choices(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        assert "**APPROVE** this cost" in step["run"]
+        assert "**REJECT** this cost" in step["run"]
+        assert "finops_action" in step["run"]
+        assert "approval_pr" in step["run"]
+
+    def test_request_says_approval_does_not_become_a_pass(self, gate):
+        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
+                    if s.get("name") == "Request cost approval")
+        assert "does **not** turn this into a PASS" in step["run"]
 
 
 class TestNoTerraformTargeting:

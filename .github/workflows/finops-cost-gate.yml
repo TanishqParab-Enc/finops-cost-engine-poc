@@ -148,7 +148,7 @@ jobs:
       needs.detect-changes.outputs.stacks != '' &&
       needs.detect-changes.outputs.stacks != '[]' && (
         needs.detect-changes.outputs.has_infra_changes == 'true' ||
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && inputs.finops_action == 'none') ||
         github.event_name == 'push'
       )
     runs-on: ubuntu-latest
@@ -467,6 +467,46 @@ jobs:
             echo "::notice title=FINOPS BLOCKED::The budget exception does not authorise this change."
           fi
 
+      # The approval request itself. A BLOCK is not actionable unless the PR
+      # says exactly how to approve or reject it, so append the instructions to
+      # the comment the next step posts.
+      - name: Request cost approval
+        if: always() && steps.gate.outputs.exit_code == '1' && github.event_name == 'pull_request'
+        working-directory: head
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p .finops
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/finops-cost-gate.yml"
+          cat >> .finops/pr-comment.md <<EOF
+
+          ---
+
+          ### Cost approval required
+
+          \`\`\`
+          finops_decision          = BLOCK
+          approval_status          = PENDING
+          deployment_authorization = DENIED
+          \`\`\`
+
+          This overspend needs an explicit decision from \`$FINOPS_APPROVER\`.
+
+          **[Open the FinOps Cost Gate workflow]($RUN_URL)** -> **Run workflow** -> then:
+
+          | To | Set \`finops_action\` | Set \`approval_pr\` |
+          |----|----------------------|--------------------|
+          | **APPROVE** this cost | \`approve\` | \`$PR_NUMBER\` |
+          | **REJECT** this cost | \`reject\` | \`$PR_NUMBER\` |
+
+          Approving does **not** turn this into a PASS - \`finops_decision\` stays
+          \`BLOCK\`. It only sets \`deployment_authorization = AUTHORIZED\`, bound to
+          PR #$PR_NUMBER at this exact commit. Any new commit invalidates it.
+          EOF
+          echo "Approval request appended to the pull request comment."
+
       - name: Publish gate summary
         if: always()
         working-directory: head
@@ -626,6 +666,7 @@ jobs:
     needs: detect-changes
     if: |
       github.event_name == 'workflow_dispatch' &&
+      inputs.finops_action == 'none' &&
       contains(needs.detect-changes.outputs.stacks, '"web-platform"')
     runs-on: ubuntu-latest
     strategy:
@@ -768,11 +809,13 @@ jobs:
   # record it mints keeps finops_decision=FAIL.
   finops-approval:
     name: FinOps cost approval (${{ inputs.finops_action }})
-    needs: [detect-changes, cost-gate]
-    if: |
-      always() &&
-      github.event_name == 'workflow_dispatch' &&
-      inputs.finops_action != 'none'
+    # Deliberately depends on nothing. An approval must not re-plan, re-price
+    # or touch AWS: it consumes the artifacts the pull request's own cost-gate
+    # run already produced, so what is approved is exactly what was priced.
+    # This also means no scenario job, no Terraform plan and no OIDC role
+    # assumption happens on an approval - workflow_dispatch cannot assume the
+    # plan role anyway, so re-pricing here could never have worked.
+    if: github.event_name == 'workflow_dispatch' && inputs.finops_action != 'none'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -817,14 +860,7 @@ jobs:
           echo "::error title=Cost estimate rejected::Deployment cancelled because the cost estimate was rejected."
           exit 1
 
-      - name: Download this run's cost-gate artifacts
-        if: inputs.finops_action == 'approve'
-        uses: actions/download-artifact@v4
-        with:
-          pattern: finops-*-${{ github.run_id }}
-          path: artifacts
-
-      # Resolves the PR head SHA from the live API, never from an input, so the
+      # Resolves the head SHA from the live API, never from an input, so the
       # approval cannot be bound to a SHA the dispatcher simply typed in.
       - name: Resolve the pull request being approved
         id: pr
@@ -844,18 +880,47 @@ jobs:
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "Approving PR #$PR_NUMBER at head $HEAD_SHA"
 
-          # The approval must describe the code that was actually priced.
-          if [ "$HEAD_SHA" != "${{ github.sha }}" ]; then
-            echo "::error title=Ref mismatch::This dispatch ran against ${{ github.sha }} but PR #$PR_NUMBER is at $HEAD_SHA. Re-run the workflow selecting that pull request's branch so the approval binds to the code that was priced."
+      # The evaluation being approved is the pull request's own cost-gate run
+      # for that exact head SHA. A new commit on the PR produces a new head
+      # SHA, so a stale approval can never be pointed at newer code.
+      - name: Locate the pull request's cost evaluation
+        id: eval_run
+        if: inputs.finops_action == 'approve'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/actions/workflows/finops-cost-gate.yml/runs?event=pull_request&head_sha=$HEAD_SHA" > runs.json
+          RUN_ID=$(python3 -c "
+          import json
+          runs = json.load(open('runs.json')).get('workflow_runs', [])
+          done = [r for r in runs if r.get('status') == 'completed']
+          print(sorted(done, key=lambda r: r['id'])[-1]['id'] if done else '')
+          ")
+          if [ -z "$RUN_ID" ]; then
+            echo "::error title=No cost evaluation::No completed FinOps Cost Gate run was found for $HEAD_SHA. Let the pull request's cost gate finish before approving."
             exit 1
           fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Approving the cost evaluation produced by run $RUN_ID"
+
+      - name: Download that evaluation's artifacts
+        if: inputs.finops_action == 'approve'
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.eval_run.outputs.run_id }}
+          repository: ${{ github.repository }}
+          pattern: finops-*
+          path: artifacts
 
       - name: Record the approval for each blocked stack
         if: inputs.finops_action == 'approve'
         env:
           PR_NUMBER: ${{ inputs.approval_pr }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          STACKS: ${{ needs.detect-changes.outputs.stacks }}
         run: |
           set -euo pipefail
           mkdir -p finops-approval
@@ -872,10 +937,11 @@ jobs:
               continue
             fi
 
-            TF_DIR=$(STACKS="$STACKS" STACK="$STACK" python3 -c "
-            import json, os
-            stacks = json.loads(os.environ['STACKS'])
-            print(next(s['dir'] for s in stacks if s['name'] == os.environ['STACK']))
+            # Terraform root comes from the trusted registry, never the artifact.
+            TF_DIR=$(STACK="$STACK" python3 -c "
+            import os
+            from finops.stacks import get_stack
+            print(get_stack(os.environ['STACK']).terraform_dir)
             ")
 
             finops approve \
