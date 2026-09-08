@@ -1,0 +1,42 @@
+# Stack registry for the central FinOps pipeline.
+#
+# This file is the ONLY source of Terraform directories, deployability and
+# state keys. Nothing here may be supplied by a pull request input: the gate
+# resolves a stack by name against this registry, and the trusted main run
+# re-reads it from trusted code before any deployment.
+#
+# deployable=false means the stack is priced and reported but can never be
+# applied, and a PASS must not mint a deployment cost lock for it.
+schema_version: "1.0"
+
+stacks:
+  aws:
+    terraform_dir: terraform/aws
+    cloud: aws
+    deployable: true
+    environment: dev
+    state_key: finops-poc/dev/aws/terraform.tfstate
+    var_file: environments/dev.tfvars
+    paths:
+      - terraform/aws/
+
+  web-platform:
+    terraform_dir: terraform/workloads/web-platform
+    cloud: aws
+    # The Dev deploy role's inline policy (finops-poc-dev-deploy-write) was
+    # widened to cover RDS, ELB, CloudFront, Route 53, Auto Scaling,
+    # CloudWatch Logs, VPC networking and the workload's own IAM
+    # role/instance-profile/asset bucket - applied 2026-09-08. An APPROVED
+    # BLOCK may now reach Terraform apply for this stack.
+    deployable: true
+    environment: dev
+    # Already covered by the project-wide finops-poc/* state permission, so no
+    # IAM change is needed for this path.
+    state_key: finops-poc/dev/web-platform/terraform.tfstate
+    var_file: null
+    # S3, CloudFront and CloudWatch bill on consumption, so Terraform alone
+    # cannot price them. Passed to Infracost 0.10.45 as --usage-file; without
+    # it those resources price at zero and the breakdown understates the bill.
+    usage_file: terraform/workloads/web-platform/infracost-usage.yml
+    paths:
+      - terraform/workloads/web-platform/
