@@ -1,5 +1,6 @@
 # Outputs are metadata only - they create no resource and carry no cost, so
 # touching this file exercises the gate without moving the estimate.
+# Re-validation pass: environment-gated approval + widened deploy-role IAM.
 
 output "vpc_id" {
   description = "VPC hosting the platform."
