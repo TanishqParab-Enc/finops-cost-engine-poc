@@ -166,9 +166,9 @@ variable "dns_enabled" {
 }
 
 variable "dns_zone_name" {
-  description = "Hosted zone name. Uses a reserved, non-routable example domain so nothing here can resolve publicly."
+  description = "Hosted zone name. AWS hard-blocks example.com/.net/.org (IANA reserved documentation domains) for public hosted zones, so this must not use that domain; it is never delegated, so it does not need to be a real, owned domain."
   type        = string
-  default     = "web-platform.example.com"
+  default     = "webplatform-dev.finops-poc-test.com"
 }
 
 # -- monitoring --------------------------------------------------------------
