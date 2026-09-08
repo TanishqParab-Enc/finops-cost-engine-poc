@@ -5,6 +5,17 @@ resource "aws_db_subnet_group" "main" {
   tags = var.tags
 }
 
+# Explicit rather than implicit-null so the deploy role's narrowly-scoped
+# KmsKeyNotAccessibleFault fix (see backend/modules/finops-environment) can
+# target these two specific keys instead of granting KMS access account-wide.
+data "aws_kms_key" "rds" {
+  key_id = "alias/aws/rds"
+}
+
+data "aws_kms_key" "secretsmanager" {
+  key_id = "alias/aws/secretsmanager"
+}
+
 resource "aws_db_instance" "main" {
   identifier = "${var.name_prefix}-db"
 
@@ -15,11 +26,13 @@ resource "aws_db_instance" "main" {
   allocated_storage = var.allocated_storage
   storage_type      = var.storage_type
   storage_encrypted = true
+  kms_key_id        = data.aws_kms_key.rds.arn
 
   db_name  = "appdb"
   username = "appadmin"
   # Managed by RDS rather than held in state or a variable.
-  manage_master_user_password = true
+  manage_master_user_password   = true
+  master_user_secret_kms_key_id = data.aws_kms_key.secretsmanager.arn
 
   multi_az               = var.multi_az
   db_subnet_group_name   = aws_db_subnet_group.main.name

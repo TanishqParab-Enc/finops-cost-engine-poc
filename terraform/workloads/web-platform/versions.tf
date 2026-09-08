@@ -9,7 +9,9 @@ terraform {
     }
   }
 
-  # Deliberately no backend block. This workload exists to exercise the FinOps
-  # gate against a realistic resource mix; it is never deployed, so it must not
-  # be able to touch any live state.
+  # Backend config is supplied at init time via -backend-config flags in CI
+  # (see the `deploy` job in .github/workflows/finops-cost-gate.yml), the same
+  # pattern terraform/aws/main.tf uses. Empty here on purpose. Local runs:
+  # `terraform init -backend=false` to skip state.
+  backend "s3" {}
 }
