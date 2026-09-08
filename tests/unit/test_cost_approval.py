@@ -416,7 +416,7 @@ class TestApprovalWorkflowWiring:
 
     def test_deploy_is_reachable_from_the_pull_request_run(self, gate):
         cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert cond == "github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'"
+        assert cond == "always() && github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'"
 
     def test_deploy_targets_dev_only(self, gate):
         job = gate["jobs"]["deploy"]

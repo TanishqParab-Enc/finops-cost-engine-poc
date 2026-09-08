@@ -384,7 +384,7 @@ class TestDeployGating:
 
     def test_deploy_is_reachable_only_from_a_pull_request(self, gate):
         cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert cond == "github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'"
+        assert cond == "always() && github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'"
 
     def test_deploy_targets_dev_only(self, gate):
         assert gate["jobs"]["deploy"]["env"]["TARGET_ENV"] == "dev"

@@ -942,7 +942,16 @@ jobs:
     # closed before any Terraform command runs. Deliberately depends on
     # authorize-deploy's explicit result, never on cost-gate's raw pass/fail
     # (see the comment on authorize-deploy).
-    if: github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'
+    #
+    # always() is required: cost-gate is an ANCESTOR job (via authorize-
+    # deploy) that legitimately fails on a BLOCK. GitHub's status check
+    # functions look at the full ancestor chain, not just direct `needs` - so
+    # without always() here, the implicit default success() would see
+    # cost-gate's failure through that chain and skip this job even when
+    # authorize-deploy itself succeeded (verified live on run 34197717116:
+    # authorize-deploy succeeded after an approval, yet deploy still skipped
+    # until this fix).
+    if: always() && github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: dev
