@@ -37,3 +37,48 @@ tags = {
   CostCenter = "REPLACE_ME"
   Owner      = "REPLACE_ME"
 }
+
+# Widens the deploy role for the web-platform workload (ALB, ASG, RDS, VPC
+# networking, CloudWatch Logs/Alarms). CloudFront/Route53 and the workload's
+# own IAM role/instance-profile/asset bucket are covered separately by
+# workload_name_prefix below. See backend/README.md "Deploy role" for how to
+# extend this list as the workload adds resource types.
+extra_deploy_actions = [
+  "ec2:CreateVpc", "ec2:DeleteVpc", "ec2:ModifyVpcAttribute",
+  "ec2:CreateInternetGateway", "ec2:DeleteInternetGateway",
+  "ec2:AttachInternetGateway", "ec2:DetachInternetGateway",
+  "ec2:CreateSubnet", "ec2:DeleteSubnet", "ec2:ModifySubnetAttribute",
+  "ec2:CreateRouteTable", "ec2:DeleteRouteTable", "ec2:CreateRoute",
+  "ec2:DeleteRoute", "ec2:ReplaceRoute", "ec2:AssociateRouteTable",
+  "ec2:DisassociateRouteTable", "ec2:CreateSecurityGroup", "ec2:DeleteSecurityGroup",
+  "ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress",
+  "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress",
+  "ec2:CreateLaunchTemplate", "ec2:CreateLaunchTemplateVersion",
+  "ec2:DeleteLaunchTemplate", "ec2:ModifyLaunchTemplate",
+  "autoscaling:CreateAutoScalingGroup", "autoscaling:DeleteAutoScalingGroup",
+  "autoscaling:UpdateAutoScalingGroup", "autoscaling:DescribeAutoScalingGroups",
+  "autoscaling:DescribeScalingActivities", "autoscaling:CreateOrUpdateTags",
+  "autoscaling:DeleteTags", "autoscaling:SuspendProcesses", "autoscaling:ResumeProcesses",
+  "elasticloadbalancing:CreateLoadBalancer", "elasticloadbalancing:DeleteLoadBalancer",
+  "elasticloadbalancing:ModifyLoadBalancerAttributes", "elasticloadbalancing:DescribeLoadBalancers",
+  "elasticloadbalancing:DescribeLoadBalancerAttributes", "elasticloadbalancing:CreateTargetGroup",
+  "elasticloadbalancing:DeleteTargetGroup", "elasticloadbalancing:ModifyTargetGroup",
+  "elasticloadbalancing:ModifyTargetGroupAttributes", "elasticloadbalancing:DescribeTargetGroups",
+  "elasticloadbalancing:DescribeTargetGroupAttributes", "elasticloadbalancing:DescribeTargetHealth",
+  "elasticloadbalancing:CreateListener", "elasticloadbalancing:DeleteListener",
+  "elasticloadbalancing:ModifyListener", "elasticloadbalancing:DescribeListeners",
+  "elasticloadbalancing:AddTags", "elasticloadbalancing:RemoveTags", "elasticloadbalancing:DescribeTags",
+  "rds:CreateDBInstance", "rds:DeleteDBInstance", "rds:ModifyDBInstance",
+  "rds:DescribeDBInstances", "rds:CreateDBSubnetGroup", "rds:DeleteDBSubnetGroup",
+  "rds:ModifyDBSubnetGroup", "rds:DescribeDBSubnetGroups", "rds:AddTagsToResource",
+  "rds:RemoveTagsFromResource", "rds:ListTagsForResource",
+  "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy",
+  "logs:DescribeLogGroups", "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",
+  "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:DescribeAlarms",
+  "cloudwatch:TagResource", "cloudwatch:UntagResource", "cloudwatch:ListTagsForResource",
+]
+
+# Scopes the module's workload IAM/S3/global-service statements to this
+# workload's own resources (webplatform-dev-*, webplatform-dev-assets).
+workload_name_prefix = "webplatform"
+
