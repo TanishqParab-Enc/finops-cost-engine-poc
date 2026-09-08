@@ -108,6 +108,16 @@ variable "extra_deploy_actions" {
   default     = []
 }
 
+# Scopes the deploy role's workload IAM/S3 statements (instance role, instance
+# profile, asset bucket) to <this>-* resources, mirroring the backend's own
+# <project_name>-* self-management scoping. Empty disables those statements
+# entirely - no workload IAM or S3 write access is granted.
+variable "workload_name_prefix" {
+  description = "Resource name prefix used by the deployed workload (e.g. \"webplatform\"), for scoping deploy-role IAM/S3 writes to its own resources."
+  type        = string
+  default     = ""
+}
+
 # SECURITY: enabling this lets the deploy role write IAM, which is inherently
 # privilege-adjacent. It is scoped to <project_name>-* resources and paired
 # with an explicit Deny protecting the plan and deploy roles themselves. Set

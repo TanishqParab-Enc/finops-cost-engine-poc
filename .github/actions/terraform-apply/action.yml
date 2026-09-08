@@ -33,6 +33,14 @@ inputs:
   bedrock-foundation-model-arns:
     description: JSON array of foundation model ARNs for every routed region
     required: true
+  extra-deploy-actions:
+    description: JSON array of additional write IAM actions for the deploy role
+    required: false
+    default: '[]'
+  workload-name-prefix:
+    description: Resource name prefix of the deployed workload, for scoping deploy-role IAM/S3 writes
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -90,6 +98,9 @@ runs:
         bedrock_model_id              = "${{ inputs.bedrock-model-id }}"
         bedrock_inference_profile_arn = "${{ inputs.bedrock-inference-profile-arn }}"
         bedrock_foundation_model_arns = ${{ inputs.bedrock-foundation-model-arns }}
+
+        extra_deploy_actions = ${{ inputs.extra-deploy-actions }}
+        workload_name_prefix = "${{ inputs.workload-name-prefix }}"
         EOF
 
     # Plan to a file first, then apply exactly that plan. Applying a saved plan

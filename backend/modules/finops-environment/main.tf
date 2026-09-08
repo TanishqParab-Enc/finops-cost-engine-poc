@@ -184,6 +184,130 @@ data "aws_iam_policy_document" "deploy_write" {
   }
 
   # ---------------------------------------------------------------------
+  # Workload IAM: the instance role/profile the web-platform workload
+  # creates for its own EC2 instances (never the deploy or plan role
+  # itself). Scoped to <workload_name_prefix>-* so this cannot touch any
+  # other IAM role in the account, matching how the backend's own
+  # self-management statements below are scoped to <project_name>-*.
+  # PassRole is additionally restricted to EC2 as the passed-to service, so
+  # the deploy role cannot pass this role to a different, more privileged
+  # context.
+  # ---------------------------------------------------------------------
+  dynamic "statement" {
+    for_each = var.workload_name_prefix != "" ? [1] : []
+
+    content {
+      sid    = "ManageWorkloadInstanceRole"
+      effect = "Allow"
+      actions = [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:ListInstanceProfilesForRole",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile",
+      ]
+      resources = [
+        "arn:${local.partition}:iam::${local.account_id}:role/${var.workload_name_prefix}-*",
+        "arn:${local.partition}:iam::${local.account_id}:instance-profile/${var.workload_name_prefix}-*",
+      ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.workload_name_prefix != "" ? [1] : []
+
+    content {
+      sid       = "PassWorkloadInstanceRoleToEc2Only"
+      effect    = "Allow"
+      actions   = ["iam:PassRole"]
+      resources = ["arn:${local.partition}:iam::${local.account_id}:role/${var.workload_name_prefix}-*"]
+
+      condition {
+        test     = "StringEquals"
+        variable = "iam:PassedToService"
+        values   = ["ec2.amazonaws.com"]
+      }
+    }
+  }
+
+  # Workload's own asset bucket (object-storage module) - never the
+  # Terraform state bucket, which has its own dedicated statement above.
+  dynamic "statement" {
+    for_each = var.workload_name_prefix != "" ? [1] : []
+
+    content {
+      sid    = "ManageWorkloadAssetBucket"
+      effect = "Allow"
+      actions = [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:GetBucket*",
+        "s3:PutBucket*",
+        "s3:GetEncryptionConfiguration",
+        "s3:PutEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:PutLifecycleConfiguration",
+        "s3:PutBucketVersioning",
+        "s3:GetBucketVersioning",
+      ]
+      resources = ["arn:${local.partition}:s3:::${var.workload_name_prefix}-*"]
+    }
+  }
+
+  # CloudFront and Route53 are global services - their API calls are not
+  # reliably tagged with aws:RequestedRegion the way the region-scoped
+  # ManagePocCompute statement above assumes, so they get their own
+  # statement without that condition rather than silently risking an
+  # implicit deny from a condition that never matches.
+  dynamic "statement" {
+    for_each = var.workload_name_prefix != "" ? [1] : []
+
+    content {
+      sid    = "ManageWorkloadGlobalServices"
+      effect = "Allow"
+      actions = [
+        "cloudfront:CreateOriginAccessControl",
+        "cloudfront:DeleteOriginAccessControl",
+        "cloudfront:GetOriginAccessControl",
+        "cloudfront:UpdateOriginAccessControl",
+        "cloudfront:CreateDistribution",
+        "cloudfront:GetDistribution",
+        "cloudfront:UpdateDistribution",
+        "cloudfront:DeleteDistribution",
+        "cloudfront:TagResource",
+        "cloudfront:UntagResource",
+        "cloudfront:ListTagsForResource",
+        "route53:CreateHostedZone",
+        "route53:DeleteHostedZone",
+        "route53:GetHostedZone",
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName",
+        "route53:ChangeResourceRecordSets",
+        "route53:ListResourceRecordSets",
+        "route53:GetChange",
+        "route53:ChangeTagsForResource",
+        "route53:ListTagsForResource",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  # ---------------------------------------------------------------------
   # Backend self-management.
   #
   # SECURITY: a principal that can write IAM can escalate to administrator.

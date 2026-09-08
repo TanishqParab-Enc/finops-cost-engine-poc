@@ -104,6 +104,12 @@ variable "extra_deploy_actions" {
   default     = []
 }
 
+variable "workload_name_prefix" {
+  description = "Resource name prefix of the deployed workload, for scoping deploy-role IAM/S3 writes to its own resources."
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   description = "Additional tags merged onto every resource."
   type        = map(string)
