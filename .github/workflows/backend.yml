@@ -208,6 +208,9 @@ jobs:
           bedrock_model_id              = "${{ vars.FINOPS_BEDROCK_MODEL }}"
           bedrock_inference_profile_arn = "${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}"
           bedrock_foundation_model_arns = ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+
+          extra_deploy_actions = ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
+          workload_name_prefix = "${{ vars.WORKLOAD_NAME_PREFIX || '' }}"
           EOF
 
           echo "::group::rendered tfvars"
@@ -336,6 +339,8 @@ jobs:
           bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
           bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
           bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+          extra-deploy-actions: ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
+          workload-name-prefix: ${{ vars.WORKLOAD_NAME_PREFIX || '' }}
 
   # Not reachable from a push. Required reviewers are unavailable on this plan,
   # so an automatic production apply would be an unreviewed production change.
@@ -383,3 +388,5 @@ jobs:
           bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
           bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
           bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+          extra-deploy-actions: ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
+          workload-name-prefix: ${{ vars.WORKLOAD_NAME_PREFIX || '' }}

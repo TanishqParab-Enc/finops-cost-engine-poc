@@ -140,3 +140,5 @@ jobs:
           bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
           bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
           bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+          extra-deploy-actions: ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
+          workload-name-prefix: ${{ vars.WORKLOAD_NAME_PREFIX || '' }}
