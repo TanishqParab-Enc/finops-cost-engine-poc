@@ -769,7 +769,12 @@ jobs:
   finops-approval:
     name: "Manual cost approval (finops-cost-approval)"
     needs: collect-blocked-stacks
-    if: needs.collect-blocked-stacks.outputs.has_blocked == 'true'
+    # always() is required: cost-gate legitimately fails on a BLOCK, and
+    # without it GitHub's implicit default success() check (added whenever an
+    # if: condition has no explicit status-check function) would see that
+    # failure through the dependency graph and silently skip this job instead
+    # of pausing it - exactly the bug this comment now documents finding.
+    if: always() && needs.collect-blocked-stacks.outputs.has_blocked == 'true'
     runs-on: ubuntu-latest
     environment:
       name: finops-cost-approval

@@ -352,7 +352,14 @@ class TestApprovalWorkflowWiring:
 
     def test_approval_job_only_runs_when_a_stack_is_blocked(self, gate):
         cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
-        assert cond == "needs.collect-blocked-stacks.outputs.has_blocked == 'true'"
+        assert cond == "always() && needs.collect-blocked-stacks.outputs.has_blocked == 'true'"
+
+    def test_approval_job_uses_always_to_survive_cost_gates_failure(self, gate):
+        """cost-gate legitimately fails on a BLOCK. Without always(), GitHub's
+        implicit default success() check would see that failure through the
+        dependency graph and silently skip this job instead of pausing it."""
+        cond = gate["jobs"]["finops-approval"]["if"]
+        assert cond.strip().startswith("always()")
 
     def test_approval_job_matrixes_over_the_blocked_stacks(self, gate):
         job = gate["jobs"]["finops-approval"]
