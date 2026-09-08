@@ -778,6 +778,13 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: finops-cost-approval
+      # GitHub's Review deployments UI cannot embed the cost table itself -
+      # this is the one customisable field it does show, as a clickable
+      # "View deployment" link next to Approve/Reject. Points at the pull
+      # request, which already carries the full cost breakdown comment
+      # (see "Request cost approval" in cost-gate) - so the reviewer is one
+      # click from the figures without leaving the review screen.
+      url: ${{ github.event.pull_request.html_url }}
     strategy:
       fail-fast: false
       matrix:

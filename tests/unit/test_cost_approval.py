@@ -350,6 +350,13 @@ class TestApprovalWorkflowWiring:
         job = gate["jobs"]["finops-approval"]
         assert job["environment"]["name"] == "finops-cost-approval"
 
+    def test_approval_job_links_the_review_screen_to_the_pull_request(self, gate):
+        """The Review deployments UI cannot embed the cost table itself, but
+        its one customisable field (environment.url) can point the reviewer
+        straight at the PR comment that carries it."""
+        job = gate["jobs"]["finops-approval"]
+        assert job["environment"]["url"] == "${{ github.event.pull_request.html_url }}"
+
     def test_approval_job_only_runs_when_a_stack_is_blocked(self, gate):
         cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
         assert cond == "always() && needs.collect-blocked-stacks.outputs.has_blocked == 'true'"
