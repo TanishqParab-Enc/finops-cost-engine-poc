@@ -13,5 +13,6 @@ terraform {
   # (see the `deploy` job in .github/workflows/finops-cost-gate.yml), the same
   # pattern terraform/aws/main.tf uses. Empty here on purpose. Local runs:
   # `terraform init -backend=false` to skip state.
+  # State key: finops-poc/dev/web-platform/terraform.tfstate (bucket finops-poc-tfstate-024125831628).
   backend "s3" {}
 }
