@@ -95,8 +95,7 @@ class TestRegistry:
     def test_deployability(self):
         stacks = load_stacks(REGISTRY)
         assert stacks["aws"].deployable is True
-        assert stacks["web-platform"].deployable is False
-        assert stacks["web-platform"].deferred_reason
+        assert stacks["web-platform"].deployable is True
 
     def test_state_keys_are_isolated(self):
         stacks = load_stacks(REGISTRY)
@@ -373,9 +372,9 @@ class TestDeployGating:
         assert names.index("Verify the stack is deployable (trusted registry)") < names.index(
             "Terraform apply")
 
-    def test_web_platform_would_be_refused_by_that_check(self):
+    def test_web_platform_is_now_deployable_after_the_iam_widening(self):
         registry = yaml.safe_load(REGISTRY.read_text(encoding="utf-8"))
-        assert registry["stacks"]["web-platform"]["deployable"] is False
+        assert registry["stacks"]["web-platform"]["deployable"] is True
 
     def test_no_bypass_inputs_exist(self, gate):
         triggers = gate.get("on") or gate.get(True)
@@ -415,12 +414,11 @@ class TestDeployGating:
                      if s.get("name") == "Terraform apply")
         assert apply["working-directory"] == "${{ matrix.stack.dir }}"
 
-    def test_web_platform_cannot_reach_deploy(self):
-        """web-platform is deployable=false, so the deployability check in
-        `deploy` excludes it even though it may appear in the same run's
-        selected stacks alongside aws."""
+    def test_web_platform_can_now_reach_deploy(self):
+        """web-platform is deployable=true after the deploy-role IAM widening,
+        so the deployability check in `deploy` no longer excludes it."""
         registry = load_stacks(REGISTRY)
-        assert registry["web-platform"].deployable is False
+        assert registry["web-platform"].deployable is True
 
     def test_destroy_guard_precedes_apply(self, gate):
         steps = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]

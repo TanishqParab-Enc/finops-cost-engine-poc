@@ -23,14 +23,12 @@ stacks:
   web-platform:
     terraform_dir: terraform/workloads/web-platform
     cloud: aws
-    # Deferred: the Dev deploy role has no permission for RDS, ELB, CloudFront,
-    # Route 53, Auto Scaling, CloudWatch Logs, VPC creation, asset buckets or
-    # instance profiles. Widening it requires a separate security review.
-    deployable: false
-    deferred_reason: >-
-      Live deployment is intentionally deferred because the existing Dev
-      deployment role does not have the required AWS service permissions.
-      IAM expansion requires a separate security-reviewed change.
+    # The Dev deploy role's inline policy (finops-poc-dev-deploy-write) was
+    # widened to cover RDS, ELB, CloudFront, Route 53, Auto Scaling,
+    # CloudWatch Logs, VPC networking and the workload's own IAM
+    # role/instance-profile/asset bucket - applied 2026-09-08. An APPROVED
+    # BLOCK may now reach Terraform apply for this stack.
+    deployable: true
     environment: dev
     # Already covered by the project-wide finops-poc/* state permission, so no
     # IAM change is needed for this path.
