@@ -156,6 +156,24 @@ data "aws_iam_policy_document" "plan_read" {
       resources = ["arn:${local.partition}:s3:::${var.state_bucket_name}"]
     }
   }
+
+  # terraform plan also evaluates aws_kms_key data sources (see
+  # modules/database/main.tf), so the plan role needs read-only access to the
+  # same two keys the deploy role can act on - describe only, never
+  # decrypt/grant, which stay deploy-time-only permissions.
+  dynamic "statement" {
+    for_each = var.workload_name_prefix != "" ? [1] : []
+
+    content {
+      sid     = "ReadWorkloadDefaultKmsKeysForPlan"
+      effect  = "Allow"
+      actions = ["kms:DescribeKey"]
+      resources = [
+        data.aws_kms_key.workload_rds_default[0].arn,
+        data.aws_kms_key.workload_secretsmanager_default[0].arn,
+      ]
+    }
+  }
 }
 
 data "aws_iam_policy_document" "deploy_write" {
