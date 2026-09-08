@@ -334,7 +334,7 @@ class TestSingleCentralWorkflow:
 
     def test_reports_are_scoped_per_stack(self, gate_text):
         assert "<!-- stack:${{ matrix.stack.name }} -->" in gate_text
-        assert "finops-${{ matrix.stack.name }}-${{ github.run_id }}" in gate_text
+        assert "finops-gate-${{ matrix.stack.name }}-${{ github.run_id }}" in gate_text
 
     def test_authorisation_checks_pass_the_stack(self, gate_text):
         assert '--stack "${{ matrix.stack.name }}"' in gate_text
@@ -352,10 +352,6 @@ class TestDeployGating:
         matrix = gate["jobs"]["deploy"]["strategy"]["matrix"]["stack"]
         assert matrix == "${{ fromJSON(needs.detect-changes.outputs.stacks) }}"
 
-    def test_push_path_no_longer_depends_on_the_removed_aws_evaluated_output(self, gate):
-        cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert "aws_evaluated" not in cond
-
     def test_job_if_never_references_matrix(self, gate):
         """The `matrix` context is only valid in `strategy` and `steps`, never
         in a job-level `if:` - referencing it there is a GitHub Actions
@@ -367,14 +363,6 @@ class TestDeployGating:
         step = next(s for s in gate["jobs"]["deploy"]["steps"]
                     if s.get("name") == "Verify the stack is deployable (trusted registry)")
         assert "deployable" in step["run"]
-
-    def test_workflow_dispatch_aws_only_restriction_is_enforced_by_a_step(self, gate):
-        cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert "inputs.cloud == 'aws'" in cond
-        pin = next(s for s in gate["jobs"]["deploy"]["steps"]
-                   if s.get("name") == "Pin and validate deployment target")
-        assert "matrix.stack.name" in pin["run"]
-        assert "aws-only" in pin["run"].lower()
 
     def test_deploy_reverifies_deployability_from_the_registry(self, gate):
         names = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]
@@ -391,18 +379,16 @@ class TestDeployGating:
 
     def test_no_bypass_inputs_exist(self, gate):
         triggers = gate.get("on") or gate.get(True)
-        inputs = triggers["workflow_dispatch"]["inputs"]
-        for forbidden in ("skip_finops", "force_deploy", "terraform_dir", "stack", "deployable"):
-            assert forbidden not in inputs
+        inputs = triggers["workflow_dispatch"] or {}
+        assert not inputs.get("inputs")
 
-    def test_pr_cannot_apply(self, gate):
+    def test_deploy_is_reachable_only_from_a_pull_request(self, gate):
         cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert "pull_request" not in cond
-        assert "github.event_name == 'push'" in cond and "refs/heads/main" in cond
+        assert cond == "github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'"
 
-    def test_prod_unreachable_from_automatic_push(self, gate):
-        env = gate["jobs"]["deploy"]["env"]["TARGET_ENV"]
-        assert env.index("'dev'") < env.index("inputs.")
+    def test_deploy_targets_dev_only(self, gate):
+        assert gate["jobs"]["deploy"]["env"]["TARGET_ENV"] == "dev"
+        assert gate["jobs"]["deploy"]["environment"]["name"] == "dev"
 
     def test_existing_aws_deploy_path_is_intact(self, gate):
         steps = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]
@@ -429,10 +415,10 @@ class TestDeployGating:
                      if s.get("name") == "Terraform apply")
         assert apply["working-directory"] == "${{ matrix.stack.dir }}"
 
-    def test_web_platform_cannot_reach_deploy_on_push(self):
-        """web-platform is deployable=false, so the matrix.stack.deployable
-        check in the job `if` excludes it even though it may appear in the
-        same push's selected stacks alongside aws."""
+    def test_web_platform_cannot_reach_deploy(self):
+        """web-platform is deployable=false, so the deployability check in
+        `deploy` excludes it even though it may appear in the same run's
+        selected stacks alongside aws."""
         registry = load_stacks(REGISTRY)
         assert registry["web-platform"].deployable is False
 
@@ -458,8 +444,9 @@ class TestPreservedSemantics:
         assert "Failing safe (exit $CODE)" in gate_text
 
     def test_pr_review_is_not_the_approval_mechanism(self, gate_text):
-        """Superseded by the explicit finops_action dispatch - no step reads
-        the reviews API or a committed exception record to authorise."""
+        """Superseded by the finops-cost-approval Environment's required
+        reviewer - no step reads the reviews API or a committed exception
+        record to authorise."""
         assert "Evaluate budget exception" not in gate_text
         assert "finops verify-exception" not in gate_text
         assert "pulls/${PR}/reviews" not in gate_text
@@ -478,36 +465,19 @@ class TestPreservedSemantics:
 class TestScenarioValidation:
     """Scenario matrix inside the central workflow (no second workflow)."""
 
-    def _scenarios_would_run(
-        self, event_name: str, stacks_json: str, finops_action: str = "none"
-    ) -> bool:
+    def _scenarios_would_run(self, event_name: str, stacks_json: str) -> bool:
         """Literal re-implementation of the job's `if:` expression."""
         return (
             event_name == "workflow_dispatch"
-            and finops_action == "none"
             and '"web-platform"' in stacks_json
         )
 
     def test_scenarios_never_run_on_pull_request(self):
         assert self._scenarios_would_run("pull_request", '[{"name":"web-platform"}]') is False
 
-    def test_scenarios_never_run_on_push(self):
-        assert self._scenarios_would_run("push", '[{"name":"web-platform"}]') is False
-
     def test_scenarios_run_only_on_manual_dispatch_with_web_platform_selected(self):
         assert self._scenarios_would_run("workflow_dispatch", '[{"name":"web-platform"}]') is True
         assert self._scenarios_would_run("workflow_dispatch", '[{"name":"aws"}]') is False
-
-    def test_scenarios_never_run_on_an_approve_or_reject_dispatch(self):
-        """An approval action is a decision about the real workload - firing
-        eight fixture jobs alongside it is noise and cost."""
-        for action in ("approve", "reject"):
-            assert self._scenarios_would_run(
-                "workflow_dispatch", '[{"name":"web-platform"}]', action) is False
-
-    def test_scenario_condition_matches_the_workflow(self, gate):
-        cond = " ".join(gate["jobs"]["scenarios"]["if"].split())
-        assert "inputs.finops_action == 'none'" in cond
 
     def test_scenarios_job_lives_in_the_central_workflow(self, gate):
         assert "scenarios" in gate["jobs"]
@@ -632,38 +602,39 @@ class TestCostCreep:
 
 class TestApprovalBeforeDeploymentOrdering:
     """Deployment must be structurally unreachable until authorization
-    resolves (where the exception/lock authorisation lives), never merely
-    'usually resolved first' by job listing order. deploy depends on the
-    explicit authorize-deploy result, never on cost-gate's raw pass/fail -
-    cost-gate is matrixed by stack, so its own conclusion is all-or-nothing
-    across every stack in the push, which must not gate an unrelated,
-    already-authorized stack's deployment."""
+    resolves, never merely 'usually resolved first' by job listing order.
+    deploy depends on the explicit authorize-deploy result, never on
+    cost-gate's raw pass/fail - cost-gate is matrixed by stack, so its own
+    conclusion is all-or-nothing across every stack in the pull request,
+    which must not gate an unrelated, already-authorized stack's
+    deployment."""
 
     def test_deploy_needs_authorize_deploy_not_cost_gate_directly(self, gate):
         assert gate["jobs"]["deploy"]["needs"] == ["detect-changes", "authorize-deploy"]
 
     def test_deploy_requires_authorize_deploy_success(self, gate):
         cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert cond.startswith("needs.authorize-deploy.result == 'success' &&")
+        assert "needs.authorize-deploy.result == 'success'" in cond
         assert "needs.cost-gate.result" not in cond
 
     def test_authorize_deploy_always_runs_even_when_cost_gate_partially_fails(self, gate):
         cond = " ".join(gate["jobs"]["authorize-deploy"]["if"].split())
         assert cond.startswith("always() &&")
 
-    def test_authorize_deploy_needs_cost_gate(self, gate):
-        assert gate["jobs"]["authorize-deploy"]["needs"] == ["detect-changes", "cost-gate"]
+    def test_authorize_deploy_needs_cost_gate_and_the_approval_job(self, gate):
+        assert gate["jobs"]["authorize-deploy"]["needs"] == [
+            "detect-changes", "cost-gate", "finops-approval"]
 
-    def test_no_sleep_or_wait_based_approval_inside_the_pr_job(self, gate_text):
-        """Approval must never be a workflow pausing to wait for a review to
-        arrive - a PR run finishes BLOCKED and a later trusted run deploys.
-        The only wait is GitHub's own environment protection UI, not a
-        command this workflow runs."""
+    def test_no_sleep_or_busy_wait_polling_is_used(self, gate_text):
+        """The only wait is GitHub's own required-reviewer Environment gate -
+        a native pause, never a command this workflow runs waiting in a
+        loop for a decision to arrive."""
         code_lines = [
             line for line in gate_text.splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
         assert not any("sleep" in line.lower() for line in code_lines)
+        assert not any("while true" in line.lower() for line in code_lines)
 
     def test_no_workflow_provided_approved_boolean_is_ever_trusted(self, gate_text):
         """A PR must never be able to just assert 'approved=true' - deploy's
@@ -694,8 +665,9 @@ class TestDeploymentAuthorizationArchitecture:
         assert "steps.verify_lock.outcome" in step["run"]
 
     def test_compute_authorization_never_consults_a_pr_review(self, gate):
-        """A BLOCK always leaves the pull request PENDING/DENIED; only the
-        finops_action dispatch can move it, re-verified on trusted main."""
+        """A BLOCK always leaves the pull request PENDING/DENIED; only a
+        finops-approval job run (gated by the finops-cost-approval
+        Environment) can move it."""
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Compute deployment authorization")
         assert "steps.exception" not in step["run"]
@@ -733,7 +705,7 @@ class TestDeploymentAuthorizationArchitecture:
     def test_deploy_verifies_authorization_for_its_own_stack_before_anything_else(self, gate):
         steps = [s.get("name", s.get("uses")) for s in gate["jobs"]["deploy"]["steps"]]
         assert steps.index("Verify deployment authorization for this stack") < steps.index(
-            "Pin and validate deployment target")
+            "Verify the stack is deployable (trusted registry)")
 
     def test_deploy_authorization_check_never_treats_block_as_pass(self, gate):
         step = next(s for s in gate["jobs"]["deploy"]["steps"]
@@ -742,103 +714,67 @@ class TestDeploymentAuthorizationArchitecture:
         assert "finops_decision" in step["run"]
 
 
-class TestNoEnvironmentApprovalExperimentRemains:
-    """The GitHub Actions *environment* approval experiment (the
-    finops-cost-approval environment and its Approvals-API attestation) is
-    fully removed - this repository's plan cannot enforce required
-    reviewers, so an unprotected environment must never gate a FinOps
-    exception. The approval job that exists now is dispatch-based and is
-    covered by tests/unit/test_cost_approval.py."""
+class TestApprovalUsesTheRequiredReviewerEnvironment:
+    """The GitHub Actions Environment `finops-cost-approval`'s required-
+    reviewer protection rule is the human decision mechanism - the native
+    equivalent of a Jenkins `input` step, running inside the SAME pipeline
+    execution that produced the evaluation."""
 
-    def test_no_finops_cost_approval_environment_reference(self, gate_text):
-        assert "finops-cost-approval" not in gate_text
+    def test_finops_cost_approval_environment_is_referenced(self, gate_text):
+        assert "finops-cost-approval" in gate_text
 
-    def test_no_job_targets_an_environment_for_finops_purposes(self, gate):
-        """The pre-existing dev/production environments on the `deploy` job
-        (AWS deploy-role targeting) are unrelated and must remain - this only
-        asserts no job uses an environment to gate a FinOps exception."""
+    def test_approval_job_targets_the_environment(self, gate):
+        assert gate["jobs"]["finops-approval"]["environment"]["name"] == "finops-cost-approval"
+
+    def test_no_other_job_targets_the_finops_environment(self, gate):
         for job_id, job in gate["jobs"].items():
+            if job_id == "finops-approval":
+                continue
             env = job.get("environment")
             if env is None:
                 continue
             name = env.get("name") if isinstance(env, dict) else env
             assert "finops" not in str(name).lower(), f"job {job_id!r} environment {name!r}"
 
-    def test_approval_job_is_not_environment_gated(self, gate):
-        assert "environment" not in gate["jobs"]["finops-approval"]
-
-    def test_no_environment_approvals_api_usage_remains(self, gate_text):
-        """The removed design read GET .../actions/runs/{id}/approvals to
-        learn who clicked Approve on an environment. The dispatch design
-        reads the run's own attested actor instead."""
+    def test_no_environment_approvals_api_is_polled(self, gate_text):
+        """GitHub itself withholds this job's steps until the required
+        reviewer approves - nothing in the workflow polls for that."""
         assert "/approvals" not in gate_text
-
-    def test_cross_run_download_is_only_for_the_dispatch_approval_record(self, gate):
-        """A cross-run download is legitimate here - it carries the approval
-        record from the approving dispatch run to trusted main - but it must
-        only ever fetch that record, never an arbitrary artifact."""
-        for step in gate["jobs"]["authorize-deploy"]["steps"]:
-            if not step.get("uses", "").startswith("actions/download-artifact"):
-                continue
-            with_ = step.get("with") or {}
-            if "run-id" in with_:
-                assert with_["pattern"].startswith("finops-approval-pr")
-
-    def test_authorize_deploy_needs_only_cost_gate(self, gate):
-        assert gate["jobs"]["authorize-deploy"]["needs"] == ["detect-changes", "cost-gate"]
+        assert "pending_deployments" not in gate_text
 
 
-class TestExplicitDispatchIsTheApprovalMechanism:
-    """The human decision is an explicit finops_action=approve|reject
-    workflow_dispatch, restricted to one GitHub-attested account - never a
-    PR review, an environment job, or a bare repository boolean."""
+class TestApprovalIsEnvironmentGatedNotDispatchBased:
+    """The human decision is a required-reviewer Approve/Reject on the
+    `finops-approval` job itself - never a PR review, a separate
+    workflow_dispatch run, or a bare repository boolean."""
 
-    def test_approve_and_reject_are_the_only_actions_offered(self, gate):
+    def test_workflow_dispatch_carries_no_approval_inputs(self, gate):
         triggers = gate.get("on") or gate.get(True)
-        options = triggers["workflow_dispatch"]["inputs"]["finops_action"]["options"]
-        assert options == ["none", "approve", "reject"]
+        assert not (triggers["workflow_dispatch"] or {}).get("inputs")
 
     def test_the_approver_is_repository_configuration_not_an_input(self, gate):
         approver = gate["env"]["FINOPS_APPROVER"]
         assert "vars.FINOPS_APPROVER" in approver
         assert "inputs." not in approver
 
-    def test_the_actor_is_checked_before_any_decision_is_recorded(self, gate):
-        steps = [s.get("name") for s in gate["jobs"]["finops-approval"]["steps"]]
-        assert steps.index("Authorise the approver") < steps.index(
-            "Record the decision for each blocked stack")
-        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Authorise the approver")
-        assert 'github.actor }}" != "$FINOPS_APPROVER"' in step["run"]
-
-    def test_rejection_states_the_exact_required_message(self, gate):
-        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Publish the decision")
-        assert "Deployment cancelled because the cost estimate was rejected." in step["run"]
-
-    def test_rejection_mints_no_record_anything_could_later_consume(self, gate):
-        """Only an approve uploads the artifact trusted main looks for, so a
-        rejection leaves nothing that could later read as authorisation."""
-        upload = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                      if s.get("name") == "Upload the approval record")
-        assert upload["if"] == "inputs.finops_action == 'approve'"
-        record = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                      if s.get("name") == "Record the decision for each blocked stack")
-        assert 'if [ "$ACTION" = "approve" ]' in record["run"]
+    def test_no_actor_check_step_duplicates_githubs_own_gate(self, gate):
+        names = [s.get("name") for s in gate["jobs"]["finops-approval"]["steps"]]
+        assert "Authorise the approver" not in names
 
     def test_enforce_gate_reports_all_three_states(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
         for state in ("finops_decision", "approval_status", "deployment_authorization"):
             assert f"steps.authz.outputs.{state}" in step["run"]
 
-    def test_enforce_gate_points_at_the_dispatch_not_a_peer_review(self, gate):
+    def test_enforce_gate_points_at_the_environment_not_a_peer_review(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
-        assert "finops_action=approve" in step["run"]
+        assert "finops-cost-approval" in step["run"]
         assert "Peer approval required" not in step["run"]
 
-    def test_a_block_never_goes_green_on_the_pull_request(self, gate):
-        """Nothing in the PR's own run can authorise it - the BLOCK branch
-        always exits non-zero."""
+    def test_a_block_never_goes_green_on_its_own_cost_gate_step(self, gate):
+        """Nothing in cost-gate's own steps can authorise a BLOCK - the
+        BLOCK branch always exits non-zero; only the later finops-approval
+        job can move deployment_authorization."""
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"] if s.get("name") == "Enforce gate")
         assert "AUTHORIZED" not in step["run"]
 
@@ -848,18 +784,10 @@ class TestExplicitDispatchIsTheApprovalMechanism:
         assert "inputs.force_deploy" not in gate_text
 
 
-class TestApprovalDispatchIsSelfContained:
-    """An approve/reject dispatch decides on an evaluation that already
-    happened. It must not re-plan, re-price, touch AWS, or drag along the
-    scenario fixtures - workflow_dispatch cannot assume the AWS OIDC plan
-    role, so re-pricing on approval could never have worked."""
-
-    def test_approval_job_depends_on_nothing(self, gate):
-        assert "needs" not in gate["jobs"]["finops-approval"]
-
-    def test_cost_gate_does_not_run_on_an_approval_dispatch(self, gate):
-        cond = " ".join(gate["jobs"]["cost-gate"]["if"].split())
-        assert "(github.event_name == 'workflow_dispatch' && inputs.finops_action == 'none')" in cond
+class TestApprovalConsumesOnlyThisRunsOwnEvaluation:
+    """The finops-approval job must not re-plan, re-price, or touch AWS: it
+    consumes the artifact the SAME run's cost-gate job already produced, so
+    what is approved is exactly what was priced."""
 
     def test_approval_job_never_assumes_an_aws_role(self, gate):
         job = json.dumps(gate["jobs"]["finops-approval"])
@@ -868,22 +796,19 @@ class TestApprovalDispatchIsSelfContained:
         assert "AWS_DEPLOY_ROLE_ARN" not in job
 
     def test_approval_job_never_runs_terraform(self, gate):
-        """--terraform-dir is a binding argument, not an invocation - assert on
-        actual Terraform commands."""
         job = json.dumps(gate["jobs"]["finops-approval"]).lower()
         for command in ("terraform plan", "terraform apply", "terraform init", "terraform show"):
             assert command not in job
 
-    def test_approval_consumes_the_pull_requests_own_evaluation_run(self, gate):
-        steps = {s.get("name"): s for s in gate["jobs"]["finops-approval"]["steps"]}
-        locate = steps["Locate the pull request's cost evaluation"]
-        assert "event=pull_request&head_sha=$HEAD_SHA" in locate["run"]
-        download = steps["Download that evaluation's artifacts"]
-        assert download["with"]["run-id"] == "${{ steps.eval_run.outputs.run_id }}"
+    def test_approval_downloads_only_the_current_runs_artifact(self, gate):
+        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
+                    if s.get("name") == "Download this stack's cost evaluation (this run)")
+        assert step["with"]["name"] == "finops-gate-${{ matrix.stack }}-${{ github.run_id }}"
+        assert "run-id" not in step["with"]
 
     def test_terraform_root_comes_from_the_trusted_registry(self, gate):
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Record the decision for each blocked stack")
+                    if s.get("name") == "Record the approval")
         assert "from finops.stacks import get_stack" in step["run"]
 
 
@@ -920,34 +845,22 @@ class TestApprovalRequestIsSurfacedOnThePullRequest:
         assert "cost-estimate.json" in step["run"]
         assert "gate-result.json" in step["run"]
 
-    def test_request_explains_the_decision_is_a_separate_manual_run(self, gate):
+    def test_request_explains_this_is_the_same_paused_run(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Request cost approval")
-        assert "separate manual workflow run" in step["run"]
-        assert "logically downstream" in step["run"]
+        assert "SAME run" in step["run"]
+        assert "finops-cost-approval" in step["run"]
 
-    def test_request_tells_the_approver_both_choices(self, gate):
+    def test_request_points_at_the_review_deployments_procedure(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Request cost approval")
-        assert "finops_action" in step["run"]
-        assert "approval_pr" in step["run"]
-        assert "approve" in step["run"] and "reject" in step["run"]
+        assert "Review deployments" in step["run"]
+        assert "Waiting" in step["run"]
 
-    def test_request_gives_the_full_ui_procedure(self, gate):
+    def test_request_links_directly_to_this_run(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
                     if s.get("name") == "Request cost approval")
-        assert "Actions -> FinOps Cost Gate" in step["run"]
-        assert "Run workflow" in step["run"]
-        assert "Use workflow from" in step["run"]
-
-    def test_request_is_honest_that_the_field_needs_the_default_branch(self, gate):
-        """GitHub builds the dispatch form from the default branch, so the
-        comment must not promise a dropdown that will not be there yet."""
-        step = next(s for s in gate["jobs"]["cost-gate"]["steps"]
-                    if s.get("name") == "Request cost approval")
-        assert "is not shown" in step["run"]
-        assert "default branch" in step["run"]
-        assert "gh workflow run" in step["run"]
+        assert "actions/runs/${{ github.run_id }}" in step["run"]
 
     def test_request_says_approval_does_not_become_a_pass(self, gate):
         step = next(s for s in gate["jobs"]["cost-gate"]["steps"]

@@ -1,7 +1,8 @@
 """APPROVE / REJECT of a BLOCKED cost estimate.
 
-The human decision is a workflow_dispatch run whose event and actor GitHub
-attests. Three states stay separate throughout: an approval moves
+The human decision is a GitHub Actions Environment (finops-cost-approval)
+required-reviewer approval, reviewed in the SAME pipeline run that produced
+the evaluation. Three states stay separate throughout: an approval moves
 deployment_authorization only, never finops_decision.
 """
 
@@ -23,7 +24,7 @@ from finops.gate import (
     REJECTION_MESSAGE,
     evaluate_approval,
 )
-from finops.lock.exception import create_exception, verify_dispatch_approval
+from finops.lock.exception import create_exception, verify_environment_approval
 from finops.models import (
     Action,
     Cloud,
@@ -38,7 +39,6 @@ from tests.conftest import make_config
 from tests.unit.test_stack_matrix import GATE, REPO
 
 APPROVER = "TanishqParab-Enc"
-INTRUDER = "mallory"
 HEAD = "a" * 40
 PR = 15
 STACK = "web-platform"
@@ -140,15 +140,15 @@ class TestApprovalStateMachine:
 
 
 class TestApprovalBinding:
-    """Every binding is re-checked on trusted main against a FRESH plan and
-    estimate, so nothing approved on the PR can drift before it deploys."""
+    """Every binding is re-checked against a plan and estimate, so nothing
+    approved cannot silently drift from what was actually priced."""
 
     def _record(self, **overrides):
         kwargs = dict(
             decision=_decision(), estimate=_estimate(), plan=_plan(), plan_doc=_plan_doc(),
             config=make_config(approvers=[APPROVER], threshold=100),
             pr_number=PR, head_sha=HEAD, approver=APPROVER,
-            justification="approved via workflow_dispatch",
+            justification="approved via the finops-cost-approval GitHub Environment",
             stack=STACK, terraform_dir=TF_DIR, max_incremental_cost=259.02,
         )
         kwargs.update(overrides)
@@ -161,10 +161,10 @@ class TestApprovalBinding:
             plan=_plan(), plan_doc=_plan_doc(), estimate=_estimate(),
             config=make_config(approvers=[APPROVER], threshold=100),
             pr_number=PR, head_sha=HEAD, stack=STACK, terraform_dir=TF_DIR,
-            run_event="workflow_dispatch", run_actor=APPROVER, expected_approver=APPROVER,
+            run_event="pull_request",
         )
         kwargs.update(overrides)
-        return verify_dispatch_approval(
+        return verify_environment_approval(
             record, kwargs.pop("plan"), kwargs.pop("plan_doc"), kwargs.pop("estimate"),
             kwargs.pop("config"), **kwargs)
 
@@ -184,16 +184,9 @@ class TestApprovalBinding:
         ):
             assert record.get(field) is not None, field
 
-    def test_unauthorised_actor_is_denied(self):
-        assert self._verify(self._record(), run_actor=INTRUDER)
-
     def test_an_approval_from_another_event_is_denied(self):
-        assert self._verify(self._record(), run_event="pull_request")
+        assert self._verify(self._record(), run_event="workflow_dispatch")
         assert self._verify(self._record(), run_event="push")
-
-    def test_record_approver_must_match_the_attested_actor(self):
-        record = self._record(approver=INTRUDER)
-        assert self._verify(record)
 
     def test_wrong_pr_is_denied(self):
         assert self._verify(self._record(), pr_number=PR + 1)
@@ -245,10 +238,10 @@ class TestApprovalBinding:
 
 
 class TestApprovalCli:
-    """The workflow shells out to these exact commands."""
+    """The finops-approval job shells out to these exact commands."""
 
-    def _approve(self, tmp_path, *extra, action="approve", actor=APPROVER,
-                 event="workflow_dispatch"):
+    def _approve(self, tmp_path, *extra, action="approve", approver=APPROVER,
+                 event="pull_request"):
         plan = tmp_path / "plan.json"
         plan.write_text(json.dumps({
             "terraform_version": "1.11.0", "format_version": "1.2",
@@ -273,8 +266,8 @@ class TestApprovalCli:
             [sys.executable, "-m", "finops.cli", "approve",
              "--action", action, "--result", str(result), "--plan", str(plan),
              "--pr", str(PR), "--head-sha", HEAD, "--stack", STACK,
-             "--terraform-dir", TF_DIR, "--run-event", event, "--run-actor", actor,
-             "--expected-approver", APPROVER, "--json", *extra],
+             "--terraform-dir", TF_DIR, "--run-event", event, "--approver", approver,
+             "--json", *extra],
             capture_output=True, text=True)
 
     def test_reject_emits_the_exact_states_and_message(self, tmp_path):
@@ -297,12 +290,8 @@ class TestApprovalCli:
         assert payload["incremental_monthly_cost"] == 259.02
         assert payload["threshold"] == 100.0
 
-    def test_reject_is_refused_for_an_unauthorised_actor(self, tmp_path):
-        proc = self._approve(tmp_path, action="reject", actor="mallory")
-        assert proc.returncode != 0
-
-    def test_reject_is_refused_outside_workflow_dispatch(self, tmp_path):
-        proc = self._approve(tmp_path, action="reject", event="pull_request")
+    def test_reject_is_refused_outside_pull_request(self, tmp_path):
+        proc = self._approve(tmp_path, action="reject", event="workflow_dispatch")
         assert proc.returncode != 0
 
     def test_reject_mints_no_record(self, tmp_path):
@@ -318,15 +307,10 @@ class TestApprovalCli:
         assert payload["approval_status"] == "APPROVED"
         assert payload["deployment_authorization"] == "AUTHORIZED"
 
-    def test_unauthorised_actor_cannot_approve(self, tmp_path):
-        proc = self._approve(tmp_path, actor=INTRUDER)
+    def test_approval_outside_pull_request_is_refused(self, tmp_path):
+        proc = self._approve(tmp_path, event="workflow_dispatch")
         assert proc.returncode != 0
-        assert "not the authorised approver" in proc.stderr
-
-    def test_approval_outside_workflow_dispatch_is_refused(self, tmp_path):
-        proc = self._approve(tmp_path, event="pull_request")
-        assert proc.returncode != 0
-        assert "workflow_dispatch" in proc.stderr
+        assert "pull_request" in proc.stderr
 
     def test_approval_verify_round_trip(self, tmp_path):
         out = tmp_path / "approved.json"
@@ -344,8 +328,7 @@ class TestApprovalCli:
              "--decision", str(out), "--plan", str(tmp_path / "plan.json"),
              "--estimate", str(estimate), "--pr", str(PR), "--head-sha", HEAD,
              "--stack", STACK, "--terraform-dir", TF_DIR,
-             "--run-event", "workflow_dispatch", "--run-actor", APPROVER,
-             "--expected-approver", APPROVER, "--json"],
+             "--run-event", "pull_request", "--json"],
             capture_output=True, text=True)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         payload = json.loads(proc.stdout)
@@ -355,96 +338,51 @@ class TestApprovalCli:
 
 
 class TestApprovalWorkflowWiring:
-    def test_approve_and_reject_are_the_dispatch_choices(self, gate):
+    def test_workflow_dispatch_has_no_approval_inputs(self, gate):
         triggers = gate.get("on") or gate.get(True)
-        options = triggers["workflow_dispatch"]["inputs"]["finops_action"]["options"]
-        assert options == ["none", "approve", "reject"]
-
-    def test_approval_defaults_to_doing_nothing(self, gate):
-        triggers = gate.get("on") or gate.get(True)
-        assert triggers["workflow_dispatch"]["inputs"]["finops_action"]["default"] == "none"
-
-    def test_approval_job_only_runs_on_an_explicit_dispatch(self, gate):
-        cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
-        assert "github.event_name == 'workflow_dispatch'" in cond
-        assert "inputs.finops_action != 'none'" in cond
+        assert "workflow_dispatch" in triggers
+        assert not (triggers["workflow_dispatch"] or {}).get("inputs")
 
     def test_approver_is_repository_config_not_an_input(self, gate):
         assert gate["env"]["FINOPS_APPROVER"] == "${{ vars.FINOPS_APPROVER || 'TanishqParab-Enc' }}"
-        triggers = gate.get("on") or gate.get(True)
-        assert "approver" not in triggers["workflow_dispatch"]["inputs"]
 
-    def test_actor_is_authorised_before_any_other_step(self, gate):
-        steps = [s.get("name", s.get("uses")) for s in gate["jobs"]["finops-approval"]["steps"]]
-        assert steps.index("Authorise the approver") < steps.index(
-            "Resolve the pull request being decided")
-        assert steps.index("Authorise the approver") < steps.index(
-            "Record the decision for each blocked stack")
+    def test_approval_job_uses_the_required_reviewer_environment(self, gate):
+        job = gate["jobs"]["finops-approval"]
+        assert job["environment"]["name"] == "finops-cost-approval"
 
-    def test_rejection_is_verified_and_bound_like_an_approval(self, gate):
-        """A rejection is a decision about a specific priced change, so it
-        goes through the same resolve/locate/download binding as approve."""
-        steps = gate["jobs"]["finops-approval"]["steps"]
-        for name in ("Resolve the pull request being decided",
-                     "Locate the pull request's cost evaluation",
-                     "Download that evaluation's artifacts",
-                     "Record the decision for each blocked stack"):
-            step = next(s for s in steps if s.get("name") == name)
-            assert "if" not in step, f"{name} must run for reject too"
+    def test_approval_job_only_runs_when_a_stack_is_blocked(self, gate):
+        cond = " ".join(gate["jobs"]["finops-approval"]["if"].split())
+        assert cond == "needs.collect-blocked-stacks.outputs.has_blocked == 'true'"
 
-    def test_only_approve_uploads_a_record(self, gate):
-        upload = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                      if s.get("name") == "Upload the approval record")
-        assert upload["if"] == "inputs.finops_action == 'approve'"
+    def test_approval_job_matrixes_over_the_blocked_stacks(self, gate):
+        job = gate["jobs"]["finops-approval"]
+        assert job["strategy"]["matrix"]["stack"] == (
+            "${{ fromJson(needs.collect-blocked-stacks.outputs.blocked_stacks) }}")
 
-    def test_rejection_is_not_reported_as_an_infrastructure_failure(self, gate):
+    def test_no_actor_check_step_exists(self, gate):
+        """GitHub's own required-reviewer gate is the identity check now -
+        there is nothing left for the job's own steps to verify."""
+        names = [s.get("name") for s in gate["jobs"]["finops-approval"]["steps"]]
+        assert "Authorise the approver" not in names
+
+    def test_approval_consumes_only_this_runs_own_artifact(self, gate):
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Publish the decision")
-        assert "Deployment cancelled because the cost estimate was rejected." in step["run"]
-        assert "::error" not in step["run"]
-
-    def test_head_sha_comes_from_the_api_not_an_input(self, gate):
-        triggers = gate.get("on") or gate.get(True)
-        assert "head_sha" not in triggers["workflow_dispatch"]["inputs"]
-        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Resolve the pull request being decided")
-        assert "pulls/$PR_NUMBER" in step["run"]
-
-    def test_only_an_open_pull_request_can_be_decided(self, gate):
-        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Resolve the pull request being decided")
-        assert '"$STATE" != "open"' in step["run"]
+                    if s.get("name") == "Download this stack's cost evaluation (this run)")
+        assert step["with"]["name"] == "finops-gate-${{ matrix.stack }}-${{ github.run_id }}"
+        assert "run-id" not in step["with"]
 
     def test_approval_binds_to_the_terraform_root(self, gate):
         step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Record the decision for each blocked stack")
+                    if s.get("name") == "Record the approval")
         assert "--terraform-dir" in step["run"]
-        assert "--run-actor" in step["run"] and "--expected-approver" in step["run"]
+        assert "--approver" in step["run"]
+        assert "--run-actor" not in step["run"]
+        assert "--expected-approver" not in step["run"]
 
-    def test_the_dispatch_requires_a_blocked_evaluation(self, gate):
-        """The decision is only meaningful against an evaluation that really
-        was a BLOCK - a PASS stack is skipped and an all-PASS run errors."""
-        step = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                    if s.get("name") == "Record the decision for each blocked stack")
-        assert '"$DECISION" != "BLOCK"' in step["run"]
-        assert "Nothing to decide" in step["run"]
-
-    def test_the_dispatch_consumes_the_prs_own_evaluation_run(self, gate):
-        locate = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                      if s.get("name") == "Locate the pull request's cost evaluation")
-        assert "event=pull_request&head_sha=$HEAD_SHA" in locate["run"]
-        download = next(s for s in gate["jobs"]["finops-approval"]["steps"]
-                        if s.get("name") == "Download that evaluation's artifacts")
-        assert download["with"]["run-id"] == "${{ steps.eval_run.outputs.run_id }}"
-
-    def test_an_approval_dispatch_runs_nothing_else(self, gate):
-        """detect-changes is skipped, and cost-gate / scenarios / deploy all
-        need it - so no Terraform, Infracost, OIDC or fixtures run."""
-        cond = " ".join(gate["jobs"]["detect-changes"]["if"].split())
-        assert cond == (
-            "github.event_name != 'workflow_dispatch' || inputs.finops_action == 'none'")
-        for jid in ("cost-gate", "scenarios"):
-            assert "detect-changes" in gate["jobs"][jid]["needs"]
+    def test_approval_job_never_runs_terraform(self, gate):
+        job = json.dumps(gate["jobs"]["finops-approval"])
+        assert "terraform apply" not in job
+        assert "terraform plan" not in job
 
     def test_no_sleep_or_polling_waits_for_the_decision(self, gate_text):
         code = [ln for ln in gate_text.splitlines()
@@ -452,41 +390,43 @@ class TestApprovalWorkflowWiring:
         assert not any("sleep" in ln.lower() for ln in code)
         assert not any("while true" in ln.lower() for ln in code)
 
-    def test_no_environment_required_reviewer_is_used(self, gate_text):
-        assert "finops-cost-approval" not in gate_text
+    def test_the_environment_required_reviewer_is_used(self, gate_text):
+        assert "finops-cost-approval" in gate_text
 
+    def test_collect_blocked_stacks_aggregates_across_the_matrix(self, gate):
+        job = gate["jobs"]["collect-blocked-stacks"]
+        assert job["needs"] == ["detect-changes", "cost-gate"]
+        assert "blocked_stacks" in job["outputs"]
+        assert "has_blocked" in job["outputs"]
 
-class TestTrustedMainVerification:
-    def test_trusted_main_relocates_the_approving_run_from_the_api(self, gate):
-        step = next(s for s in gate["jobs"]["authorize-deploy"]["steps"]
-                    if s.get("name") == "Locate the approving dispatch run")
-        assert "event=workflow_dispatch" in step["run"]
-        assert "FINOPS_APPROVER" in step["run"]
+    def test_authorize_deploy_needs_the_approval_job(self, gate):
+        assert gate["jobs"]["authorize-deploy"]["needs"] == [
+            "detect-changes", "cost-gate", "finops-approval"]
 
-    def test_trusted_main_reverifies_with_a_fresh_plan_and_estimate(self, gate):
-        step = next(s for s in gate["jobs"]["authorize-deploy"]["steps"]
-                    if s.get("name") == "Aggregate per-stack authorization")
-        assert '"finops", "approval-verify"' in step["run"]
-        assert "proposed-plan.json" in step["run"]
-        assert "cost-estimate.json" in step["run"]
+    def test_authorize_deploy_runs_on_every_pull_request(self, gate):
+        cond = " ".join(gate["jobs"]["authorize-deploy"]["if"].split())
+        assert cond == "always() && github.event_name == 'pull_request' && needs.detect-changes.result == 'success'"
 
-    def test_a_blocked_stack_without_an_approval_record_is_denied(self, gate):
-        step = next(s for s in gate["jobs"]["authorize-deploy"]["steps"]
-                    if s.get("name") == "Aggregate per-stack authorization")
-        assert 'entry["deployment_authorization"] = "DENIED"' in step["run"]
+    def test_deploy_is_reachable_from_the_pull_request_run(self, gate):
+        cond = " ".join(gate["jobs"]["deploy"]["if"].split())
+        assert cond == "github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'"
+
+    def test_deploy_targets_dev_only(self, gate):
+        job = gate["jobs"]["deploy"]
+        assert job["environment"]["name"] == "dev"
+        assert job["env"]["TARGET_ENV"] == "dev"
+
+    def test_no_cross_run_artifact_downloads_remain(self, gate_text):
+        """Every download-artifact use in this workflow is same-run - no
+        `run-id:` targeting a different, earlier run."""
+        assert "run-id:" not in gate_text
 
     def test_deploy_depends_on_the_authorization_result(self, gate):
         assert gate["jobs"]["deploy"]["needs"] == ["detect-changes", "authorize-deploy"]
-        cond = " ".join(gate["jobs"]["deploy"]["if"].split())
-        assert cond.startswith("needs.authorize-deploy.result == 'success' &&")
 
-    def test_deployment_is_never_reachable_from_a_pull_request(self, gate):
-        for job in ("authorize-deploy", "deploy"):
-            cond = " ".join(gate["jobs"][job]["if"].split())
-            assert "pull_request" not in cond
-        assert "refs/heads/main" in " ".join(gate["jobs"]["deploy"]["if"].split())
+    def test_no_environment_required_reviewer_is_bypassed_by_actor_checks(self, gate):
+        """The old actor-check code path is gone - GitHub's own Environment
+        gate is the sole identity check now."""
+        job_text = json.dumps(gate["jobs"]["finops-approval"])
+        assert "github.actor" not in job_text
 
-    def test_approval_job_itself_never_runs_terraform(self, gate):
-        job = json.dumps(gate["jobs"]["finops-approval"])
-        assert "terraform apply" not in job
-        assert "terraform plan" not in job

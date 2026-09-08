@@ -423,7 +423,7 @@ def verify_exception(
     return problems
 
 
-def verify_dispatch_approval(
+def verify_environment_approval(
     record: dict,
     plan: NormalizedPlan,
     plan_doc: dict,
@@ -435,19 +435,22 @@ def verify_dispatch_approval(
     stack: str | None = None,
     terraform_dir: str | None = None,
     run_event: str | None = None,
-    run_actor: str | None = None,
-    expected_approver: str | None = None,
     now: datetime | None = None,
 ) -> list[str]:
-    """Same bindings as verify_exception, but the human decision comes from a
-    GitHub Actions ``workflow_dispatch`` run instead of a pull request review.
+    """Same bindings as ``verify_exception``, but the human decision comes
+    from a GitHub Actions Environment's required-reviewer protection rule
+    (the ``finops-cost-approval`` Environment), reviewed in the SAME pipeline
+    run that produced the evaluation - not a pull request review and not a
+    separate ``workflow_dispatch`` run.
 
-    ``run_event`` and ``run_actor`` must be the GitHub-attested values for the
-    run that produced this record (``github.event_name`` / ``github.actor``,
-    re-read from the Actions API on the trusted run). They are set by GitHub,
-    cannot be forged by pull request content, and workflow_dispatch itself
-    requires write access - so this is an authorisation channel a PR cannot
-    reach, which is the same property the PR-review path relied on.
+    There is deliberately no actor/approver check here. GitHub itself only
+    starts the job that calls ``finops approve`` after the Environment's
+    required reviewer clicks Approve on this exact run; a Reject prevents
+    those steps from ever running. That makes the identity check GitHub's
+    job, not this function's - duplicating it here would check nothing
+    GitHub has not already enforced. The one channel check kept is
+    ``run_event``: this must be a ``pull_request`` run, the only trigger this
+    workflow ever gates with the Environment.
     """
     if not config.exceptions.enabled:
         return ["Budget exceptions are disabled by policy"]
@@ -458,26 +461,9 @@ def verify_dispatch_approval(
         terraform_dir=terraform_dir, now=now,
     )
 
-    if run_event != "workflow_dispatch":
+    if run_event != "pull_request":
         problems.append(
-            f"Approval must come from a workflow_dispatch run, not {run_event!r}"
-        )
-
-    approver = (expected_approver or "").strip().lower()
-    actor = (run_actor or "").strip().lower()
-    recorded = str(record.get("approver") or "").strip().lower()
-
-    if not approver:
-        problems.append("No expected approver configured; refusing to authorise")
-    elif actor != approver:
-        problems.append(
-            f"Approval was triggered by {run_actor!r}, who is not the authorised "
-            f"approver {expected_approver!r}"
-        )
-    elif recorded != approver:
-        problems.append(
-            f"Exception names {record.get('approver')!r} as approver but the "
-            f"approval run was triggered by {run_actor!r}"
+            f"Approval must come from the pull request's own run, not {run_event!r}"
         )
 
     return problems

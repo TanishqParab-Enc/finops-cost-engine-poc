@@ -1,8 +1,12 @@
 name: FinOps Cost Gate
 
-# Shift-left FinOps control:
+# Shift-left FinOps control, entirely within ONE pipeline execution:
 #   detect IaC change -> terraform plan (base + head) -> Infracost -> threshold
-#   -> PASS (lock cost, continue) | FAIL (block, require peer review)
+#   -> PASS (lock cost, deploy automatically)
+#   -> BLOCK (pause for human review via a GitHub Actions Environment,
+#      required-reviewer approval resumes the SAME run, reject stops it)
+#   -> deploy using the plan already produced by this run (never re-planned,
+#      never re-priced)
 
 # Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
 "on":
@@ -13,79 +17,28 @@ name: FinOps Cost Gate
       - 'config/finops-stacks.yml'
       - 'finops-exceptions/**'
       - '.github/workflows/finops-cost-gate.yml'
-  # Trusted post-merge execution. The PR gate runs PR-branch code, so its cost
-  # lock is audit evidence only - never an authorisation. This push run re-runs
-  # the whole gate from trusted main code, mints a fresh lock, verifies it, and
-  # only then deploys to dev.
-  push:
-    branches: [main]
-    paths:
-      - 'terraform/**'
-      - 'config/finops-policy.yaml'
-      - 'config/finops-stacks.yml'
-      - 'finops-exceptions/**'
-      - '.github/workflows/finops-cost-gate.yml'
-  workflow_dispatch:
-    inputs:
-      # THE APPROVE / REJECT CONTROL. Actions -> FinOps Cost Gate -> Run
-      # workflow -> pick the PR's branch -> set finops_action.
-      # This is not an "approved=true" boolean a PR can set: the decision is
-      # only honoured when GitHub itself attests github.event_name ==
-      # workflow_dispatch AND github.actor == FINOPS_APPROVER, and triggering
-      # a dispatch requires write access. Repository content cannot reach it.
-      finops_action:
-        description: "Approve or reject a BLOCKED cost estimate (none = just evaluate cost)"
-        required: false
-        default: none
-        type: choice
-        options: [none, approve, reject]
-      approval_pr:
-        description: "PR number the approval applies to (required for approve/reject)"
-        required: false
-        type: string
-      cloud:
-        description: Cloud stack to evaluate
-        required: true
-        default: aws
-        type: choice
-        options: [aws, azure, gcp]
-      deploy:
-        description: "Apply the stack after the gate passes (leave unchecked to only evaluate cost)"
-        required: false
-        default: false
-        type: boolean
-      deploy_environment:
-        description: Environment to deploy to when 'deploy' is checked
-        required: false
-        default: dev
-        type: choice
-        options: [dev, prod]
+  # Manual trigger for the read-only scenario-pricing job only. Deploy is
+  # reachable only from a pull_request run (see the `deploy` job).
+  workflow_dispatch: {}
 
 permissions:
   contents: read
   pull-requests: write
   id-token: write   # required for AWS OIDC
-  # Read the approving dispatch run's attested metadata and download its
-  # approval artifact from that earlier, separate run.
-  actions: read
 
 env:
   PYTHON_VERSION: '3.12'
   TERRAFORM_VERSION: '1.11.0'
   AWS_REGION: us-east-1
-  # The only login permitted to approve a BLOCKED cost estimate. Repository
-  # configuration, never a workflow input - a dispatch cannot nominate itself
-  # as the approver.
+  # Recorded as the approving identity on an exception record. The real
+  # authorisation check is GitHub's own required-reviewers rule on the
+  # `finops-cost-approval` Environment (see the `finops-approval` job) - this
+  # value is descriptive/audit only, never a security boundary by itself.
   FINOPS_APPROVER: ${{ vars.FINOPS_APPROVER || 'TanishqParab-Enc' }}
 
 jobs:
   detect-changes:
     name: Detect infrastructure changes
-    # An approve/reject dispatch decides on an evaluation that already
-    # happened. Skipping detection here also skips cost-gate, scenarios and
-    # deploy (all of which need it), so an approval runs finops-approval and
-    # nothing else - no Terraform, no Infracost, no AWS OIDC, no fixtures.
-    if: github.event_name != 'workflow_dispatch' || inputs.finops_action == 'none'
     runs-on: ubuntu-latest
     outputs:
       has_infra_changes: ${{ steps.detect.outputs.has_infra_changes }}
@@ -107,10 +60,7 @@ jobs:
         id: detect
         run: |
           set -euo pipefail
-          # On push, main is both base and head, so diffing against the branch
-          # would report no change. Use the pre-push commit to see what the
-          # merge actually introduced.
-          BASE="${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || github.event.repository.default_branch) }}"
+          BASE="origin/${{ github.base_ref || github.event.repository.default_branch }}"
 
           finops detect-changes --base "$BASE" --head HEAD --json > changes.json
           cat changes.json
@@ -150,12 +100,10 @@ jobs:
     name: Cost gate (${{ matrix.stack.name }})
     needs: detect-changes
     if: |
+      github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.stacks != '' &&
-      needs.detect-changes.outputs.stacks != '[]' && (
-        needs.detect-changes.outputs.has_infra_changes == 'true' ||
-        (github.event_name == 'workflow_dispatch' && inputs.finops_action == 'none') ||
-        github.event_name == 'push'
-      )
+      needs.detect-changes.outputs.stacks != '[]' &&
+      needs.detect-changes.outputs.has_infra_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -172,7 +120,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'push' && github.event.before || github.base_ref || github.event.repository.default_branch }}
+          ref: ${{ github.base_ref || github.event.repository.default_branch }}
           path: base
 
       - uses: actions/setup-python@v5
@@ -421,12 +369,10 @@ jobs:
         working-directory: head
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
           mkdir -p .finops
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/finops-cost-gate.yml"
-          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Restate the figures the decision is about, from this run's own
           # artifacts. The rendered table above omits a labelled incremental
@@ -462,36 +408,26 @@ jobs:
 
           **1.** This change is **BLOCKED**: the incremental monthly cost exceeds the
           threshold.
-          **2.** It needs an explicit **APPROVE** or **REJECT** from \`$FINOPS_APPROVER\`.
-          Nothing deploys until then.
+          **2.** This pull request's own pipeline run is now waiting on the
+          **\`finops-cost-approval\`** GitHub Environment - it needs an explicit
+          **Approve** or **Reject** from \`$FINOPS_APPROVER\`. Nothing deploys until then.
 
-          > The decision is a **separate manual workflow run**. It does not re-plan or
-          > re-price anything - it consumes *this* blocked evaluation for PR
-          > #$PR_NUMBER at this exact commit, and refuses to run if that evaluation is
-          > not a BLOCK. It is therefore logically downstream of this run even though
-          > GitHub shows it as its own run.
+          > This is the SAME run, paused mid-execution (like a Jenkins \`input\` step) -
+          > it does not re-plan or re-price anything. It consumes exactly the plan and
+          > estimate this run already produced for PR #$PR_NUMBER at this exact commit.
 
           To decide:
 
-          **3.** Go to **[Actions -> FinOps Cost Gate]($RUN_URL)** and click **Run workflow**.
-          **4.** Under *Use workflow from*, select this pull request's branch: \`$BRANCH\`.
-          **5.** Set **finops_action** to \`approve\` or \`reject\`.
-          **6.** Set **approval_pr** to \`$PR_NUMBER\`.
-          **7.** Click **Run workflow**.
-
-          > **If the \`finops_action\` field is not shown:** GitHub builds that form from
-          > the workflow file on the default branch (\`$DEFAULT_BRANCH\`), so the field
-          > only appears once this change is merged there. Until then use the CLI, which
-          > reads the inputs from the branch you pass:
-          >
-          > \`\`\`
-          > gh workflow run finops-cost-gate.yml --repo ${{ github.repository }} \\
-          >   --ref $BRANCH -f finops_action=approve -f approval_pr=$PR_NUMBER
-          > \`\`\`
+          **3.** Open **[this run]($RUN_URL)**.
+          **4.** Find the **\`Manual cost approval (finops-cost-approval)\`** job - it will
+          show **Waiting**.
+          **5.** Click **Review deployments**, select the job, and choose **Approve** or
+          **Reject**.
 
           Approving does **not** turn this into a PASS - \`finops_decision\` stays
           \`BLOCK\`. It only sets \`deployment_authorization = AUTHORIZED\`, bound to
-          PR #$PR_NUMBER at this exact commit. Any new commit invalidates it.
+          PR #$PR_NUMBER at this exact commit. Any new commit invalidates it and starts
+          a fresh run.
           EOF
           echo "Approval request appended to the pull request comment."
 
@@ -537,14 +473,14 @@ jobs:
               });
             }
 
-      # Only meaningful on the trusted main run: proves the lock this run just
-      # minted is untampered, APPROVED, produced by an AUTHORITATIVE estimator,
-      # and still bound to the current threshold and plan before anything is
-      # applied. Guarded on a passing gate so a threshold failure reports the
-      # real reason rather than a missing-lock error.
+      # Proves the lock this run just minted is untampered and still bound to
+      # the current threshold and plan before anything downstream may deploy
+      # it. Runs on every PASS for a deployable stack - the plan and lock were
+      # both just produced by this same run, so this is a same-run integrity
+      # check, not a re-verification of an earlier run's output.
       - name: Verify cost lock before deployment
         id: verify_lock
-        if: github.event_name == 'push' && steps.gate.outputs.exit_code == '0' && matrix.stack.deployable == true
+        if: steps.gate.outputs.exit_code == '0' && matrix.stack.deployable == true
         working-directory: head
         run: |
           set -euo pipefail
@@ -605,7 +541,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: finops-${{ matrix.stack.name }}-${{ github.run_id }}
+          name: finops-gate-${{ matrix.stack.name }}-${{ github.run_id }}
           path: head/.finops/
           retention-days: 90
           # .finops is dot-prefixed, and upload-artifact@v4 skips hidden paths
@@ -613,8 +549,8 @@ jobs:
           include-hidden-files: true
 
       # The gate is the last word: a non-zero exit stops the pipeline.
-      #   1 = threshold exceeded - needs an explicit APPROVE via the
-      #       finops-approval job before anything can deploy
+      #   1 = threshold exceeded - the finops-approval job (gated by the
+      #       finops-cost-approval Environment) pauses this same run next
       #   2 = cost could not be trusted, failing safe
       - name: Enforce gate
         if: always()
@@ -626,7 +562,7 @@ jobs:
           case "$CODE" in
             0) echo "PASS - cost locked, pipeline may continue." ;;
             1)
-              echo "::error::FinOps threshold exceeded (finops_decision=BLOCK, approval_status=PENDING). Run the FinOps Cost Gate workflow with finops_action=approve or reject - see the approval request on the pull request."
+              echo "::error::FinOps threshold exceeded (finops_decision=BLOCK, approval_status=PENDING). This run's finops-approval job will pause for review in the finops-cost-approval Environment - see the approval request on the pull request."
               exit 1
               ;;
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
@@ -646,7 +582,6 @@ jobs:
     needs: detect-changes
     if: |
       github.event_name == 'workflow_dispatch' &&
-      inputs.finops_action == 'none' &&
       contains(needs.detect-changes.outputs.stacks, '"web-platform"')
     runs-on: ubuntu-latest
     strategy:
@@ -770,391 +705,215 @@ jobs:
           retention-days: 90
           include-hidden-files: true
 
-  # THE APPROVE / REJECT GATE.
-  #
-  # Trigger: Actions -> FinOps Cost Gate -> "Run workflow" -> select the PR's
-  # branch -> finops_action = approve | reject, approval_pr = the PR number.
-  #
-  # Why workflow_dispatch rather than an "approved=true" file or input: the
-  # decision is only honoured when GitHub itself attests both
-  # github.event_name == workflow_dispatch and github.actor == FINOPS_APPROVER.
-  # Both are set by GitHub, neither is forgeable by pull request content, and
-  # dispatching requires write access - so this is an authorisation channel a
-  # PR simply cannot reach. Environment required-reviewers would be the
-  # native equivalent but this repository's plan does not support that rule.
-  #
-  # The approval binds to a plan and Infracost estimate produced by THIS run's
-  # own cost-gate job, so what is approved is exactly what was priced. It never
-  # rewrites the decision: `finops approve` refuses anything but a FAIL and the
-  # record it mints keeps finops_decision=FAIL.
-  finops-approval:
-    name: Manual cost approval (APPROVE / REJECT)
-    # Deliberately depends on nothing. An approval must not re-plan, re-price
-    # or touch AWS: it consumes the artifacts the pull request's own cost-gate
-    # run already produced, so what is approved is exactly what was priced.
-    # This also means no scenario job, no Terraform plan and no OIDC role
-    # assumption happens on an approval - workflow_dispatch cannot assume the
-    # plan role anyway, so re-pricing here could never have worked.
-    if: github.event_name == 'workflow_dispatch' && inputs.finops_action != 'none'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install engine
-        run: pip install --quiet -e .
-
-      # Fail closed before anything else. github.actor is GitHub-attested.
-      - name: Authorise the approver
-        run: |
-          set -euo pipefail
-          if [ "${{ github.actor }}" != "$FINOPS_APPROVER" ]; then
-            echo "::error title=Unauthorised approver::'${{ github.actor }}' is not permitted to approve or reject FinOps cost estimates. Only '$FINOPS_APPROVER' is."
-            exit 1
-          fi
-          echo "Approval action '${{ inputs.finops_action }}' requested by ${{ github.actor }}."
-
-      # Both APPROVE and REJECT are bound to the same evaluation, so the
-      # resolve/locate/download steps below run for either action - a
-      # rejection is a decision about a specific priced change, not a blanket
-      # "no". Only the record-minting step differs.
-      - name: Resolve the pull request being decided
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ inputs.approval_pr }}
-        run: |
-          set -euo pipefail
-          if [ -z "$PR_NUMBER" ]; then
-            echo "::error title=No pull request::approval_pr is required for approve or reject."
-            exit 1
-          fi
-          gh api "repos/$REPO/pulls/$PR_NUMBER" > pr.json
-          STATE=$(python3 -c "import json;print(json.load(open('pr.json'))['state'])")
-          if [ "$STATE" != "open" ]; then
-            echo "::error title=Pull request not open::PR #$PR_NUMBER is '$STATE'. Only an open pull request can be decided."
-            exit 1
-          fi
-          HEAD_SHA=$(python3 -c "import json;print(json.load(open('pr.json'))['head']['sha'])")
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "Deciding PR #$PR_NUMBER at head $HEAD_SHA"
-
-      # The evaluation being decided is the pull request's own cost-gate run
-      # for that exact head SHA. A new commit produces a new head SHA, so a
-      # stale request can never be pointed at newer code.
-      - name: Locate the pull request's cost evaluation
-        id: eval_run
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-        run: |
-          set -euo pipefail
-          gh api "repos/$REPO/actions/workflows/finops-cost-gate.yml/runs?event=pull_request&head_sha=$HEAD_SHA" > runs.json
-          RUN_ID=$(python3 -c "
-          import json
-          runs = json.load(open('runs.json')).get('workflow_runs', [])
-          done = [r for r in runs if r.get('status') == 'completed']
-          print(sorted(done, key=lambda r: r['id'])[-1]['id'] if done else '')
-          ")
-          if [ -z "$RUN_ID" ]; then
-            echo "::error title=No cost evaluation::No completed FinOps Cost Gate run was found for $HEAD_SHA. Let the pull request's cost gate finish first."
-            exit 1
-          fi
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "Deciding the cost evaluation produced by run $RUN_ID"
-
-      - name: Download that evaluation's artifacts
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ steps.eval_run.outputs.run_id }}
-          repository: ${{ github.repository }}
-          pattern: finops-*
-          path: artifacts
-
-      # `finops approve` re-checks the attested event/actor and refuses any
-      # evaluation that is not a FAIL, so neither action can be recorded
-      # against something that was never BLOCKED.
-      - name: Record the decision for each blocked stack
-        id: decision
-        env:
-          PR_NUMBER: ${{ inputs.approval_pr }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          ACTION: ${{ inputs.finops_action }}
-        run: |
-          set -euo pipefail
-          mkdir -p finops-approval
-          DECIDED=0
-
-          for authz in artifacts/*/authorization.json; do
-            [ -f "$authz" ] || continue
-            DIR=$(dirname "$authz")
-            STACK=$(python3 -c "import json;print(json.load(open('$authz'))['stack'])")
-            DECISION=$(python3 -c "import json;print(json.load(open('$authz'))['finops_decision'])")
-
-            if [ "$DECISION" != "BLOCK" ]; then
-              echo "Stack '$STACK' is $DECISION - no decision needed."
-              continue
-            fi
-
-            # Terraform root comes from the trusted registry, never the artifact.
-            # Single line on purpose: inside this loop the block scalar keeps the
-            # leading indentation, and Python rejects an indented first line.
-            TF_DIR=$(STACK="$STACK" python3 -c "import os;from finops.stacks import get_stack;print(get_stack(os.environ['STACK']).terraform_dir)")
-
-            OUT_ARG=""
-            if [ "$ACTION" = "approve" ]; then
-              OUT_ARG="--out finops-approval/${STACK}.json"
-            fi
-
-            finops approve \
-              --action "$ACTION" \
-              --result "$DIR/gate-result.json" \
-              --plan "$DIR/proposed-plan.json" \
-              --pr "$PR_NUMBER" \
-              --head-sha "$HEAD_SHA" \
-              --stack "$STACK" \
-              --terraform-dir "$TF_DIR" \
-              --run-event "${{ github.event_name }}" \
-              --run-actor "${{ github.actor }}" \
-              --expected-approver "$FINOPS_APPROVER" \
-              $OUT_ARG | tee "decision-${STACK}.txt"
-
-            DECIDED=$((DECIDED + 1))
-          done
-
-          if [ "$DECIDED" -eq 0 ]; then
-            echo "::error title=Nothing to decide::No BLOCKED stack was found in the evaluation for $HEAD_SHA."
-            exit 1
-          fi
-
-      - name: Publish the decision
-        if: always() && steps.decision.outcome == 'success'
-        env:
-          PR_NUMBER: ${{ inputs.approval_pr }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          ACTION: ${{ inputs.finops_action }}
-        run: |
-          set -euo pipefail
-          if [ "$ACTION" = "approve" ]; then
-            {
-              echo "## FinOps cost estimate APPROVED"
-              echo ""
-              echo '```'
-              echo "finops_decision          = BLOCK   (unchanged - approval never rewrites the decision)"
-              echo "approval_status          = APPROVED"
-              echo "deployment_authorization = AUTHORIZED"
-              echo '```'
-              echo ""
-              echo "Approved by ${{ github.actor }} for PR #$PR_NUMBER at \`$HEAD_SHA\`."
-              echo ""
-              cat decision-*.txt
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "## Deployment cancelled because the cost estimate was rejected."
-              echo ""
-              echo '```'
-              cat decision-*.txt
-              echo '```'
-              echo ""
-              echo "No approval record was produced, so no later run can treat this as authorised."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::notice title=Cost estimate rejected::Deployment cancelled because the cost estimate was rejected."
-          fi
-          cat decision-*.txt
-
-      - name: Upload the approval record
-        if: inputs.finops_action == 'approve'
-        uses: actions/upload-artifact@v4
-        with:
-          name: finops-approval-pr${{ inputs.approval_pr }}-${{ steps.pr.outputs.head_sha }}
-          path: finops-approval/
-          retention-days: 90
-
-  # Apply is NEVER reachable from a pull request - PR branches run untrusted
-  # code, and `terraform apply` on untrusted code is arbitrary code execution
-  # against AWS. Two mutually exclusive paths reach here:
-  #   push to main    -> automatic, hard-pinned to dev, trusted code only,
-  #                      one job per stack the push actually touched
-  #   workflow_dispatch -> explicit opt-in, aws only, may target dev or prod
-  # `matrix.stack.deployable` is read from the SAME trusted registry JSON
-  # detect-changes already built for cost-gate - a PR cannot flip it, since it
-  # is never taken from workflow input. The deploy job also re-reads
-  # config/finops-stacks.yml directly, so deployability is checked twice,
-  # independently. Apply targets an environment-specific workload state and
-  # var-file, so dev and prod are genuinely isolated - not just IAM-role-
-  # labelled copies of the same shared state.
-  #
-  # cost-gate is matrixed by stack, so its own job conclusion is all-or-
-  # nothing across every stack a push touched: one BLOCKED-without-exception
-  # stack would make the whole job 'failure', which must not stop an
-  # unrelated, already-authorized stack from deploying. This job aggregates
-  # each matrix instance's authorization.json (published in its own "Upload
-  # FinOps artifacts" artifact, already computed correctly by cost-gate's own
-  # "Compute deployment authorization" step - including the peer-reviewed
-  # exception check) into one per-stack map, so `deploy` can depend on an
-  # explicit authorization result instead of cost-gate's raw pass/fail.
-  # Always runs (`always()`) so it aggregates the DENIED case too, not just
-  # skip past it.
-  authorize-deploy:
-    name: Aggregate deployment authorization
+  # Aggregates each cost-gate matrix instance's authorization.json into one
+  # list of stacks that need a human decision. A matrix job's outputs are not
+  # aggregated by GitHub across instances, so this is the only way to build a
+  # single JSON array for finops-approval's own matrix below.
+  collect-blocked-stacks:
+    name: Collect blocked stacks
     needs: [detect-changes, cost-gate]
-    if: |
-      always() && needs.detect-changes.result == 'success' && (
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
-      )
+    if: always() && github.event_name == 'pull_request' && needs.detect-changes.result == 'success'
     runs-on: ubuntu-latest
     outputs:
-      authorizations: ${{ steps.aggregate.outputs.authorizations }}
+      blocked_stacks: ${{ steps.collect.outputs.blocked_stacks }}
+      has_blocked: ${{ steps.collect.outputs.has_blocked }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install engine
-        run: pip install --quiet -e .
-
-      - name: Download per-stack authorization artifacts
+      - name: Download this run's cost-gate artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: finops-*-${{ github.run_id }}
+          pattern: finops-gate-*-${{ github.run_id }}
           path: artifacts
 
-      # Which PR this trusted commit came from, per GitHub's own merge
-      # tracking - not a workflow input.
-      - name: Resolve the merged pull request
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          gh api "repos/$REPO/commits/$SHA/pulls" > pr.json
-          PR=$(python3 -c "import json;d=json.load(open('pr.json'));print(d[0]['number'] if d else '')")
-          echo "number=$PR" >> "$GITHUB_OUTPUT"
-          if [ -n "$PR" ]; then
-            gh api "repos/$REPO/pulls/$PR" > detail.json
-            echo "head_sha=$(python3 -c "import json;print(json.load(open('detail.json'))['head']['sha'])")" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Merged PR: #${PR:-<none>}"
-
-      # Locates the approving dispatch run and re-reads its attested event and
-      # actor from the Actions API. The approval artifact is never trusted for
-      # merely existing - if no dispatch run by the authorised approver exists
-      # for this exact PR head, nothing below can authorise a deployment.
-      - name: Locate the approving dispatch run
-        id: approval_run
-        if: steps.pr.outputs.number != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-        run: |
-          set -euo pipefail
-          gh api "repos/$REPO/actions/workflows/finops-cost-gate.yml/runs?event=workflow_dispatch&head_sha=$HEAD_SHA&status=success" > runs.json
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os
-          runs = json.load(open("runs.json")).get("workflow_runs", [])
-          approver = (os.environ.get("FINOPS_APPROVER") or "").strip().lower()
-          match = [
-              r for r in runs
-              if (r.get("actor") or {}).get("login", "").strip().lower() == approver
-          ]
-          run = sorted(match, key=lambda r: r["id"])[-1] if match else None
-          print(f"run_id={run['id'] if run else ''}")
-          print(f"run_event={run['event'] if run else ''}")
-          print(f"run_actor={(run['actor']['login'] if run else '')}")
-          PY
-          cat "$GITHUB_OUTPUT"
-
-      - name: Download the approval record
-        if: steps.approval_run.outputs.run_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ steps.approval_run.outputs.run_id }}
-          repository: ${{ github.repository }}
-          pattern: finops-approval-pr${{ steps.pr.outputs.number }}-${{ steps.pr.outputs.head_sha }}
-          path: approval
-
-      - name: Aggregate per-stack authorization
-        id: aggregate
-        env:
-          STACKS: ${{ needs.detect-changes.outputs.stacks }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          RUN_EVENT: ${{ steps.approval_run.outputs.run_event }}
-          RUN_ACTOR: ${{ steps.approval_run.outputs.run_actor }}
+      - name: Collect
+        id: collect
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import glob
           import json
           import os
-          import subprocess
-          import sys
 
-          stacks = {s["name"]: s for s in json.loads(os.environ.get("STACKS") or "[]")}
-          merged = {}
-
+          blocked = []
           for path in glob.glob("artifacts/*/authorization.json"):
               with open(path, encoding="utf-8") as fh:
                   entry = json.load(fh)
+              if entry.get("finops_decision") == "BLOCK":
+                  blocked.append(entry["stack"])
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"blocked_stacks={json.dumps(sorted(blocked))}\n")
+              out.write(f"has_blocked={'true' if blocked else 'false'}\n")
+          print(f"Blocked stacks: {sorted(blocked)}")
+          PY
+
+  # THE APPROVAL GATE - a GitHub Actions Environment's required-reviewer
+  # protection rule. The native equivalent of a Jenkins `input` step: this job
+  # pauses THIS SAME run (status becomes "Waiting") the moment it requests the
+  # `finops-cost-approval` Environment, and GitHub itself only starts the
+  # steps below once the required reviewer (FINOPS_APPROVER) clicks Approve
+  # on this exact run. A Reject prevents these steps from running at all -
+  # the job's conclusion becomes failed/cancelled, so authorize-deploy below
+  # never sees an authorization for that stack. There is deliberately no
+  # "record a rejection" code path: GitHub's own gate IS the rejection
+  # handling, and it happens before any step here can execute.
+  #
+  # No actor check is performed in these steps: GitHub will not run them
+  # unless the Environment's required reviewer already approved, so that
+  # identity check has already happened by the time this job's first step
+  # starts - duplicating it here would check nothing GitHub has not already
+  # enforced.
+  #
+  # Consumes only the artifact THIS SAME run's cost-gate job already
+  # produced - never re-plans, never re-prices, never re-runs Terraform or
+  # Infracost, never touches AWS.
+  finops-approval:
+    name: "Manual cost approval (finops-cost-approval)"
+    needs: collect-blocked-stacks
+    if: needs.collect-blocked-stacks.outputs.has_blocked == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: finops-cost-approval
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.collect-blocked-stacks.outputs.blocked_stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      - name: Download this stack's cost evaluation (this run)
+        uses: actions/download-artifact@v4
+        with:
+          name: finops-gate-${{ matrix.stack }}-${{ github.run_id }}
+          path: evaluation
+
+      # Terraform root comes from the trusted registry, never the artifact.
+      - name: Record the approval
+        id: decision
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STACK: ${{ matrix.stack }}
+        run: |
+          set -euo pipefail
+          TF_DIR=$(python3 -c "import os;from finops.stacks import get_stack;print(get_stack(os.environ['STACK']).terraform_dir)")
+
+          mkdir -p finops-approval
+          finops approve \
+            --action approve \
+            --result evaluation/gate-result.json \
+            --plan evaluation/proposed-plan.json \
+            --pr "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --stack "$STACK" \
+            --terraform-dir "$TF_DIR" \
+            --run-event "${{ github.event_name }}" \
+            --approver "$FINOPS_APPROVER" \
+            --out "finops-approval/${STACK}-exception.json" \
+            --json | tee decision.json
+
+          finops authorize-deployment --exit-code 1 --exception-valid --json > authz.json
+          cat authz.json
+          RUN_ID="${{ github.run_id }}" STACK="$STACK" python3 -c "import json,os;d=json.load(open('authz.json'));d['stack']=os.environ['STACK'];d['run_id']=os.environ['RUN_ID'];json.dump(d,open('finops-approval/authorization.json','w'),indent=2)"
+
+      - name: Publish the decision
+        if: always() && steps.decision.outcome == 'success'
+        run: |
+          {
+            echo "## FinOps cost estimate APPROVED - ${{ matrix.stack }}"
+            echo ""
+            echo '```'
+            echo "finops_decision          = BLOCK   (unchanged - approval never rewrites the decision)"
+            echo "approval_status          = APPROVED"
+            echo "deployment_authorization = AUTHORIZED"
+            echo '```'
+            echo ""
+            echo "Approved by $FINOPS_APPROVER for PR #${{ github.event.pull_request.number }} at \`${{ github.event.pull_request.head.sha }}\`."
+            echo ""
+            cat decision.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the approval record
+        if: always() && steps.decision.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-approval-${{ matrix.stack }}-${{ github.run_id }}
+          path: finops-approval/
+          retention-days: 90
+
+  # Apply is NEVER reachable except from a pull_request run that has been
+  # explicitly authorized in THIS SAME run - either cost-gate's own PASS/lock
+  # path, or finops-approval's Environment-gated approval above.
+  # `matrix.stack.deployable` is read from the SAME trusted registry JSON
+  # detect-changes already built for cost-gate - a PR cannot flip it, since it
+  # is never taken from workflow input. The deploy job also re-reads
+  # config/finops-stacks.yml directly, so deployability is checked twice,
+  # independently.
+  #
+  # cost-gate is matrixed by stack, so its own job conclusion is all-or-
+  # nothing across every stack the PR touched: one BLOCKED stack would make
+  # the whole job 'failure', which must not stop an unrelated, already-
+  # authorized stack from deploying. This job aggregates each matrix
+  # instance's authorization.json (from cost-gate's own artifact, and - for a
+  # BLOCKed stack - finops-approval's artifact if and only if that stack's
+  # approval actually ran) into one per-stack map, so `deploy` can depend on
+  # an explicit authorization result instead of cost-gate's raw pass/fail.
+  # Always runs (`always()`) so it aggregates the DENIED/rejected case too,
+  # not just skip past it.
+  authorize-deploy:
+    name: Aggregate deployment authorization
+    needs: [detect-changes, cost-gate, finops-approval]
+    if: always() && github.event_name == 'pull_request' && needs.detect-changes.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      authorizations: ${{ steps.aggregate.outputs.authorizations }}
+    steps:
+      - name: Download cost-gate authorizations (this run)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: finops-gate-*-${{ github.run_id }}
+          path: gate-artifacts
+
+      - name: Download approval decisions (this run, if any)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: finops-approval-*-${{ github.run_id }}
+          path: approval-artifacts
+
+      - name: Aggregate per-stack authorization
+        id: aggregate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+
+          merged = {}
+          for path in glob.glob("gate-artifacts/*/authorization.json"):
+              with open(path, encoding="utf-8") as fh:
+                  entry = json.load(fh)
               stack = entry.get("stack")
-              if not stack:
-                  continue
-
-              # PASS keeps the authorization cost-gate already computed from
-              # the normal cost-lock path; only a BLOCK needs an approval.
-              if entry.get("finops_decision") != "BLOCK":
+              if stack:
                   merged[stack] = entry
-                  continue
 
-              art_dir = os.path.dirname(path)
-              matches = glob.glob(f"approval/*/{stack}.json") or glob.glob(f"approval/{stack}.json")
-              if not matches:
-                  entry["deployment_authorization"] = "DENIED"
-                  entry["approval_status"] = "PENDING"
-                  print(f"{stack}: no approval record -> DENIED", file=sys.stderr)
+          # A BLOCKed stack's authorization is only ever overwritten here if
+          # finops-approval actually produced an artifact for it - which only
+          # happens when GitHub's required-reviewer gate let that job's steps
+          # run at all (i.e. it was approved, never rejected).
+          for path in glob.glob("approval-artifacts/*/authorization.json"):
+              with open(path, encoding="utf-8") as fh:
+                  entry = json.load(fh)
+              stack = entry.get("stack")
+              if stack:
                   merged[stack] = entry
-                  continue
-
-              cmd = [
-                  "finops", "approval-verify",
-                  "--decision", matches[0],
-                  "--plan", f"{art_dir}/proposed-plan.json",
-                  "--estimate", f"{art_dir}/cost-estimate.json",
-                  "--stack", stack,
-                  "--terraform-dir", stacks.get(stack, {}).get("dir", ""),
-                  "--run-event", os.environ.get("RUN_EVENT", ""),
-                  "--run-actor", os.environ.get("RUN_ACTOR", ""),
-                  "--expected-approver", os.environ.get("FINOPS_APPROVER", ""),
-                  "--json",
-              ]
-              if os.environ.get("PR_NUMBER"):
-                  cmd += ["--pr", os.environ["PR_NUMBER"]]
-              if os.environ.get("HEAD_SHA"):
-                  cmd += ["--head-sha", os.environ["HEAD_SHA"]]
-
-              proc = subprocess.run(cmd, capture_output=True, text=True)
-              print(f"approval-verify[{stack}]: {proc.stdout.strip()} {proc.stderr.strip()}", file=sys.stderr)
-              try:
-                  verdict = json.loads(proc.stdout)
-              except json.JSONDecodeError:
-                  verdict = {"deployment_authorization": "DENIED", "approval_status": "PENDING"}
-              entry["approval_status"] = verdict.get("approval_status", "PENDING")
-              entry["deployment_authorization"] = verdict.get("deployment_authorization", "DENIED")
-              merged[stack] = entry
 
           print("Aggregated deployment authorization:")
           print(json.dumps(merged, indent=2))
@@ -1162,6 +921,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"authorizations={json.dumps(merged)}\n")
           PY
+
 
   deploy:
     name: Deploy (gated) [${{ matrix.stack.name }}]
@@ -1171,30 +931,21 @@ jobs:
       matrix:
         stack: ${{ fromJSON(needs.detect-changes.outputs.stacks) }}
     # The `matrix` context is only available in `strategy` and `steps`, never
-    # in a job-level `if:` - so deployability (matrix.stack.deployable) and
-    # the workflow_dispatch aws-only restriction (matrix.stack.name) cannot be
-    # checked here. Both are instead enforced, per matrix instance, by steps
-    # below - "Verify deployment authorization for this stack" and
-    # "Verify the stack is deployable (trusted registry)" - which fail
+    # in a job-level `if:` - so deployability (matrix.stack.deployable) cannot
+    # be checked here. It is instead enforced, per matrix instance, by
+    # "Verify the stack is deployable (trusted registry)" below, which fails
     # closed before any Terraform command runs. Deliberately depends on
     # authorize-deploy's explicit result, never on cost-gate's raw pass/fail
     # (see the comment on authorize-deploy).
-    if: |
-      needs.authorize-deploy.result == 'success' && (
-        (github.event_name == 'push' &&
-         github.ref == 'refs/heads/main') ||
-        (github.event_name == 'workflow_dispatch' &&
-         inputs.deploy == true &&
-         inputs.cloud == 'aws')
-      )
+    if: github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'
     runs-on: ubuntu-latest
     environment:
-      name: ${{ (github.event_name == 'push' && 'dev') || (inputs.deploy_environment == 'prod' && 'production') || 'dev' }}
+      name: dev
     env:
-      # Resolved by a GitHub Actions expression, not shell interpolation. On
-      # push this is the literal 'dev' and inputs.* is never read, so the
-      # automatic path cannot resolve to prod even if an input were forged.
-      TARGET_ENV: ${{ (github.event_name == 'push' && 'dev') || inputs.deploy_environment }}
+      # This POC's PR-triggered flow deploys to dev only. A production
+      # tier would need its own Environment-gated job, not a workflow input -
+      # a workflow input cannot be trusted the way an Environment gate can.
+      TARGET_ENV: dev
       # Which stack this specific matrix job applies. Comes from the trusted
       # stacks JSON (registry + changed paths), never a workflow input, and is
       # re-verified against the registry file itself in the next step.
@@ -1237,22 +988,6 @@ jobs:
               )
           PY
 
-      - name: Pin and validate deployment target
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ matrix.stack.name }}" != "aws" ]; then
-            echo "::error title=Manual dispatch is aws-only::workflow_dispatch may only deploy the aws stack (got '${{ matrix.stack.name }}')."
-            exit 1
-          fi
-          if [ "${{ github.event_name }}" = "push" ] && [ "$TARGET_ENV" != "dev" ]; then
-            echo "::error title=Environment pin violated::Automatic push deployments are restricted to dev (got '$TARGET_ENV')."
-            exit 1
-          fi
-          case "$TARGET_ENV" in
-            dev|prod) echo "Deploying $DEPLOY_STACK to $TARGET_ENV" ;;
-            *) echo "::error title=Invalid environment::TARGET_ENV must be dev or prod (got '$TARGET_ENV')."; exit 1 ;;
-          esac
-
       # Independent re-check against config/finops-stacks.yml on the trusted
       # ref. A stack marked deployable=false can never be applied, whatever the
       # gate reported.
@@ -1275,7 +1010,7 @@ jobs:
                   f"::error title=Stack not deployable::Refusing to apply {name!r}. {reason}"
               )
           expected = os.environ["TARGET_ENV"]
-          if stack.get("environment") != expected and expected == "dev":
+          if stack.get("environment") != expected:
               sys.exit(
                   f"::error title=Environment mismatch::{name!r} targets "
                   f"{stack.get('environment')!r}, not {expected!r}."
@@ -1284,30 +1019,19 @@ jobs:
           print(f"state_key={stack['state_key']}")
           PY
 
-      # The deploy role is a single repo-level secret pointing at ONE
-      # environment's role (see backend/README.md "Why only two tiers").
-      # Applying prod with it would silently use dev's identity, so prod
-      # requires an explicit prod-specific secret instead of falling back.
+      # A single repo-level secret pointing at the dev deploy role (see
+      # backend/README.md "Why only two tiers").
       - name: Resolve deploy role for the target environment
         id: role
         env:
           DEV_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          PROD_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
         run: |
           set -euo pipefail
-          if [ "$TARGET_ENV" = "prod" ]; then
-            if [ -z "$PROD_ROLE" ]; then
-              echo "::error title=No production deploy role::AWS_DEPLOY_ROLE_ARN_PROD is not set. Refusing to deploy prod with dev's role. Apply backend/environments/prod first, then set that secret."
-              exit 1
-            fi
-            echo "arn=$PROD_ROLE" >> "$GITHUB_OUTPUT"
-          else
-            if [ -z "$DEV_ROLE" ]; then
-              echo "::error title=No deploy role::AWS_DEPLOY_ROLE_ARN is not set."
-              exit 1
-            fi
-            echo "arn=$DEV_ROLE" >> "$GITHUB_OUTPUT"
+          if [ -z "$DEV_ROLE" ]; then
+            echo "::error title=No deploy role::AWS_DEPLOY_ROLE_ARN is not set."
+            exit 1
           fi
+          echo "arn=$DEV_ROLE" >> "$GITHUB_OUTPUT"
 
       - uses: hashicorp/setup-terraform@v3
         with:

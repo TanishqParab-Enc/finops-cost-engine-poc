@@ -139,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     approve = sub.add_parser(
         "approve",
-        help="Record an APPROVE/REJECT decision for a BLOCKed evaluation (workflow_dispatch)",
+        help="Record an APPROVE/REJECT decision for a BLOCKed evaluation",
     )
     _add_config_arg(approve)
     approve.add_argument(
@@ -156,13 +156,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approve.add_argument(
         "--run-event", required=True,
-        help="GitHub-attested github.event_name of the approving run",
+        help="GitHub-attested github.event_name of the run (must be pull_request)",
     )
     approve.add_argument(
-        "--run-actor", required=True, help="GitHub-attested github.actor of the approving run"
-    )
-    approve.add_argument(
-        "--expected-approver", required=True, help="The only login permitted to approve"
+        "--approver", required=True,
+        help="Identity recorded as having approved (the configured FINOPS_APPROVER). The "
+             "real authorisation check already happened via the finops-cost-approval "
+             "Environment's required reviewer, not this value.",
     )
     approve.add_argument(
         "--max-incremental-cost", type=float, default=None, help="Approved cost ceiling"
@@ -173,26 +173,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     approval_verify = sub.add_parser(
         "approval-verify",
-        help="Re-verify a dispatch approval on trusted main against a fresh plan and estimate",
+        help="Re-verify an environment-gated approval against a plan and estimate",
     )
     _add_config_arg(approval_verify)
     approval_verify.add_argument(
-        "--decision", required=True, help="Path to the approval record from the approving run"
+        "--decision", required=True, help="Path to the approval record"
     )
-    approval_verify.add_argument("--plan", required=True, help="Fresh Terraform plan JSON")
-    approval_verify.add_argument("--estimate", required=True, help="Fresh cost-estimate.json")
+    approval_verify.add_argument("--plan", required=True, help="Terraform plan JSON")
+    approval_verify.add_argument("--estimate", required=True, help="cost-estimate.json")
     approval_verify.add_argument("--pr", type=int, default=None, help="Pull request number")
     approval_verify.add_argument("--head-sha", default=None, help="Approved PR head commit SHA")
     approval_verify.add_argument("--stack", default=None, help="Stack being deployed")
     approval_verify.add_argument("--terraform-dir", default=None, help="Terraform root being applied")
     approval_verify.add_argument(
-        "--run-event", default=None, help="Attested event of the approving run"
-    )
-    approval_verify.add_argument(
-        "--run-actor", default=None, help="Attested actor of the approving run"
-    )
-    approval_verify.add_argument(
-        "--expected-approver", default=None, help="The only login permitted to approve"
+        "--run-event", default=None, help="Attested event of the approving run (must be pull_request)"
     )
     approval_verify.add_argument("--json", action="store_true")
 
@@ -462,13 +456,18 @@ def _rebuild_decision_from_result(result_raw: dict, config):
 
 
 def _cmd_approve(args: argparse.Namespace) -> int:
-    """Record the human APPROVE/REJECT choice made in a workflow_dispatch run.
+    """Record the human APPROVE/REJECT choice.
 
-    Both actions are verified identically - attested event, attested actor,
-    and an evaluation that really was a FAIL. Rejection is a deliberate
-    business outcome, so it exits 0 rather than masquerading as a system
-    failure; it simply mints no record, and nothing downstream can treat the
-    absence of a record as authorisation.
+    The identity check has already happened by the time this runs: it is
+    only ever invoked from the ``finops-approval`` job, which GitHub starts
+    only after the ``finops-cost-approval`` Environment's required reviewer
+    clicks Approve on this exact run - a Reject prevents these steps from
+    running at all. This function therefore only re-checks the channel
+    (must be a pull_request run) and the evaluation itself (must really be a
+    FAIL), never an actor - GitHub already is that check. Rejection is a
+    deliberate business outcome, so it exits 0 rather than masquerading as a
+    system failure; it simply mints no record, and nothing downstream can
+    treat the absence of a record as authorisation.
     """
     from .gate import (
         APPROVAL_APPROVED,
@@ -481,20 +480,10 @@ def _cmd_approve(args: argparse.Namespace) -> int:
 
     config = load_config(args.config)
 
-    if args.run_event != "workflow_dispatch":
+    if args.run_event != "pull_request":
         print(
-            f"::error::A decision must come from a workflow_dispatch run, not "
+            f"::error::A decision must come from a pull_request run, not "
             f"{args.run_event!r}.",
-            file=sys.stderr,
-        )
-        return EXIT_ERROR
-
-    actor = (args.run_actor or "").strip().lower()
-    expected = (args.expected_approver or "").strip().lower()
-    if not expected or actor != expected:
-        print(
-            f"::error::{args.run_actor!r} is not the authorised approver "
-            f"({args.expected_approver!r}). Refusing to record a decision.",
             file=sys.stderr,
         )
         return EXIT_ERROR
@@ -525,7 +514,7 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             "finops_decision": "BLOCK",
             "approval_status": APPROVAL_REJECTED,
             "deployment_authorization": "DENIED",
-            "rejected_by": args.run_actor,
+            "rejected_by": args.approver,
         }
         if args.json:
             print(json.dumps(payload))
@@ -536,7 +525,7 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             print(f"Terraform root:           {args.terraform_dir}")
             print(f"Incremental monthly cost: {estimate.currency} {incremental}")
             print(f"Threshold:                {estimate.currency} {threshold}")
-            print(f"Approval:                 {APPROVAL_REJECTED} by {args.run_actor}")
+            print(f"Approval:                 {APPROVAL_REJECTED} by {args.approver}")
             print("Deployment authorization: DENIED")
         return EXIT_PASS
 
@@ -551,10 +540,10 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         config,
         pr_number=args.pr,
         head_sha=args.head_sha,
-        approver=args.run_actor,
+        approver=args.approver,
         justification=(
-            f"Cost estimate explicitly approved by {args.run_actor} via "
-            f"workflow_dispatch on the FinOps Cost Gate workflow."
+            f"Cost estimate explicitly approved by {args.approver} via the "
+            f"finops-cost-approval GitHub Environment on the FinOps Cost Gate workflow."
         ),
         stack=args.stack,
         terraform_dir=args.terraform_dir,
@@ -590,11 +579,12 @@ def _cmd_approve(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_verify(args: argparse.Namespace) -> int:
-    """Trusted-main re-verification: the approval record is re-checked against
-    a plan and estimate computed fresh on THIS run, never the numbers the
-    approving run cached."""
+    """Re-verify an environment-gated approval record against a plan and
+    estimate. Not called by the workflow itself (the finops-approval job
+    consumes the same-run artifacts it mints directly), but kept as an
+    independently testable, standalone verification path."""
     from .gate import evaluate_approval
-    from .lock.exception import load_exception, verify_dispatch_approval
+    from .lock.exception import load_exception, verify_environment_approval
     from .plan.normalizer import load_plan_json
 
     config = load_config(args.config)
@@ -603,7 +593,7 @@ def _cmd_approval_verify(args: argparse.Namespace) -> int:
     plan_doc = load_plan_json(args.plan)
     estimate = _rebuild_estimate(args.estimate)
 
-    problems = verify_dispatch_approval(
+    problems = verify_environment_approval(
         record,
         plan,
         plan_doc,
@@ -614,8 +604,6 @@ def _cmd_approval_verify(args: argparse.Namespace) -> int:
         stack=args.stack,
         terraform_dir=args.terraform_dir,
         run_event=args.run_event,
-        run_actor=args.run_actor,
-        expected_approver=args.expected_approver,
     )
 
     states = evaluate_approval(
