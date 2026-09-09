@@ -392,6 +392,9 @@ jobs:
     name: Post-destroy verification
     needs: [validate-destroy, destroy]
     runs-on: ubuntu-latest
+    # Matches the deploy role's OIDC trust policy, which only trusts
+    # environment-scoped subjects (repo:...:environment:dev/production).
+    environment: ${{ inputs.environment }}
     steps:
       - name: Configure AWS credentials (OIDC, deploy role)
         uses: aws-actions/configure-aws-credentials@v4
