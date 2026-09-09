@@ -62,6 +62,9 @@ jobs:
   validate-destroy:
     name: Validate and plan destroy
     runs-on: ubuntu-latest
+    # Matches the deploy role's OIDC trust policy, which only trusts
+    # environment-scoped subjects (repo:...:environment:dev/production).
+    environment: ${{ inputs.environment }}
     outputs:
       terraform_dir: ${{ steps.resolve.outputs.terraform_dir }}
       state_key: ${{ steps.resolve.outputs.state_key }}
@@ -296,6 +299,9 @@ jobs:
     name: Apply destroy plan
     needs: [validate-destroy, destroy-approval]
     runs-on: ubuntu-latest
+    # Matches the deploy role's OIDC trust policy, which only trusts
+    # environment-scoped subjects (repo:...:environment:dev/production).
+    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
 
