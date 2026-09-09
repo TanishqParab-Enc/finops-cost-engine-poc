@@ -1,5 +1,6 @@
 terraform {
   # FinOps-controlled web-platform deployment root.
+  # Retrigger: rerun production pipeline after RDS Secrets Manager IAM fix.
   # 1.10+ matches the rest of the repository (see terraform/aws/main.tf).
   required_version = ">= 1.10.0, < 2.0.0"
 
