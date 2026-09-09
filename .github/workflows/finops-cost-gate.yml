@@ -545,7 +545,10 @@ jobs:
           # by default, which silently discarded the whole audit trail.
           include-hidden-files: true
 
-      # The gate is the last word: a non-zero exit stops the pipeline.
+      # The gate is the last word for a genuine failure. A threshold BLOCK
+      # (exit 1) is an expected governance state, not a process error, so it
+      # no longer fails this job - only exit code 2 (cost could not be
+      # trusted) still does.
       #   1 = threshold exceeded - the finops-approval job (gated by the
       #       finops-cost-approval Environment) pauses this same run next
       #   2 = cost could not be trusted, failing safe
@@ -559,8 +562,7 @@ jobs:
           case "$CODE" in
             0) echo "PASS - cost locked, pipeline may continue." ;;
             1)
-              echo "::error::FinOps threshold exceeded (finops_decision=BLOCK, approval_status=PENDING). This run's finops-approval job will pause for review in the finops-cost-approval Environment - see the approval request on the pull request."
-              exit 1
+              echo "::notice::FinOps threshold exceeded (finops_decision=BLOCK, approval_status=PENDING). This is an expected governance state, not a pipeline error - the finops-approval job will pause for review in the finops-cost-approval Environment - see the approval request on the pull request."
               ;;
             *) echo "::error::Cost could not be established. Failing safe (exit $CODE)."; exit 1 ;;
           esac

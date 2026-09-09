@@ -52,7 +52,7 @@ _SERVICE_BY_PREFIX = (
 _ACTION_LABEL = {
     Action.CREATE: "added",
     Action.UPDATE: "changed",
-    Action.DELETE: "removed",
+    Action.DELETE: "destroyed",
     Action.REPLACE: "replaced",
     Action.NOOP: "unchanged",
     Action.READ: "read",

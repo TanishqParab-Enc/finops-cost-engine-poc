@@ -17,12 +17,14 @@ from typing import Any
 
 from ...errors import CostEstimationError
 from ...models import (
+    Action,
     Cloud,
     CostComponent,
     CostConfidence,
     CostCoverage,
     CostEstimate,
     EstimatorTrust,
+    NormalizedPlan,
     ResourceCost,
 )
 from ...plan.normalizer import detect_cloud
@@ -371,13 +373,22 @@ def build_estimate(
     estimator_version: str = "",
     trust: EstimatorTrust = EstimatorTrust.AUTHORITATIVE,
     raw_reference: str | None = None,
+    plan: NormalizedPlan | None = None,
 ) -> CostEstimate:
     """Incremental cost = proposed total - baseline total.
 
     Verified against CLI v2.16.2: `scan` reports a breakdown only, so the diff
     is computed here rather than read from the tool.
+
+    ``plan`` is the same normalised Terraform plan the gate already parsed -
+    optional only for callers with no plan (e.g. a bare fixture). When given,
+    its per-address Terraform action (create/update/delete/replace) is
+    attached to each ``ResourceCost`` so reporting can label a destroyed
+    resource as "destroyed" rather than guessing from the sign of the delta
+    alone.
     """
     warnings: list[str] = list(proposed.warnings)
+    plan_actions: dict[str, Action] = {c.address: c.action for c in plan.changes} if plan else {}
 
     if proposed.total_monthly_cost is None:
         raise CostEstimationError(
@@ -432,6 +443,7 @@ def build_estimate(
                 delta_monthly_cost=delta,
                 confidence=source.confidence(),
                 components=(new_res or old_res).components,
+                action=plan_actions.get(address),
             )
         )
 

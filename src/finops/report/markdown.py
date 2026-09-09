@@ -36,8 +36,11 @@ def render_markdown(result: GateResult) -> str:
     lines: list[str] = [MARKER]
     decision = result.decision
     estimate = result.estimate
+    is_reduction = bool(estimate and estimate.incremental_monthly_cost < 0)
 
-    if result.status is Status.PASS:
+    if result.status is Status.PASS and is_reduction:
+        lines.append("## ✅ FinOps Cost Check Passed — Cost Reduction Detected")
+    elif result.status is Status.PASS:
         lines.append("## ✅ FinOps Cost Check Passed")
     elif result.status is Status.FAIL:
         lines.append("## ❌ FinOps Cost Check Failed")
@@ -53,7 +56,13 @@ def render_markdown(result: GateResult) -> str:
             "|---|---|",
             f"| Current monthly cost | {_money(as_float(estimate.previous_monthly_cost), currency)} |",
             f"| Projected monthly cost | {_money(as_float(estimate.new_monthly_cost), currency)} |",
-            f"| **Estimated monthly impact** | **{_money(as_float(estimate.incremental_monthly_cost), currency)}** |",
+            f"| **Monthly cost impact** | **{_money(as_float(estimate.incremental_monthly_cost), currency)}** |",
+        ]
+        if is_reduction:
+            lines.append(
+                f"| **Monthly savings** | **{_money(abs(as_float(estimate.incremental_monthly_cost)), currency)}** |"
+            )
+        lines += [
             f"| Threshold ({decision.metric}) | {_money(as_float(decision.threshold_value), currency)} |",
             f"| Comparison | `observed {decision.comparison} threshold` |",
             f"| Status | **{decision.status.value}** |",
@@ -65,7 +74,19 @@ def render_markdown(result: GateResult) -> str:
         lines.append("")
 
     if result.status is Status.PASS:
-        lines.append("Cost has been locked for this CI/CD execution.")
+        if is_reduction:
+            lines += [
+                "### Cost reduction detected",
+                "",
+                "This change reduces prospective monthly cloud cost - Terraform resource "
+                "removals were priced as negative cost, not zero. No cost approval is "
+                "required for savings.",
+                "",
+                "This savings has been locked to the exact reviewed plan so the deployment "
+                "can proceed - no additional spend was approved or requires review.",
+            ]
+        else:
+            lines.append("Cost has been locked for this CI/CD execution.")
         if result.cost_lock:
             lines.append("")
             lines.append(f"`lock_id: {result.cost_lock.get('lock_id')}`")

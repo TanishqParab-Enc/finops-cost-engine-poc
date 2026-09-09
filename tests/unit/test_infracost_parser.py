@@ -13,7 +13,7 @@ from finops.cost.infracost.parser import (
     parse_v2,
 )
 from finops.errors import CostEstimationError
-from finops.models import Cloud, CostConfidence, EstimatorTrust
+from finops.models import Action, Cloud, CostConfidence, EstimatorTrust, NormalizedPlan, ResourceChange
 
 pytestmark = pytest.mark.unit
 
@@ -201,3 +201,60 @@ class TestBuildEstimate:
         estimate = build_estimate(parse_document(doc), None, "infracost")
         assert estimate.coverage.unsupported_resources == 2
         assert any("not supported" in w for w in estimate.warnings)
+
+    def test_malformed_price_string_is_treated_as_no_price_not_zero(self):
+        """A garbage/unparseable price must fail safe the same way a null
+        price does - it must never silently become a priced $0 resource."""
+        resource = v2_resource("aws_thing.x", "aws_thing", None, price="not-a-number")
+        parsed = parse_v2(v2_doc("0", [resource]))
+        entry = parsed.resources["aws_thing.x"]
+        assert entry.confidence() is CostConfidence.NO_PRICE
+        assert entry.monthly_cost is None
+
+    def test_plan_action_is_attached_to_destroyed_and_created_resources(self):
+        """The Terraform action (destroy/create/...) from the plan, not a
+        guess from the delta's sign, is what the report labels resources with."""
+        proposed = parse_document(
+            v2_doc("50", [v2_resource("aws_instance.new", "aws_instance", "50")])
+        )
+        baseline = parse_document(
+            v2_doc("70", [v2_resource("aws_instance.old", "aws_instance", "70")])
+        )
+        plan = NormalizedPlan(
+            terraform_version="1.11.0",
+            format_version="1.2",
+            clouds=[Cloud.AWS],
+            changes=[
+                ResourceChange(
+                    address="aws_instance.new",
+                    resource_type="aws_instance",
+                    name="new",
+                    cloud=Cloud.AWS,
+                    action=Action.CREATE,
+                ),
+                ResourceChange(
+                    address="aws_instance.old",
+                    resource_type="aws_instance",
+                    name="old",
+                    cloud=Cloud.AWS,
+                    action=Action.DELETE,
+                ),
+            ],
+        )
+        estimate = build_estimate(proposed, baseline, "infracost", plan=plan)
+        by_address = {r.address: r for r in estimate.resources}
+
+        created = by_address["aws_instance.new"]
+        destroyed = by_address["aws_instance.old"]
+        assert created.action is Action.CREATE
+        assert created.delta_monthly_cost == Decimal("50")
+        assert destroyed.action is Action.DELETE
+        assert destroyed.delta_monthly_cost == Decimal("-70")
+
+    def test_no_plan_leaves_action_unset(self):
+        """Backward compatible: a caller with no plan (e.g. a bare fixture)
+        still gets a valid estimate, just without a Terraform action label."""
+        proposed = parse_document(v2_doc("0", []))
+        baseline = parse_document(v2_doc("70", [v2_resource("aws_instance.a", "aws_instance", "70")]))
+        estimate = build_estimate(proposed, baseline, "infracost")
+        assert estimate.resources[0].action is None

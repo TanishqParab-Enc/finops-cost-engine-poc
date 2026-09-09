@@ -93,6 +93,35 @@ class TestCostReduction:
         decision = engine.evaluate(make_estimate(previous="500", new="120"), config)
         assert decision.status is Status.PASS
 
+    def test_large_reduction_passes_regardless_of_magnitude(self):
+        """A destroy's savings can vastly exceed the spend threshold - the
+        threshold governs incremental SPEND, never savings."""
+        decision = engine.evaluate(make_estimate(previous="1259.02", new="259.02"), make_config(threshold=100))
+        assert decision.status is Status.PASS
+        assert decision.observed_value == Decimal("-1000")
+
+    def test_full_teardown_passes_with_full_previous_cost_as_savings(self):
+        """The exact web-platform shape: current $259.02/month, projected $0
+        after a complete destroy."""
+        decision = engine.evaluate(make_estimate(previous="259.02", new="0"), make_config(threshold=100))
+        assert decision.status is Status.PASS
+        assert decision.observed_value == Decimal("-259.02")
+
+
+class TestMixedChanges:
+    def test_net_negative_mixed_change_passes(self):
+        """destroyed = -$100, created = +$30 -> net -$70 -> PASS."""
+        decision = engine.evaluate(make_estimate(previous="100", new="30"), make_config(threshold=100))
+        assert decision.status is Status.PASS
+        assert decision.observed_value == Decimal("-70")
+
+    def test_net_positive_mixed_change_blocks(self):
+        """destroyed = -$50, created = +$180 -> net +$130 -> BLOCK."""
+        decision = engine.evaluate(make_estimate(previous="50", new="180"), make_config(threshold=100))
+        assert decision.status is Status.FAIL
+        assert decision.observed_value == Decimal("130")
+        assert decision.exceeded_by == Decimal("30")
+
 
 class TestThresholdMetrics:
     def test_annual_metric(self):

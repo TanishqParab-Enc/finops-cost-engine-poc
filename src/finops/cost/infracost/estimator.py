@@ -42,6 +42,7 @@ class InfracostEstimator(CostEstimator):
             estimator_version=version.raw,
             trust=self.trust,
             raw_reference=str(self.artifact_dir) if self.artifact_dir else None,
+            plan=request.normalized_plan,
         )
 
     def _persist(self, document: dict, filename: str) -> None:
