@@ -30,6 +30,10 @@ class GateRequest:
     baseline_plan: Path | None = None
     commit: str = ""
     execution_id: str = ""
+    stack: str | None = None
+    # A lock authorises deployment. A stack that cannot be deployed must not
+    # mint one just because it priced under the threshold.
+    allow_cost_lock: bool = True
 
 
 def _resolve_identity(request: GateRequest) -> tuple[str, str]:
@@ -98,8 +102,10 @@ def run_gate(request: GateRequest, config: Config, estimator: CostEstimator) -> 
         result.errors.append(ai_error.to_dict())
         return result
 
-    if result.status is Status.PASS:
-        lock = create_cost_lock(decision, estimate, plan, config, commit, execution_id)
+    if result.status is Status.PASS and request.allow_cost_lock:
+        lock = create_cost_lock(
+            decision, estimate, plan, config, commit, execution_id, stack=request.stack
+        )
         write_cost_lock(lock, config)
         result.cost_lock = lock
 
@@ -148,3 +154,99 @@ def write_artifacts(result: GateResult, config: Config) -> dict[str, Path]:
         written["plan"] = plan_path
 
     return written
+
+
+def finops_decision_label(analyze_exit_code: int) -> str:
+    """PASS/BLOCK vocabulary for the decision itself. Independent of, and
+    never influenced by, deployment authorisation - an approved exception
+    changes what may deploy, never what the decision was."""
+    return "PASS" if analyze_exit_code == 0 else "BLOCK"
+
+
+def authorize_deployment(
+    *, analyze_exit_code: int, exception_valid: bool | None = None, lock_verified: bool = True,
+) -> str:
+    """AUTHORIZED or DENIED for a trusted `main` deployment.
+
+    Exactly two paths authorise deployment:
+      1. Normal: the fresh analyze run PASSed (exit_code 0) and, for a
+         deployable stack, its cost lock re-verified against the fresh plan.
+      2. Exception: the fresh analyze run was BLOCKed (exit_code 1) but a
+         freshly re-validated, peer-review-backed exception covers this
+         exact PR/head SHA/stack/cost. Re-validation (non-author reviewer,
+         allow-list, APPROVED state, expiry, integrity, cost ceiling, ...)
+         happens in verify_exception; this function only consumes its
+         boolean result.
+    Anything else - no exception, an invalid/stale one, or exit_code 2
+    (cost could not be trusted, e.g. a non-authoritative/mocked estimate) -
+    is DENIED. finops_decision is never rewritten by this function: a BLOCK
+    that is AUTHORIZED via exception is still a BLOCK.
+    """
+    if analyze_exit_code == 0:
+        return "AUTHORIZED" if lock_verified else "DENIED"
+    if analyze_exit_code == 1 and exception_valid:
+        return "AUTHORIZED"
+    return "DENIED"
+
+
+REJECTION_MESSAGE = "Deployment cancelled because the cost estimate was rejected."
+
+APPROVAL_NOT_REQUIRED = "NOT_REQUIRED"
+APPROVAL_PENDING = "PENDING"
+APPROVAL_APPROVED = "APPROVED"
+APPROVAL_REJECTED = "REJECTED"
+
+
+def evaluate_approval(
+    *,
+    analyze_exit_code: int,
+    approval_action: str | None = None,
+    approval_problems: list | None = None,
+    lock_verified: bool = True,
+) -> dict:
+    """The three states the pipeline reports, kept deliberately separate.
+
+    ``finops_decision`` is derived only from the cost evaluation and is never
+    rewritten by an approval - an approved overspend is still a BLOCK. Only
+    ``deployment_authorization`` moves.
+
+    ``approval_action`` is the human's explicit choice ('approve'/'reject')
+    from a workflow_dispatch run; ``approval_problems`` is the result of
+    re-verifying that approval's bindings. An approval that fails any binding
+    is not an approval - it leaves the change PENDING and DENIED rather than
+    silently authorising it.
+    """
+    decision = finops_decision_label(analyze_exit_code)
+
+    if analyze_exit_code == 0:
+        authorized = lock_verified
+        return {
+            "finops_decision": decision,
+            "approval_status": APPROVAL_NOT_REQUIRED,
+            "deployment_authorization": "AUTHORIZED" if authorized else "DENIED",
+        }
+
+    action = (approval_action or "").strip().lower()
+
+    if action == "reject":
+        return {
+            "finops_decision": decision,
+            "approval_status": APPROVAL_REJECTED,
+            "deployment_authorization": "DENIED",
+            "message": REJECTION_MESSAGE,
+        }
+
+    # exit_code 2 means the cost itself could not be trusted; no approval of a
+    # number we could not establish is meaningful.
+    if action == "approve" and analyze_exit_code == 1 and not approval_problems:
+        return {
+            "finops_decision": decision,
+            "approval_status": APPROVAL_APPROVED,
+            "deployment_authorization": "AUTHORIZED",
+        }
+
+    return {
+        "finops_decision": decision,
+        "approval_status": APPROVAL_PENDING,
+        "deployment_authorization": "DENIED",
+    }

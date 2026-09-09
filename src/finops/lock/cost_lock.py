@@ -43,6 +43,7 @@ def create_cost_lock(
     config: Config,
     commit: str,
     execution_id: str,
+    stack: str | None = None,
 ) -> dict:
     if decision.status is not Status.PASS:
         raise CostLockError(
@@ -61,6 +62,9 @@ def create_cost_lock(
         "schema_version": SCHEMA_VERSION,
         "lock_id": str(uuid.uuid4()),
         "status": "APPROVED",
+        # Which Terraform root this authorises. A lock for one stack must never
+        # be accepted for another.
+        "stack": stack,
         "commit": commit,
         "execution_id": execution_id,
         "timestamp": utc_now_iso(),
@@ -104,9 +108,17 @@ def load_cost_lock(path: str | Path) -> dict:
         raise CostLockError(f"Cost lock {lock_path} is not valid JSON", detail=str(exc)) from exc
 
 
-def verify_cost_lock(lock: dict, plan: NormalizedPlan, config: Config) -> list[str]:
+def verify_cost_lock(
+    lock: dict, plan: NormalizedPlan, config: Config, stack: str | None = None
+) -> list[str]:
     """Return a list of problems. Empty means the lock is valid for this plan."""
     problems: list[str] = []
+
+    if stack is not None and lock.get("stack") != stack:
+        problems.append(
+            f"Lock was issued for stack {lock.get('stack')!r} and cannot authorise "
+            f"stack {stack!r}"
+        )
 
     if lock.get("schema_version") != SCHEMA_VERSION:
         problems.append(

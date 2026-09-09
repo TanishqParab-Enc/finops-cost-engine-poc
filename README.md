@@ -381,6 +381,16 @@ Each cost-gate job checks out **both** the base branch and the PR head, plans bo
 
 Business logic lives in the Python package; the workflow only orchestrates — so the same engine runs unchanged in any CI system.
 
+### Test infrastructure destruction
+
+[.github/workflows/terraform-test-destroy.yml](.github/workflows/terraform-test-destroy.yml) is a separate, **manual-only** (`workflow_dispatch`) workflow for intentionally tearing down a deployable test stack such as `web-platform` in `dev`. It is never part of the FinOps Cost Gate and never runs on push or pull_request.
+
+- Requires typing `DESTROY` (exact match) plus choosing the stack/environment from fixed, registry-backed dropdowns — no free-text Terraform directory can be entered.
+- Uses the same GitHub OIDC deploy role and remote S3 backend/state convention as `finops-cost-gate.yml`'s `deploy` job (state key resolved only from `config/finops-stacks.yml`, never hand-typed).
+- A `terraform plan -destroy` is generated and uploaded as an artifact *before* any approval is requested; a human then reviews it and approves via the `finops-destroy-approval` GitHub Environment (never a PR comment — there is no PR here).
+- The `destroy` job re-verifies the downloaded plan's SHA-256 fingerprint and stack/environment metadata against what was approved, then applies **exactly** that saved plan — it never re-plans immediately before applying.
+- Structurally cannot destroy the backend/IAM/OIDC bootstrap infrastructure or the Terraform state bucket itself — it only ever touches the selected workload's own Terraform root and state key.
+
 ### Required repository settings
 
 | Type | Name | Notes |
