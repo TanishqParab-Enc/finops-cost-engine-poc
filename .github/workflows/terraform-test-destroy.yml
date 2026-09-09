@@ -1,0 +1,488 @@
+name: Terraform Test Stack Destroy
+
+# Controlled, manual-only destruction of a TEST/DEPLOYABLE workload stack
+# (e.g. web-platform/dev). Deliberately separate from finops-cost-gate.yml -
+# this workflow never runs on push or pull_request, never touches the
+# approval architecture that gates deployment, and can never destroy the
+# backend/IAM/OIDC bootstrap infrastructure (it only ever inits/plans/applies
+# the selected workload's own Terraform root and remote state key, resolved
+# from config/finops-stacks.yml - never backend/, never the bootstrap layer).
+#
+# Stages (three jobs, strictly sequential):
+#   validate-destroy   - resolve + validate the stack, plan -destroy, upload
+#                         the saved plan + a readable copy + its fingerprint
+#   destroy-approval   - GitHub Environment gate (finops-destroy-approval);
+#                         pauses this same run for a human Approve/Reject
+#   destroy            - re-verifies the downloaded plan's fingerprint, then
+#                         applies EXACTLY that saved plan (never re-plans)
+#
+# A fourth job (post-destroy-verify) then runs read-only AWS checks to
+# confirm the expected resources are gone and nothing outside scope changed.
+
+# Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
+"on":
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: Stack to destroy (must be deployable in config/finops-stacks.yml)
+        required: true
+        type: choice
+        options:
+          - web-platform
+      environment:
+        description: Environment to destroy
+        required: true
+        type: choice
+        options:
+          - dev
+      confirmation:
+        description: "Type DESTROY (exactly, all caps) to confirm"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # required for AWS OIDC
+
+env:
+  TERRAFORM_VERSION: '1.11.0'
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: '024125831628'
+  # This literal must never be the resolved state key for any stack - it is
+  # the BACKEND layer's own state, never a workload's.
+  FORBIDDEN_STATE_KEY: finops-poc/dev/terraform.tfstate
+
+# Never let a destroy race a deploy (or another destroy) against the same
+# workload's state.
+concurrency:
+  group: terraform-test-destroy-${{ inputs.stack }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-destroy:
+    name: Validate and plan destroy
+    runs-on: ubuntu-latest
+    outputs:
+      terraform_dir: ${{ steps.resolve.outputs.terraform_dir }}
+      state_key: ${{ steps.resolve.outputs.state_key }}
+      var_file: ${{ steps.resolve.outputs.var_file }}
+      plan_sha256: ${{ steps.fingerprint.outputs.plan_sha256 }}
+    steps:
+      - name: Fail closed unless confirmation is exactly DESTROY
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION" != "DESTROY" ]; then
+            echo "::error title=Confirmation required::Input 'confirmation' must be exactly DESTROY. Got: '$CONFIRMATION'"
+            exit 1
+          fi
+          echo "Confirmed: DESTROY typed exactly."
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      # Resolves ONLY from the trusted registry file - a workflow_dispatch
+      # input picks a stack NAME, never a Terraform directory or state key
+      # directly, so this step is the only place those paths are decided.
+      - name: Resolve and validate stack from the trusted registry
+        id: resolve
+        env:
+          STACK: ${{ inputs.stack }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          import yaml
+
+          stack_name = os.environ["STACK"]
+          environment = os.environ["ENVIRONMENT"]
+          forbidden_key = os.environ["FORBIDDEN_STATE_KEY"]
+
+          registry = yaml.safe_load(open("config/finops-stacks.yml", encoding="utf-8"))
+          stack = (registry.get("stacks") or {}).get(stack_name)
+
+          if stack is None:
+              sys.exit(f"::error title=Unknown stack::{stack_name!r} is not in config/finops-stacks.yml.")
+
+          if not stack.get("deployable"):
+              sys.exit(f"::error title=Stack not deployable::{stack_name!r} is not marked deployable; refusing to destroy infrastructure that was never authorized to be created.")
+
+          registry_env = stack.get("environment")
+          if registry_env != environment:
+              sys.exit(f"::error title=Environment mismatch::{stack_name!r} is registered for environment {registry_env!r}, not {environment!r}.")
+
+          if environment != "dev":
+              sys.exit(f"::error title=Environment not allowed::Only 'dev' is an approved destroy target for this workflow. Got {environment!r}.")
+
+          state_key = stack["state_key"]
+          if state_key == forbidden_key:
+              sys.exit(f"::error title=Forbidden state key::Resolved state key {state_key!r} matches the backend layer's own state. Refusing to proceed.")
+          if not state_key.startswith(f"finops-poc/{environment}/{stack_name}/"):
+              sys.exit(f"::error title=Unexpected state key::Resolved state key {state_key!r} does not match the expected finops-poc/{environment}/{stack_name}/... shape.")
+
+          terraform_dir = stack["terraform_dir"]
+          var_file = stack.get("var_file") or ""
+
+          print(f"Stack={stack_name!r} environment={environment!r} terraform_dir={terraform_dir!r} state_key={state_key!r}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"terraform_dir={terraform_dir}\n")
+              out.write(f"state_key={state_key}\n")
+              out.write(f"var_file={var_file}\n")
+          PY
+
+      - name: Configure AWS credentials (OIDC, deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-test-destroy-${{ inputs.stack }}-${{ github.run_id }}
+
+      # Fails closed rather than silently planning/destroying in the wrong
+      # account or region.
+      - name: Verify AWS account and region
+        run: |
+          set -euo pipefail
+          IDENTITY=$(aws sts get-caller-identity --output json)
+          echo "$IDENTITY"
+          ACCOUNT=$(echo "$IDENTITY" | python3 -c "import json,sys;print(json.load(sys.stdin)['Account'])")
+          if [ "$ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+            echo "::error title=Unexpected AWS account::Resolved account $ACCOUNT does not match the required $AWS_ACCOUNT_ID."
+            exit 1
+          fi
+          if [ "$AWS_REGION" != "us-east-1" ]; then
+            echo "::error title=Unexpected AWS region::AWS_REGION is $AWS_REGION, not us-east-1."
+            exit 1
+          fi
+          echo "Confirmed: account $ACCOUNT, region $AWS_REGION."
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      # Partial backend config supplied ONLY here, at init time, from the
+      # trusted registry's own state_key - the same convention the deploy job
+      # in finops-cost-gate.yml uses. No -backend=false fallback exists: if
+      # this init fails, the job fails closed instead of silently falling
+      # back to a local backend.
+      - name: Terraform init (remote S3 backend, resolved state key)
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        env:
+          STATE_KEY: ${{ steps.resolve.outputs.state_key }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform plan (destroy mode)
+        id: plan
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        env:
+          VAR_FILE: ${{ steps.resolve.outputs.var_file }}
+        run: |
+          set -euo pipefail
+          VAR_ARG=""
+          if [ -n "$VAR_FILE" ] && [ -f "$VAR_FILE" ]; then
+            VAR_ARG="-var-file=$VAR_FILE"
+          fi
+          terraform plan -destroy -input=false -no-color -lock-timeout=5m \
+            $VAR_ARG \
+            -out=destroy.tfplan
+          terraform show -no-color destroy.tfplan > destroy-plan.txt
+          terraform show -json destroy.tfplan > destroy-plan.json
+
+          COUNT=$(python3 -c "import json;d=json.load(open('destroy-plan.json'));print(sum(1 for c in d.get('resource_changes',[]) if 'delete' in c['change']['actions']))")
+          echo "destroy_count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Planned resources to destroy: $COUNT"
+
+          if [ "$COUNT" = "0" ]; then
+            echo "::error title=Nothing to destroy::The plan would destroy 0 resources - the stack may already be empty or the state key may be wrong. Refusing to proceed."
+            exit 1
+          fi
+
+      # A hash of the exact saved binary plan - re-verified byte-for-byte in
+      # the destroy job before apply, so approval can never be redirected to
+      # a different plan than the one actually reviewed.
+      - name: Compute destroy plan fingerprint
+        id: fingerprint
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        run: |
+          set -euo pipefail
+          SHA=$(sha256sum destroy.tfplan | cut -d' ' -f1)
+          echo "plan_sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Plan fingerprint (sha256): $SHA"
+
+      - name: Write destroy metadata
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        env:
+          STACK: ${{ inputs.stack }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          STATE_KEY: ${{ steps.resolve.outputs.state_key }}
+          PLAN_SHA256: ${{ steps.fingerprint.outputs.plan_sha256 }}
+          DESTROY_COUNT: ${{ steps.plan.outputs.destroy_count }}
+        run: |
+          set -euo pipefail
+          cat > destroy-metadata.json <<EOF
+          {
+            "stack": "${STACK}",
+            "environment": "${ENVIRONMENT}",
+            "state_key": "${STATE_KEY}",
+            "plan_sha256": "${PLAN_SHA256}",
+            "destroy_count": ${DESTROY_COUNT},
+            "run_id": "${{ github.run_id }}",
+            "requested_by": "${{ github.actor }}"
+          }
+          EOF
+          cat > destroy-summary.md <<EOF
+          ### Destroy plan summary
+
+          | | |
+          |---|---|
+          | Stack | ${STACK} |
+          | Environment | ${ENVIRONMENT} |
+          | State key | \`${STATE_KEY}\` |
+          | Resources to destroy | ${DESTROY_COUNT} |
+          | Plan fingerprint (sha256) | \`${PLAN_SHA256}\` |
+          | Requested by | ${{ github.actor }} |
+
+          Review \`destroy-plan.txt\` in this run's artifacts before approving.
+          EOF
+          cat destroy-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload destroy plan and metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-destroy-${{ inputs.stack }}-${{ inputs.environment }}-${{ github.run_id }}
+          path: |
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy.tfplan
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy-plan.txt
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy-metadata.json
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy-summary.md
+          retention-days: 90
+
+  # THE APPROVAL GATE. Runs only after the destroy plan above has already
+  # been generated and uploaded - a reviewer opens this run, downloads the
+  # artifact, reads destroy-plan.txt, and only then approves or rejects via
+  # the Environment's required-reviewer rule (never a PR comment - there is
+  # no PR here). A Reject stops the run before `destroy` ever executes.
+  destroy-approval:
+    name: "Manual destroy approval (finops-destroy-approval)"
+    needs: validate-destroy
+    runs-on: ubuntu-latest
+    environment:
+      name: finops-destroy-approval
+    steps:
+      - name: Record what is being approved
+        run: |
+          echo "Stack: ${{ inputs.stack }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Plan fingerprint: ${{ needs.validate-destroy.outputs.plan_sha256 }}"
+          echo "Review the uploaded destroy-plan.txt artifact from this run before approving."
+
+  destroy:
+    name: Apply destroy plan
+    needs: [validate-destroy, destroy-approval]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the exact approved destroy plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-destroy-${{ inputs.stack }}-${{ inputs.environment }}-${{ github.run_id }}
+          path: downloaded-plan
+
+      # Defense in depth: even though destroy-approval already gated on the
+      # plan produced by validate-destroy, re-verify the downloaded plan's
+      # own hash and metadata match what was approved before ever applying -
+      # never trust an artifact without re-checking it first.
+      - name: Verify plan fingerprint and stack/environment metadata match
+        env:
+          EXPECTED_SHA: ${{ needs.validate-destroy.outputs.plan_sha256 }}
+          EXPECTED_STACK: ${{ inputs.stack }}
+          EXPECTED_ENVIRONMENT: ${{ inputs.environment }}
+          EXPECTED_STATE_KEY: ${{ needs.validate-destroy.outputs.state_key }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(sha256sum downloaded-plan/destroy.tfplan | cut -d' ' -f1)
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error title=Plan fingerprint mismatch::Downloaded plan sha256 ($ACTUAL_SHA) does not match the approved plan ($EXPECTED_SHA). Refusing to apply."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          meta = json.load(open("downloaded-plan/destroy-metadata.json"))
+          expected = {
+              "stack": os.environ["EXPECTED_STACK"],
+              "environment": os.environ["EXPECTED_ENVIRONMENT"],
+              "state_key": os.environ["EXPECTED_STATE_KEY"],
+          }
+          for key, value in expected.items():
+              if meta.get(key) != value:
+                  sys.exit(f"::error title=Metadata mismatch::{key}={meta.get(key)!r} does not match expected {value!r}.")
+          print("Confirmed: plan fingerprint and metadata match the approved destroy plan.")
+          PY
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC, deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-test-destroy-apply-${{ inputs.stack }}-${{ github.run_id }}
+
+      # Same remote backend/key the plan was produced against - reinitialized
+      # fresh in this job, never assumed to still be configured from job 1
+      # (each job runs on its own clean runner).
+      - name: Terraform init (same remote backend/state key)
+        working-directory: ${{ needs.validate-destroy.outputs.terraform_dir }}
+        env:
+          STATE_KEY: ${{ needs.validate-destroy.outputs.state_key }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      # Applies EXACTLY the saved, approved, fingerprint-verified plan file -
+      # never a freshly generated one. A saved-plan apply never prompts
+      # interactively (that prompt only exists for an unsaved/interactive
+      # apply), so no -auto-approve flag is used or needed here; the actual
+      # authorization step already happened at destroy-approval's Environment
+      # gate above, matching the same saved-plan pattern the `deploy` job in
+      # finops-cost-gate.yml already uses for applies.
+      - name: Terraform apply (saved destroy plan only)
+        working-directory: ${{ needs.validate-destroy.outputs.terraform_dir }}
+        run: |
+          set -euo pipefail
+          cp "$GITHUB_WORKSPACE/downloaded-plan/destroy.tfplan" ./destroy.tfplan
+          terraform apply -input=false -no-color -lock-timeout=5m destroy.tfplan
+
+  post-destroy-verify:
+    name: Post-destroy verification
+    needs: [validate-destroy, destroy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC, deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-test-destroy-verify-${{ inputs.stack }}-${{ github.run_id }}
+
+      # Read-only. Confirms the workload is actually gone and, just as
+      # importantly, that the backend/IAM/OIDC bootstrap infrastructure and
+      # the Terraform state bucket itself were never touched by this
+      # workflow - it never has credentials or Terraform roots that could
+      # reach them in the first place, this simply proves it.
+      - name: Verify web-platform resources are gone (read-only)
+        if: inputs.stack == 'web-platform'
+        run: |
+          set -euo pipefail
+          echo "## Post-destroy verification: web-platform" >> "$GITHUB_STEP_SUMMARY"
+          FAILED=0
+
+          # For resources that return a non-zero exit code once gone.
+          check_absent() {
+            local label="$1"; shift
+            if "$@" >/dev/null 2>&1; then
+              echo "::error title=Resource still present::${label} still exists after destroy."
+              echo "- ❌ ${label}: STILL PRESENT" >> "$GITHUB_STEP_SUMMARY"
+              FAILED=1
+            else
+              echo "- ✅ ${label}: absent" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          # For list/describe calls that succeed with an empty result instead
+          # of erroring once the resource is gone - checks the output itself.
+          check_empty() {
+            local label="$1"; shift
+            local output
+            output=$("$@" 2>/dev/null || true)
+            if [ -n "$output" ] && [ "$output" != "None" ] && [ "$output" != "[]" ]; then
+              echo "::error title=Resource still present::${label} still exists after destroy."
+              echo "- ❌ ${label}: STILL PRESENT" >> "$GITHUB_STEP_SUMMARY"
+              FAILED=1
+            else
+              echo "- ✅ ${label}: absent" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          check_absent "S3 workload bucket (webplatform-dev-assets)" \
+            aws s3api head-bucket --bucket webplatform-dev-assets
+          check_absent "IAM instance role (webplatform-dev-instance-role)" \
+            aws iam get-role --role-name webplatform-dev-instance-role
+          check_absent "IAM instance profile (webplatform-dev-instance-profile)" \
+            aws iam get-instance-profile --instance-profile-name webplatform-dev-instance-profile
+          check_absent "RDS instance (webplatform-dev-db)" \
+            aws rds describe-db-instances --db-instance-identifier webplatform-dev-db
+
+          check_empty "Auto Scaling Group (webplatform-dev-asg)" \
+            aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names webplatform-dev-asg --query "AutoScalingGroups[0].AutoScalingGroupName" --output text
+          check_empty "CloudWatch log group (/aws/webplatform-dev/application)" \
+            aws logs describe-log-groups --log-group-name-prefix /aws/webplatform-dev/application --query "logGroups[0].logGroupName" --output text
+          check_empty "VPC (tag Name=webplatform-dev-vpc)" \
+            aws ec2 describe-vpcs --filters "Name=tag:Name,Values=webplatform-dev-vpc" --query "Vpcs[0].VpcId" --output text
+          check_empty "ALB (webplatform-dev-alb)" \
+            aws elbv2 describe-load-balancers --names webplatform-dev-alb --query "LoadBalancers[0].LoadBalancerArn" --output text
+          check_empty "Route53 hosted zone (webplatform-dev.finops-poc-test.com)" \
+            aws route53 list-hosted-zones-by-name --dns-name webplatform-dev.finops-poc-test.com --query "HostedZones[0].Id" --output text
+          check_empty "CloudFront distribution (origin webplatform-dev-alb)" \
+            aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'webplatform-dev-alb')].Id | [0]" --output text
+
+          if [ "$FAILED" != "0" ]; then
+            echo "::error title=Post-destroy verification failed::One or more resources are still present."
+            exit 1
+          fi
+          echo "Confirmed: expected web-platform resources are absent."
+
+      - name: Verify Terraform state bucket and backend infrastructure untouched
+        env:
+          STATE_KEY: ${{ needs.validate-destroy.outputs.state_key }}
+        run: |
+          set -euo pipefail
+          echo "## Backend/state verification" >> "$GITHUB_STEP_SUMMARY"
+
+
+          aws s3api head-bucket --bucket "${{ vars.TF_STATE_BUCKET }}"
+          echo "- ✅ Terraform state bucket (${{ vars.TF_STATE_BUCKET }}) still exists" >> "$GITHUB_STEP_SUMMARY"
+
+          # A destroyed stack's own state object may legitimately still exist
+          # (now describing zero resources) or be absent, depending on
+          # whether Terraform deletes an emptied state object - either is
+          # fine; this only confirms the bucket/key are still reachable, not
+          # that a specific object exists.
+          if aws s3api head-object --bucket "${{ vars.TF_STATE_BUCKET }}" --key "$STATE_KEY" >/dev/null 2>&1; then
+            echo "- ℹ️ State object $STATE_KEY still exists (now describing an empty stack)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- ℹ️ State object $STATE_KEY is absent (project convention removes empty stack state)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          aws iam get-role --role-name finops-poc-dev-deploy-role >/dev/null
+          aws iam get-role --role-name finops-poc-dev-plan-role >/dev/null
+          echo "- ✅ IAM/OIDC backend roles (finops-poc-dev-deploy-role, finops-poc-dev-plan-role) still exist, untouched" >> "$GITHUB_STEP_SUMMARY"

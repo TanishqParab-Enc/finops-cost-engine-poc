@@ -10,6 +10,21 @@
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
+# Default AWS-managed keys the workload's RDS instance uses when it doesn't
+# specify its own kms_key_id/master_user_secret_kms_key_id. Referenced by ARN
+# (not alias) below so the grant is scoped to these two specific keys rather
+# than "*", per the narrowest-fix requirement - no customer CMK is created,
+# and none of the default key's own policy needs to change.
+data "aws_kms_key" "workload_rds_default" {
+  count  = var.workload_name_prefix != "" ? 1 : 0
+  key_id = "alias/aws/rds"
+}
+
+data "aws_kms_key" "workload_secretsmanager_default" {
+  count  = var.workload_name_prefix != "" ? 1 : 0
+  key_id = "alias/aws/secretsmanager"
+}
+
 locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
@@ -141,6 +156,24 @@ data "aws_iam_policy_document" "plan_read" {
       resources = ["arn:${local.partition}:s3:::${var.state_bucket_name}"]
     }
   }
+
+  # terraform plan also evaluates aws_kms_key data sources (see
+  # modules/database/main.tf), so the plan role needs read-only access to the
+  # same two keys the deploy role can act on - describe only, never
+  # decrypt/grant, which stay deploy-time-only permissions.
+  dynamic "statement" {
+    for_each = var.workload_name_prefix != "" ? [1] : []
+
+    content {
+      sid     = "ReadWorkloadDefaultKmsKeysForPlan"
+      effect  = "Allow"
+      actions = ["kms:DescribeKey"]
+      resources = [
+        data.aws_kms_key.workload_rds_default[0].arn,
+        data.aws_kms_key.workload_secretsmanager_default[0].arn,
+      ]
+    }
+  }
 }
 
 data "aws_iam_policy_document" "deploy_write" {
@@ -256,12 +289,14 @@ data "aws_iam_policy_document" "deploy_write" {
       actions = [
         "s3:CreateBucket",
         "s3:DeleteBucket",
+        "s3:ListBucket",
         "s3:GetBucket*",
         "s3:PutBucket*",
         "s3:GetEncryptionConfiguration",
         "s3:PutEncryptionConfiguration",
         "s3:GetLifecycleConfiguration",
         "s3:PutLifecycleConfiguration",
+        "s3:GetAccelerateConfiguration",
         "s3:PutBucketVersioning",
         "s3:GetBucketVersioning",
       ]
@@ -304,6 +339,34 @@ data "aws_iam_policy_document" "deploy_write" {
         "route53:ListTagsForResource",
       ]
       resources = ["*"]
+    }
+  }
+
+  # aws_db_instance.main uses storage_encrypted + manage_master_user_password
+  # with no customer CMK, so it relies on the account's default AWS-managed
+  # keys (alias/aws/rds, alias/aws/secretsmanager). Those keys are owned by
+  # AWS, not this account's IAM, so the deploy role still needs an explicit
+  # grant for the handful of actions RDS/Secrets Manager need it to take on
+  # its behalf - scoped to exactly these two key ARNs, never "*".
+  dynamic "statement" {
+    for_each = var.workload_name_prefix != "" ? [1] : []
+
+    content {
+      sid    = "ManageWorkloadDefaultKmsKeys"
+      effect = "Allow"
+      actions = [
+        "kms:DescribeKey",
+        "kms:CreateGrant",
+        "kms:ListGrants",
+        "kms:RevokeGrant",
+        "kms:GenerateDataKey",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:Decrypt",
+      ]
+      resources = [
+        data.aws_kms_key.workload_rds_default[0].arn,
+        data.aws_kms_key.workload_secretsmanager_default[0].arn,
+      ]
     }
   }
 

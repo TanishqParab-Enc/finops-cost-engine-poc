@@ -67,6 +67,7 @@ extra_deploy_actions = [
   "elasticloadbalancing:DescribeTargetGroupAttributes", "elasticloadbalancing:DescribeTargetHealth",
   "elasticloadbalancing:CreateListener", "elasticloadbalancing:DeleteListener",
   "elasticloadbalancing:ModifyListener", "elasticloadbalancing:DescribeListeners",
+  "elasticloadbalancing:DescribeListenerAttributes",
   "elasticloadbalancing:AddTags", "elasticloadbalancing:RemoveTags", "elasticloadbalancing:DescribeTags",
   "rds:CreateDBInstance", "rds:DeleteDBInstance", "rds:ModifyDBInstance",
   "rds:DescribeDBInstances", "rds:CreateDBSubnetGroup", "rds:DeleteDBSubnetGroup",
