@@ -297,6 +297,7 @@ data "aws_iam_policy_document" "deploy_write" {
         "s3:GetLifecycleConfiguration",
         "s3:PutLifecycleConfiguration",
         "s3:GetAccelerateConfiguration",
+        "s3:GetReplicationConfiguration",
         "s3:PutBucketVersioning",
         "s3:GetBucketVersioning",
       ]
