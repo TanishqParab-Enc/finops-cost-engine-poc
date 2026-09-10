@@ -5,7 +5,7 @@ environment        = "Dev"
 application_name   = "webplatform"
 availability_zones = ["us-east-1a", "us-east-1b"]
 
-instance_type    = "t3.large"
+instance_type    = "t3.xlarge"
 desired_capacity = 1
 min_capacity     = 1
 max_capacity     = 3
