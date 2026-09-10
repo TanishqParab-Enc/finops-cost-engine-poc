@@ -265,11 +265,28 @@ class TestWorkflowFileGovernanceParity:
 
     def test_workflow_dispatch_trigger_has_stack_and_environment_inputs(self, workflow):
         dispatch = workflow["on"]["workflow_dispatch"]
-        assert set(dispatch["inputs"]) == {"stack", "environment"}
+        assert set(dispatch["inputs"]) == {"stack", "environment", "apply"}
         assert dispatch["inputs"]["stack"]["required"] is True
         assert dispatch["inputs"]["environment"]["required"] is True
         # Free-text, not a hard-coded choice list of stack names.
         assert dispatch["inputs"]["stack"]["type"] == "string"
+
+    def test_apply_input_is_an_opt_in_boolean(self, workflow):
+        apply_input = workflow["on"]["workflow_dispatch"]["inputs"]["apply"]
+        assert apply_input["type"] == "boolean"
+        assert apply_input["default"] is False
+
+    def test_apply_only_restricts_the_dispatch_path_and_never_the_pr_path(self, workflow):
+        """`apply` may only subtract from what a dispatch run does; it must
+        not appear as an alternative authorisation source, and must not be
+        consulted for a pull_request."""
+        condition = str(workflow["jobs"]["deploy"]["if"])
+        assert "inputs.apply == true" in condition
+        assert "github.event_name != 'workflow_dispatch' || inputs.apply == true" in condition
+        # authorize-deploy remains the only authorisation source.
+        assert "needs.authorize-deploy.result == 'success'" in condition
+        for job in ("cost-gate", "collect-blocked-stacks", "authorize-deploy"):
+            assert "inputs.apply" not in str(workflow["jobs"][job]["if"])
 
     @pytest.mark.parametrize(
         "job_name",
@@ -302,3 +319,200 @@ class TestWorkflowFileGovernanceParity:
         assert "vars.TF_STATE_BUCKET" in script
         assert "STATE_KEY" in script
         assert baseline_step["env"]["STATE_KEY"] == "${{ matrix.stack.state_key }}"
+
+
+class TestRealRegistryResolvesTheDispatchedStack:
+    """Runtime-path regression: the values the workflow actually feeds into
+    `working-directory` and the S3 `-backend-config` come from the committed
+    registry, so assert the committed registry itself, not a fixture."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def registry(cls) -> dict:
+        return load_stacks(REPO_ROOT / "config" / "finops-stacks.yml")
+
+    def test_web_platform_resolves_to_its_own_workload_root(self, registry):
+        assert registry["web-platform"].terraform_dir == "terraform/workloads/web-platform"
+
+    def test_web_platform_dev_resolves_to_its_own_remote_state_key(self, registry):
+        stack = registry["web-platform"]
+        assert stack.environment == "dev"
+        assert stack.state_key == "finops-poc/dev/web-platform/terraform.tfstate"
+
+    def test_no_registered_stack_points_at_a_bare_terraform_root(self, registry):
+        for stack in registry.values():
+            assert stack.terraform_dir not in ("terraform", "terraform/", ".")
+            assert stack.state_key, f"{stack.name} has no state_key"
+
+    def test_dispatched_stack_is_never_resolved_from_a_cloud_name(self, registry):
+        """`aws` is a registered STACK whose root happens to be terraform/aws.
+        It must not be reachable as a cloud-name fallback for another stack:
+        selecting web-platform must never yield the aws stack's root."""
+        assert registry["web-platform"].terraform_dir != registry["aws"].terraform_dir
+        assert registry["web-platform"].state_key != registry["aws"].state_key
+
+
+class TestNoLegacyCloudDispatchPath:
+    """Root-cause regression for the failed run on main, which used a legacy
+    `cloud`-choice dispatch that planned terraform/aws over a local backend
+    and produced only `aws_instance.app[0]`."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def workflow(cls) -> dict:
+        return yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def raw(cls) -> str:
+        return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    def test_dispatch_has_no_cloud_or_deploy_inputs(self, workflow):
+        inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+        for legacy in ("cloud", "deploy", "deploy_environment"):
+            assert legacy not in inputs
+
+    def test_no_job_matrixes_over_cloud_names(self, raw):
+        assert "matrix.cloud" not in raw
+        assert "options: [aws, azure, gcp]" not in raw
+
+    def test_cost_gate_matrix_is_the_resolved_stack_registry_json(self, workflow):
+        matrix = workflow["jobs"]["cost-gate"]["strategy"]["matrix"]
+        assert "stack" in matrix
+        assert "needs.detect-changes.outputs.stacks" in str(matrix["stack"])
+
+    def test_plan_steps_use_the_resolved_stack_directory(self, workflow):
+        steps = workflow["jobs"]["cost-gate"]["steps"]
+        dirs = [s.get("working-directory", "") for s in steps]
+        assert "baseline/${{ matrix.stack.dir }}" in dirs
+        assert "head/${{ matrix.stack.dir }}" in dirs
+        # The only terraform/aws reference left must be explicitly guarded to
+        # the `aws` stack itself - never a fallback for another stack.
+        for step in steps:
+            if "terraform/aws" in str(step.get("working-directory", "")):
+                assert step.get("if") == "matrix.stack.name == 'aws'"
+
+    def test_deploy_job_applies_the_resolved_stack_directory(self, workflow):
+        steps = workflow["jobs"]["deploy"]["steps"]
+        dirs = [s.get("working-directory", "") for s in steps]
+        assert "${{ matrix.stack.dir }}" in dirs
+        assert not any(d == "terraform/aws" for d in dirs)
+
+    def test_deploy_backend_key_is_per_stack_and_per_environment(self, workflow):
+        steps = workflow["jobs"]["deploy"]["steps"]
+        init = next(
+            s for s in steps
+            if "terraform init" in str(s.get("run", "")) and "backend-config" in str(s.get("run", ""))
+        )
+        # The registry's own state_key - never a string rebuilt from the
+        # environment, which could drift from the key the gate baselined.
+        assert 'key=${{ matrix.stack.state_key }}' in init["run"]
+        assert 'backend "local"' not in init["run"]
+
+    def test_detect_changes_emits_state_key_on_both_trigger_paths(self, workflow):
+        steps = workflow["jobs"]["detect-changes"]["steps"]
+        detect = next(s for s in steps if s.get("id") == "detect")
+        script = detect["run"]
+        # workflow_dispatch branch resolves through the registry ...
+        assert "from finops.stacks import get_stack" in script
+        assert 'get_stack(stack_name)' in script
+        # ... and both branches publish the state_key the cost gate consumes.
+        assert script.count('"state_key"') >= 2
+
+    def test_dispatch_branch_hard_codes_no_stack_name(self, workflow):
+        steps = workflow["jobs"]["detect-changes"]["steps"]
+        detect = next(s for s in steps if s.get("id") == "detect")
+        script = detect["run"]
+        assert "web-platform" not in script
+        assert 'DISPATCH_STACK' in script or "os.environ" in script
+
+
+class TestSingleSharedPipeline:
+    """Both triggers must enter ONE pipeline: one cost gate, one approval
+    mechanism, one OIDC path, one apply. Never a parallel greenfield copy."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def workflow(cls) -> dict:
+        return yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    def _jobs_with(self, workflow, predicate) -> list[str]:
+        found = []
+        for name, job in workflow["jobs"].items():
+            for step in job.get("steps") or []:
+                if predicate(step):
+                    found.append(name)
+                    break
+        return found
+
+    def test_exactly_one_job_runs_terraform_apply(self, workflow):
+        appliers = self._jobs_with(
+            workflow, lambda s: "terraform apply" in str(s.get("run", ""))
+        )
+        assert appliers == ["deploy"]
+
+    def test_exactly_one_approval_environment_exists(self, workflow):
+        gated = {
+            name: job["environment"]
+            for name, job in workflow["jobs"].items()
+            if "environment" in job
+        }
+        approval = [n for n, e in gated.items() if "finops-cost-approval" in str(e)]
+        assert approval == ["finops-approval"]
+
+    def test_the_approval_environment_is_shared_by_both_triggers(self, workflow):
+        """finops-approval is not conditioned on the event type, so a BLOCK
+        from either trigger waits on the same Environment gate."""
+        job = workflow["jobs"]["finops-approval"]
+        assert job["environment"]["name"] == "finops-cost-approval"
+        assert "workflow_dispatch" not in str(job.get("if", ""))
+        assert "pull_request" not in str(job.get("if", ""))
+
+    def test_exactly_one_oidc_role_assumption_path_for_deployment(self, workflow):
+        steps = workflow["jobs"]["deploy"]["steps"]
+        creds = [s for s in steps if "configure-aws-credentials" in str(s.get("uses", ""))]
+        assert len(creds) == 1
+        assert "role-to-assume" in creds[0]["with"]
+        # No static credentials anywhere in the pipeline.
+        raw = WORKFLOW_PATH.read_text(encoding="utf-8")
+        assert "aws-access-key-id" not in raw
+        assert "aws-secret-access-key" not in raw
+
+    def test_oidc_role_is_not_branched_on_the_event_type(self, workflow):
+        steps = workflow["jobs"]["deploy"]["steps"]
+        creds = next(s for s in steps if "configure-aws-credentials" in str(s.get("uses", "")))
+        role = str(creds["with"]["role-to-assume"])
+        assert "workflow_dispatch" not in role
+        assert "pull_request" not in role
+
+    def test_proposed_cost_prices_the_complete_selected_stack(self, workflow):
+        """The proposed plan is the whole selected stack's Terraform root -
+        never a subset, a single resource, or another stack's root."""
+        steps = workflow["jobs"]["cost-gate"]["steps"]
+        proposed = next(
+            s for s in steps
+            if s.get("working-directory") == "head/${{ matrix.stack.dir }}"
+            and "terraform plan" in str(s.get("run", ""))
+        )
+        assert "-target" not in proposed["run"]
+        gate = next(s for s in steps if s.get("id") == "gate")
+        assert "matrix.stack.usage_file" in str(gate.get("env", {}))
+
+    def test_no_aws_instance_demo_resource_anywhere_in_the_pipeline(self, workflow):
+        raw = WORKFLOW_PATH.read_text(encoding="utf-8")
+        assert "aws_instance" not in raw
+
+    def test_baseline_comes_from_remote_state_not_git_branch_presence(self, workflow):
+        steps = workflow["jobs"]["cost-gate"]["steps"]
+        baseline_checkout = next(
+            s for s in steps
+            if "checkout" in str(s.get("uses", "")) and s.get("with", {}).get("path") == "baseline"
+        )
+        # Same commit as head - the baseline is NOT the base branch.
+        assert "ref" not in baseline_checkout["with"]
+        baseline = next(s for s in steps if s.get("id") == "baseline")
+        assert "terraform show -json > state.json" in baseline["run"]
+        assert "state_json_to_plan_json" in baseline["run"]
+        # The removed git-presence heuristic must not come back.
+        raw = WORKFLOW_PATH.read_text(encoding="utf-8")
+        assert "is_initial" not in raw

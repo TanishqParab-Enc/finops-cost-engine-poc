@@ -20,6 +20,8 @@ class FailureCategory(str, Enum):
 
 class FinOpsError(Exception):
     category = FailureCategory.POLICY
+    # Optional machine-readable sub-code, narrower than `category`.
+    code: str | None = None
 
     def __init__(self, message: str, *, detail: str | None = None) -> None:
         super().__init__(message)
@@ -27,11 +29,14 @@ class FinOpsError(Exception):
         self.detail = detail
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "category": self.category.value,
             "message": self.message,
             "detail": self.detail,
         }
+        if self.code is not None:
+            payload["code"] = self.code
+        return payload
 
 
 class ConfigurationError(FinOpsError):
@@ -54,6 +59,20 @@ class CostEstimationError(FinOpsError):
 
 class UnsupportedProviderError(CostEstimationError):
     """Plan contains a cloud provider the engine cannot price."""
+
+
+class BaselineUnavailableError(CostEstimationError):
+    """The deployed baseline could not be established, so no trustworthy
+    incremental cost exists.
+
+    Distinct from a genuinely greenfield stack: an accessible remote backend
+    holding no state yields a real, empty baseline (cost $0). This error only
+    covers the case where the expected remote backend/state could not be
+    accessed or validated at all - which must fail closed rather than be
+    silently priced as if nothing were deployed.
+    """
+
+    code = "BASELINE_UNAVAILABLE"
 
 
 class PolicyError(FinOpsError):

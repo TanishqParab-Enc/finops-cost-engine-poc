@@ -17,7 +17,7 @@ from pathlib import Path
 from .ai import factory as ai_factory
 from .config import Config
 from .cost.base import EstimationRequest, CostEstimator
-from .errors import FinOpsError
+from .errors import BaselineUnavailableError, FinOpsError
 from .lock.cost_lock import create_cost_lock, write_cost_lock
 from .models import GateResult, NormalizedPlan, Status
 from .plan.normalizer import normalize_plan_file
@@ -36,6 +36,12 @@ class GateRequest:
     # `proposed_plan` exactly as before. Optional and purely additive: a
     # caller that omits it gets the prior behaviour (no action wiring).
     action_plan: Path | None = None
+    # Fail closed when no baseline document was produced at all. A registered
+    # stack always has a real remote backend, so "no baseline document" means
+    # that backend could not be read - never that nothing is deployed. An
+    # accessible-but-empty backend still yields a baseline document (an empty
+    # one), which is how a genuine greenfield stack keeps pricing at $0.
+    require_baseline: bool = False
     commit: str = ""
     execution_id: str = ""
     stack: str | None = None
@@ -83,6 +89,27 @@ def run_gate(request: GateRequest, config: Config, estimator: CostEstimator) -> 
             action_plan = normalize_plan_file(request.action_plan)
         except FinOpsError:
             action_plan = None
+
+    if request.require_baseline and (
+        request.baseline_plan is None or not Path(request.baseline_plan).exists()
+    ):
+        exc = BaselineUnavailableError(
+            "Could not establish the deployed baseline cost for this stack",
+            detail=(
+                "The expected remote Terraform backend/state could not be read, so "
+                "the currently deployed cost is unknown. Refusing to treat an "
+                "unreadable backend as an empty one: no incremental cost is "
+                "trustworthy, no cost lock is minted and no deployment is "
+                "authorised. An accessible backend holding no state is a "
+                "different case and still prices as a $0 greenfield baseline."
+            ),
+        )
+        result.errors.append(exc.to_dict())
+        result.decision = policy_engine.evaluate(
+            estimate=_empty_estimate(config), config=config, upstream_errors=[exc]
+        )
+        result.status = Status.ERROR
+        return result
 
     try:
         estimator.preflight()

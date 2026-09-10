@@ -57,6 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
             "changes in the resource-level breakdown. Never used for pricing."
         ),
     )
+    analyze.add_argument(
+        "--require-baseline",
+        action="store_true",
+        help=(
+            "Fail closed when no baseline plan document was produced at all - "
+            "i.e. the stack's expected remote backend could not be read. An "
+            "accessible backend with no deployed state still produces an empty "
+            "baseline document and prices as a $0 greenfield baseline."
+        ),
+    )
     analyze.add_argument("--commit", default="", help="Commit SHA for the lock artifact")
     analyze.add_argument("--execution-id", default="", help="CI/CD execution id")
     analyze.add_argument(
@@ -237,6 +247,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             proposed_plan=Path(args.plan),
             baseline_plan=Path(args.baseline_plan) if args.baseline_plan else None,
             action_plan=Path(args.action_plan) if args.action_plan else None,
+            require_baseline=args.require_baseline,
             commit=args.commit,
             execution_id=args.execution_id,
             stack=args.stack,

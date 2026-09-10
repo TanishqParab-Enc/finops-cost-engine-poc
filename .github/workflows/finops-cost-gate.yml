@@ -34,6 +34,14 @@ name: FinOps Cost Gate
         description: "Environment this stack is registered for (e.g. dev)"
         required: true
         type: string
+      # Evaluate-only by default. Unchecked still runs the full governed
+      # chain (plan, Infracost, gate, report) but stops short of the deploy
+      # job - it never enables a shortcut around it.
+      apply:
+        description: "Apply the stack after it passes (or is approved through) the FinOps gate. Leave unchecked to evaluate cost only."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -263,21 +271,38 @@ jobs:
       # resource. This plan is NEVER used for pricing, the cost lock
       # fingerprint, or the AI prompt context - those keep using the
       # hermetic proposed plan exactly as before.
+      # FAIL CLOSED. A registered stack always has a real remote backend, so
+      # "could not read the backend" never means "nothing is deployed" - it
+      # means the deployed cost is UNKNOWN, and an unknown baseline must not
+      # be silently priced as $0 (that would understate every incremental
+      # cost and could mint a cost lock for an unreviewed delta). Hence no
+      # continue-on-error and no local-backend fallback anywhere in this
+      # step: if `init` cannot reach the expected bucket/key, the job fails.
+      #
+      # The greenfield case is DIFFERENT and still supported: `init` against
+      # an accessible backend that holds no state object yet succeeds, and
+      # `terraform show -json` then reports empty state, which reshapes into
+      # an empty (real, positively-established) baseline priced at $0.
       - name: Terraform plan (deployed target state = baseline cost)
         id: baseline
-        continue-on-error: true
         working-directory: baseline/${{ matrix.stack.dir }}
         env:
           STATE_KEY: ${{ matrix.stack.state_key }}
         run: |
           set -euo pipefail
-          terraform init -input=false -no-color \
+          if ! terraform init -input=false -no-color \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=${STATE_KEY}" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="use_lockfile=true" \
-            -backend-config="encrypt=true"
-          terraform show -json > state.json
+            -backend-config="encrypt=true"; then
+            echo "::error title=BASELINE_UNAVAILABLE::COST_ESTIMATION/BASELINE_UNAVAILABLE - could not initialise the expected remote backend for stack '${{ matrix.stack.name }}' (bucket=${{ vars.TF_STATE_BUCKET }}, key=${STATE_KEY}). The deployed cost is unknown, so the gate fails closed: no baseline, no cost lock, no deployment."
+            exit 1
+          fi
+          if ! terraform show -json > state.json; then
+            echo "::error title=BASELINE_UNAVAILABLE::COST_ESTIMATION/BASELINE_UNAVAILABLE - the remote state for stack '${{ matrix.stack.name }}' (key=${STATE_KEY}) could not be read or validated. Failing closed rather than assuming an empty baseline."
+            exit 1
+          fi
           python3 - <<'PY'
           import json
           import os
@@ -291,6 +316,17 @@ jobs:
           with open(out_path, "w", encoding="utf-8") as fh:
               json.dump(plan_doc, fh)
           PY
+
+      # Purely cosmetic: labels which resources this change actually touches
+      # in the report's breakdown. It never affects pricing, the threshold,
+      # the cost lock or the AI context, so unlike the baseline above it is
+      # explicitly allowed to fail without failing the gate.
+      - name: Terraform plan (real diff = resource action labels)
+        id: action-plan
+        continue-on-error: true
+        working-directory: baseline/${{ matrix.stack.dir }}
+        run: |
+          set -euo pipefail
           terraform plan -input=false -no-color -lock=false -refresh=false -out=action.tfplan
           terraform show -json action.tfplan > "$GITHUB_WORKSPACE/action-plan.json"
 
@@ -414,12 +450,15 @@ jobs:
           FINOPS_INFRACOST_USAGE_FILE: ${{ matrix.stack.usage_file && format('{0}/head/{1}', github.workspace, matrix.stack.usage_file) || '' }}
         run: |
           set +e
-          BASELINE_ARG=""
-          if [ -f "$GITHUB_WORKSPACE/baseline-plan.json" ]; then
-            BASELINE_ARG="--baseline-plan $GITHUB_WORKSPACE/baseline-plan.json"
-          else
-            echo "::error::Could not read the deployed Terraform state for stack '${{ matrix.stack.name }}' (state_key=${{ matrix.stack.state_key }}) to establish a baseline cost - proceeding as if no baseline exists, so the full proposed cost will be treated as incremental. See the 'Terraform plan (deployed target state = baseline cost)' step's own output for the actual error."
+          # Defence in depth: the baseline step above already fails the job if
+          # the backend is unreadable, so reaching here without a baseline
+          # document means something bypassed it. Fail closed either way -
+          # never fall through to "full proposed cost is the increment".
+          if [ ! -f "$GITHUB_WORKSPACE/baseline-plan.json" ]; then
+            echo "::error title=BASELINE_UNAVAILABLE::COST_ESTIMATION/BASELINE_UNAVAILABLE - no baseline document was produced for stack '${{ matrix.stack.name }}' (state_key=${{ matrix.stack.state_key }}). Refusing to price this change against an assumed-empty baseline. No cost lock is created and no deployment is authorised."
+            exit 1
           fi
+          BASELINE_ARG="--baseline-plan $GITHUB_WORKSPACE/baseline-plan.json"
 
           # Optional and purely additive: only affects which resources the
           # report lists as changed, never pricing/threshold/lock. Missing
@@ -441,6 +480,7 @@ jobs:
             --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
             $BASELINE_ARG \
             $ACTION_ARG \
+            --require-baseline \
             --stack "${{ matrix.stack.name }}" \
             $LOCK_ARG \
             --commit "${{ github.event.pull_request.head.sha || github.sha }}" \
@@ -944,19 +984,39 @@ jobs:
     # authorize-deploy itself succeeded (verified live on run 34197717116:
     # authorize-deploy succeeded after an approval, yet deploy still skipped
     # until this fix).
-    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.authorize-deploy.result == 'success'
+    # `apply` only ever SUBTRACTS from what a workflow_dispatch run may do:
+    # unchecked stops the run after the same governed evaluation, checked
+    # continues into this same job. It can never authorise a deploy on its
+    # own - authorize-deploy's result is still the gate - and it is not
+    # consulted at all for a pull_request, so the PR path is untouched.
+    if: >-
+      always() &&
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'workflow_dispatch' || inputs.apply == true) &&
+      needs.authorize-deploy.result == 'success'
     runs-on: ubuntu-latest
+    # The GitHub Environment (and therefore its protection rules, required
+    # reviewers and secrets) is the stack's OWN registered environment, read
+    # from the trusted registry via the matrix - never a workflow input. The
+    # workflow_dispatch `environment` input is only ever validated against
+    # this same registry value in detect-changes and then discarded, so a
+    # dispatcher cannot redirect a stack at a different Environment or
+    # escape its protection rules.
     environment:
-      name: dev
+      name: ${{ matrix.stack.environment }}
     env:
-      # This POC's PR-triggered flow deploys to dev only. A production
-      # tier would need its own Environment-gated job, not a workflow input -
-      # a workflow input cannot be trusted the way an Environment gate can.
-      TARGET_ENV: dev
+      # Registry-driven, not hard-coded: this is the environment the stack is
+      # registered for, re-verified against config/finops-stacks.yml on the
+      # trusted ref in "Verify the stack is deployable" below before any
+      # Terraform command runs.
+      TARGET_ENV: ${{ matrix.stack.environment }}
       # Which stack this specific matrix job applies. Comes from the trusted
       # stacks JSON (registry + changed paths), never a workflow input, and is
       # re-verified against the registry file itself in the next step.
       DEPLOY_STACK: ${{ matrix.stack.name }}
+      # The exact remote state object this apply will write, re-verified
+      # against the trusted registry file below.
+      DEPLOY_STATE_KEY: ${{ matrix.stack.state_key }}
     steps:
       - uses: actions/checkout@v4
 
@@ -1022,6 +1082,13 @@ jobs:
                   f"::error title=Environment mismatch::{name!r} targets "
                   f"{stack.get('environment')!r}, not {expected!r}."
               )
+          expected_key = os.environ["DEPLOY_STATE_KEY"]
+          if stack.get("state_key") != expected_key:
+              sys.exit(
+                  f"::error title=State key mismatch::{name!r} is registered against "
+                  f"{stack.get('state_key')!r}, not {expected_key!r}. Refusing to apply "
+                  f"to a state object the cost gate did not baseline."
+              )
           print(f"Stack {name!r} is deployable; terraform_dir={stack['terraform_dir']}")
           print(f"state_key={stack['state_key']}")
           PY
@@ -1051,14 +1118,15 @@ jobs:
           role-to-assume: ${{ steps.role.outputs.arn }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # State key and var-file both derive from TARGET_ENV and the matrix
-      # stack, resolved by GitHub Actions expressions and validated above -
-      # never built from raw shell input. For aws this reproduces the exact
-      # prior literals (finops-poc/${TARGET_ENV}/aws/terraform.tfstate,
-      # environments/${TARGET_ENV}.tfvars) byte-for-byte, since matrix.stack.dir
-      # and matrix.stack.name equal terraform/aws and aws respectively. A stack
-      # with no environments/<env>.tfvars (web-platform today) auto-loads its
-      # own committed terraform.tfvars instead - never a scenario fixture.
+      # The state key is the registry's own `state_key` for this stack, not a
+      # string rebuilt from TARGET_ENV - now that the environment is
+      # registry-driven rather than pinned to dev, deriving the key could
+      # drift from the key the cost gate actually baselined against. Using
+      # matrix.stack.state_key makes the gated baseline and the applied state
+      # provably the same object. The var-file still derives from TARGET_ENV;
+      # a stack with no environments/<env>.tfvars (web-platform today)
+      # auto-loads its own committed terraform.tfvars instead - never a
+      # scenario fixture.
       #
       # Plan to a file first, then apply exactly that plan - the same
       # save-then-apply pattern already used by
@@ -1072,7 +1140,7 @@ jobs:
           set -euo pipefail
           terraform init -input=false -no-color \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=finops-poc/${TARGET_ENV}/${{ matrix.stack.name }}/terraform.tfstate" \
+            -backend-config="key=${{ matrix.stack.state_key }}" \
             -backend-config="use_lockfile=true" \
             -backend-config="encrypt=true" \
             -backend-config="region=${{ env.AWS_REGION }}"
