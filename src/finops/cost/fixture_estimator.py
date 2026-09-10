@@ -41,7 +41,7 @@ class InfracostFixtureEstimator(CostEstimator):
             estimator_version="recorded",
             trust=self.trust,
             raw_reference=str(self.proposed_fixture),
-            plan=request.normalized_plan,
+            plan=request.action_plan or request.normalized_plan,
         )
 
 

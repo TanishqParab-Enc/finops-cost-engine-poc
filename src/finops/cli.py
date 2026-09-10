@@ -48,6 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Baseline Terraform plan JSON. Omit for a greenfield stack.",
     )
+    analyze.add_argument(
+        "--action-plan",
+        default=None,
+        help=(
+            "Real (non-hermetic) plan of this same change against the actual "
+            "deployed target state - labels which resources this PR genuinely "
+            "changes in the resource-level breakdown. Never used for pricing."
+        ),
+    )
     analyze.add_argument("--commit", default="", help="Commit SHA for the lock artifact")
     analyze.add_argument("--execution-id", default="", help="CI/CD execution id")
     analyze.add_argument(
@@ -148,7 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approve.add_argument("--result", required=True, help="Path to gate-result.json (must be FAIL)")
     approve.add_argument("--plan", required=True, help="Terraform plan JSON the approval binds to")
-    approve.add_argument("--pr", required=True, type=int, help="Pull request number")
+    approve.add_argument(
+        "--pr", type=int, default=None,
+        help="Pull request number (omit for a workflow_dispatch greenfield run)",
+    )
     approve.add_argument("--head-sha", required=True, help="Pull request head commit SHA")
     approve.add_argument("--stack", required=True, help="Stack this approval authorises")
     approve.add_argument(
@@ -224,6 +236,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         GateRequest(
             proposed_plan=Path(args.plan),
             baseline_plan=Path(args.baseline_plan) if args.baseline_plan else None,
+            action_plan=Path(args.action_plan) if args.action_plan else None,
             commit=args.commit,
             execution_id=args.execution_id,
             stack=args.stack,
@@ -463,11 +476,11 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     only after the ``finops-cost-approval`` Environment's required reviewer
     clicks Approve on this exact run - a Reject prevents these steps from
     running at all. This function therefore only re-checks the channel
-    (must be a pull_request run) and the evaluation itself (must really be a
-    FAIL), never an actor - GitHub already is that check. Rejection is a
-    deliberate business outcome, so it exits 0 rather than masquerading as a
-    system failure; it simply mints no record, and nothing downstream can
-    treat the absence of a record as authorisation.
+    (must be a pull_request or workflow_dispatch run) and the evaluation
+    itself (must really be a FAIL), never an actor - GitHub already is that
+    check. Rejection is a deliberate business outcome, so it exits 0 rather
+    than masquerading as a system failure; it simply mints no record, and
+    nothing downstream can treat the absence of a record as authorisation.
     """
     from .gate import (
         APPROVAL_APPROVED,
@@ -480,10 +493,10 @@ def _cmd_approve(args: argparse.Namespace) -> int:
 
     config = load_config(args.config)
 
-    if args.run_event != "pull_request":
+    if args.run_event not in ("pull_request", "workflow_dispatch"):
         print(
-            f"::error::A decision must come from a pull_request run, not "
-            f"{args.run_event!r}.",
+            f"::error::A decision must come from a pull_request or workflow_dispatch "
+            f"run, not {args.run_event!r}.",
             file=sys.stderr,
         )
         return EXIT_ERROR
@@ -520,7 +533,7 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             print(json.dumps(payload))
         else:
             print(REJECTION_MESSAGE)
-            print(f"PR:                       #{args.pr}")
+            print(f"PR:                       {'#' + str(args.pr) if args.pr is not None else 'N/A (workflow_dispatch)'}")
             print(f"Stack:                    {args.stack}")
             print(f"Terraform root:           {args.terraform_dir}")
             print(f"Incremental monthly cost: {estimate.currency} {incremental}")

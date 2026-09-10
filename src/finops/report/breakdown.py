@@ -152,6 +152,33 @@ def changed_resources(estimate: CostEstimate) -> list[ResourceCost]:
     return [r for r in estimate.resources if r.delta_monthly_cost != 0]
 
 
+# Only these Terraform actions mean "this PR actually touches this
+# resource" - NOOP/READ/absent do not, whatever the resource costs.
+_PR_CHANGE_ACTIONS = {Action.CREATE, Action.UPDATE, Action.DELETE, Action.REPLACE}
+
+
+def is_pr_change(resource: ResourceCost) -> bool:
+    """Whether Terraform is actually taking an action on this resource for
+    this PR - determined from the plan's own action, never inferred from
+    price alone, so an unchanged resource that merely costs money never
+    counts as a PR change. Falls back to the delta's sign only when no
+    action was wired through at all (e.g. a caller with no plan)."""
+    if resource.action is not None:
+        return resource.action in _PR_CHANGE_ACTIONS
+    return resource.delta_monthly_cost != 0
+
+
+def pr_changed_resources(estimate: CostEstimate) -> list[ResourceCost]:
+    """Resources this PR actually changes, movers first - the whole-stack
+    current/proposed/incremental totals stay authoritative and unaffected;
+    this only controls which resources the per-resource breakdown lists."""
+    changed = [r for r in estimate.resources if is_pr_change(r)]
+    return sorted(
+        changed,
+        key=lambda r: (-abs(r.delta_monthly_cost), -r.new_monthly_cost, r.address),
+    )
+
+
 def ordered_resources(estimate: CostEstimate) -> list[ResourceCost]:
     """Movers first (largest absolute delta), then the rest by projected cost."""
     return sorted(

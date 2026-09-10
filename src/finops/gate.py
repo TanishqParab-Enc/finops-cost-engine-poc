@@ -28,6 +28,14 @@ from .policy import engine as policy_engine
 class GateRequest:
     proposed_plan: Path
     baseline_plan: Path | None = None
+    # A real (non-hermetic) plan of this same change against the actual
+    # deployed target state - used ONLY to label which resources this PR
+    # genuinely touches (create/update/delete/replace) in the report's
+    # resource-level breakdown. Never used for pricing, the cost lock
+    # fingerprint, or the AI prompt context - all of those keep using
+    # `proposed_plan` exactly as before. Optional and purely additive: a
+    # caller that omits it gets the prior behaviour (no action wiring).
+    action_plan: Path | None = None
     commit: str = ""
     execution_id: str = ""
     stack: str | None = None
@@ -66,6 +74,16 @@ def run_gate(request: GateRequest, config: Config, estimator: CostEstimator) -> 
         result.errors.append(exc.to_dict())
         return result
 
+    # Best-effort only: this purely improves which resources the report
+    # lists, so a bad/missing action plan must never fail the whole gate -
+    # it just falls back to no action info (existing delta-based behaviour).
+    action_plan: NormalizedPlan | None = None
+    if request.action_plan is not None:
+        try:
+            action_plan = normalize_plan_file(request.action_plan)
+        except FinOpsError:
+            action_plan = None
+
     try:
         estimator.preflight()
         estimate = estimator.estimate(
@@ -73,6 +91,7 @@ def run_gate(request: GateRequest, config: Config, estimator: CostEstimator) -> 
                 proposed_plan_json=request.proposed_plan,
                 baseline_plan_json=request.baseline_plan,
                 normalized_plan=plan,
+                action_plan=action_plan,
                 currency=config.threshold.currency,
             )
         )

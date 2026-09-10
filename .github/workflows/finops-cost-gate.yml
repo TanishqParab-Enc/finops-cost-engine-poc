@@ -17,6 +17,23 @@ name: FinOps Cost Gate
       - 'config/finops-stacks.yml'
       - 'finops-exceptions/**'
       - '.github/workflows/finops-cost-gate.yml'
+  # Greenfield/manual production path: deploys ONE registered stack through
+  # the exact same governance chain as a pull_request (detect-changes ->
+  # cost-gate -> collect-blocked-stacks -> finops-approval -> authorize-
+  # deploy -> deploy). `stack`/`environment` are plain strings, never a
+  # `choice` list of stack names baked into this file - detect-changes below
+  # resolves them ONLY against config/finops-stacks.yml, so this trigger
+  # never hard-codes or favours any particular stack.
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "Registered stack name from config/finops-stacks.yml (e.g. web-platform)"
+        required: true
+        type: string
+      environment:
+        description: "Environment this stack is registered for (e.g. dev)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -55,8 +72,55 @@ jobs:
 
       - name: Detect
         id: detect
+        env:
+          DISPATCH_STACK: ${{ github.event.inputs.stack }}
+          DISPATCH_ENVIRONMENT: ${{ github.event.inputs.environment }}
         run: |
           set -euo pipefail
+
+          # workflow_dispatch selects ONE registered stack/environment
+          # directly - never a git diff, and resolved ONLY against
+          # config/finops-stacks.yml (the same trusted registry the
+          # pull_request path below uses), never a generic Terraform root
+          # such as terraform/ or any hard-coded stack name.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "has_infra_changes=true" >> "$GITHUB_OUTPUT"
+            STACKS=$(python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          from finops.errors import ConfigurationError
+          from finops.stacks import get_stack
+
+          stack_name = os.environ["DISPATCH_STACK"]
+          environment = os.environ["DISPATCH_ENVIRONMENT"]
+
+          try:
+              stack = get_stack(stack_name)
+          except ConfigurationError as exc:
+              sys.exit(f"::error title=Unknown stack::{exc}")
+
+          if stack.environment != environment:
+              sys.exit(
+                  f"::error title=Environment mismatch::Stack {stack_name!r} is "
+                  f"registered for environment {stack.environment!r}, not {environment!r}."
+              )
+
+          print(json.dumps([{
+              "name": stack.name, "dir": stack.terraform_dir, "cloud": stack.cloud,
+              "deployable": stack.deployable, "environment": stack.environment,
+              "usage_file": stack.usage_file or "", "state_key": stack.state_key,
+          }]))
+          PY
+            )
+            echo "stacks=$STACKS" >> "$GITHUB_OUTPUT"
+            echo "Selected stack (workflow_dispatch): $STACKS"
+            AWS_EVAL=$(STACKS="$STACKS" python3 -c "import json,os;print('true' if any(s['name']=='aws' for s in json.loads(os.environ['STACKS'])) else 'false')")
+            echo "aws_evaluated=$AWS_EVAL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           BASE="origin/${{ github.base_ref || github.event.repository.default_branch }}"
 
           finops detect-changes --base "$BASE" --head HEAD --json > changes.json
@@ -78,7 +142,7 @@ jobs:
           print(json.dumps([
               {"name": s.name, "dir": s.terraform_dir, "cloud": s.cloud,
                "deployable": s.deployable, "environment": s.environment,
-               "usage_file": s.usage_file or ""}
+               "usage_file": s.usage_file or "", "state_key": s.state_key}
               for s in select_stacks(files)
           ]))
           PY
@@ -97,7 +161,7 @@ jobs:
     name: Cost gate (${{ matrix.stack.name }})
     needs: detect-changes
     if: |
-      github.event_name == 'pull_request' &&
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
       needs.detect-changes.outputs.stacks != '' &&
       needs.detect-changes.outputs.stacks != '[]' &&
       needs.detect-changes.outputs.has_infra_changes == 'true'
@@ -113,12 +177,19 @@ jobs:
           fetch-depth: 0
           path: head
 
-      - name: Checkout base branch
+      # A second, independent checkout of the SAME PR head commit - never the
+      # base ref. Its ONLY purpose is to `init` against the stack's REAL
+      # remote backend for the baseline plan below, in a directory Terraform
+      # has never `init`ed against a different (local) backend, so switching
+      # backends never hits "Backend configuration changed" / an interactive
+      # migration prompt. The `head/` checkout below is later re-initialised
+      # against a throwaway local backend for the proposed-cost plan, so the
+      # two must stay physically separate directories.
+      - name: "Checkout PR head (baseline: deployed target state)"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.base_ref || github.event.repository.default_branch }}
-          path: base
+          path: baseline
 
       - uses: actions/setup-python@v5
         with:
@@ -148,58 +219,85 @@ jobs:
           role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Both plans use the committed terraform.tfvars, which Terraform loads
-      # automatically. The cost difference therefore comes purely from what the
-      # pull request changed.
+      # The baseline must be what is ACTUALLY deployed for this stack in its
+      # registered target environment right now - never "whatever main/base
+      # happens to contain". A stack can be deployed by an earlier, still-
+      # open PR before it is ever merged, so git history and deployment
+      # history are different things; comparing against the base ref alone
+      # incorrectly priced an already-deployed stack as if it were brand new.
       #
-      # The cost gate must never read, write or lock any live workload state
-      # (dev's or prod's). `init -backend=false` cannot achieve that: it
-      # records no backend at all, so the following `plan` re-reads the
-      # `backend "s3"` block in main.tf and fails with "Backend
-      # initialization required" (reproduced in CI and a clean checkout).
+      # `terraform show -json` with NO plan argument reads the current state
+      # exactly as stored - no refresh, no provider calls beyond reading the
+      # state object itself, so this is a pure READ: it cannot create,
+      # update, destroy or modify a single resource or the state object.
+      # Infracost only prices a plan's *proposed* config, which would price
+      # "cost after applying that config" regardless of which state a plan
+      # started from - so pricing is never state-independent unless the
+      # state itself, not a plan, is what gets priced. state_json_to_plan_json
+      # reshapes the (already real, already-priced-elsewhere-in-this-repo)
+      # state document into the plan-shaped JSON Infracost expects; this is a
+      # faithful reshape of real Terraform data, never a fabricated cost.
       #
-      # Instead each step writes a local-backend override into its own
-      # throwaway base/ or head/ checkout. Terraform then plans against an
-      # ephemeral local state: no S3 call, no .tflock, no live state access.
-      # Infracost prices the plan's *planned end state*, so pricing stays
-      # correct and reproducible from empty state every run.
+      # Uses the plan role's existing project-wide Terraform state read
+      # permission (already required for every stack's own plan/apply); no
+      # IAM change is needed.
       #
-      # This file is generated at runtime and never committed. It must NOT be
-      # copied into the deploy job - a `backend "local"` block there makes
-      # every S3 -backend-config argument invalid and breaks deployment.
-      # A stack that does not exist on the base ref is an initial deployment,
-      # not a change to an existing one - its baseline cost is $0, not "same
-      # as proposed". Determined by directory existence, independent of
-      # whether a plan would succeed, so a real Terraform error is never
-      # mistaken for "new stack" (and vice versa).
-      - name: Detect initial deployment
-        id: initial
-        run: |
-          set -euo pipefail
-          if [ -d "base/${{ matrix.stack.dir }}" ]; then
-            echo "is_initial=false" >> "$GITHUB_OUTPUT"
-            echo "Stack '${{ matrix.stack.name }}' exists on the base ref; treating as an existing-stack change."
-          else
-            echo "is_initial=true" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Initial deployment::Stack '${{ matrix.stack.name }}' does not exist on the base ref (${{ github.base_ref || github.event.repository.default_branch }}). Baseline cost is \$0; the full projected cost is the incremental cost."
-          fi
-
-      - name: Terraform plan (base branch = baseline cost)
+      # If no state object exists yet for this stack/environment, the S3
+      # backend legitimately starts from empty state and the reshaped plan
+      # has zero resources - the same $0 baseline a genuine first deployment
+      # gets, so no separate "is this the first deployment" branch is
+      # needed: an empty deployed state and a nonexistent one cost the same.
+      # bucket/key/region come from the trusted stack registry
+      # (config/finops-stacks.yml) via matrix.stack, resolved once in
+      # detect-changes - never a stack-specific case in this workflow.
+      #
+      # This same real-backend init is also reused to produce a genuine,
+      # non-hermetic diff plan (HEAD's config vs the real deployed state) -
+      # `-lock=false` so it can never contend with a concurrent deploy's
+      # state lock, `-refresh=false` so it makes no live provider calls at
+      # all. Its ONLY purpose is to label which resources this PR genuinely
+      # changes (create/update/delete/replace) in the report's resource-
+      # level breakdown - the hermetic proposed-cost plan below (planned
+      # from empty state) always shows every resource as "create", so it
+      # cannot tell an actual change from an unchanged, already-deployed
+      # resource. This plan is NEVER used for pricing, the cost lock
+      # fingerprint, or the AI prompt context - those keep using the
+      # hermetic proposed plan exactly as before.
+      - name: Terraform plan (deployed target state = baseline cost)
         id: baseline
-        if: steps.initial.outputs.is_initial != 'true'
         continue-on-error: true
-        working-directory: base/${{ matrix.stack.dir }}
+        working-directory: baseline/${{ matrix.stack.dir }}
+        env:
+          STATE_KEY: ${{ matrix.stack.state_key }}
         run: |
           set -euo pipefail
-          cat > backend_override.tf <<'EOF'
-          terraform {
-            backend "local" {}
-          }
-          EOF
-          terraform init -input=false -no-color
-          terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
-          terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/baseline-plan.json"
+          terraform init -input=false -no-color \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+          terraform show -json > state.json
+          python3 - <<'PY'
+          import json
+          import os
 
+          from finops.plan.state_shim import state_json_to_plan_json
+
+          with open("state.json", encoding="utf-8") as fh:
+              state_doc = json.load(fh)
+          plan_doc = state_json_to_plan_json(state_doc)
+          out_path = os.path.join(os.environ["GITHUB_WORKSPACE"], "baseline-plan.json")
+          with open(out_path, "w", encoding="utf-8") as fh:
+              json.dump(plan_doc, fh)
+          PY
+          terraform plan -input=false -no-color -lock=false -refresh=false -out=action.tfplan
+          terraform show -json action.tfplan > "$GITHUB_WORKSPACE/action-plan.json"
+
+      # The proposed plan alone still uses a throwaway local backend (never
+      # live state) - the pull request's change is priced from an ephemeral
+      # empty state, exactly as before this fix; only the BASELINE side now
+      # reads the real deployed state.
       - name: Terraform plan (PR head = proposed cost)
         working-directory: head/${{ matrix.stack.dir }}
         run: |
@@ -319,10 +417,16 @@ jobs:
           BASELINE_ARG=""
           if [ -f "$GITHUB_WORKSPACE/baseline-plan.json" ]; then
             BASELINE_ARG="--baseline-plan $GITHUB_WORKSPACE/baseline-plan.json"
-          elif [ "${{ steps.initial.outputs.is_initial }}" = "true" ]; then
-            echo "::notice::Initial deployment for '${{ matrix.stack.name }}' - current monthly cost is \$0.00; the full projected cost is the incremental cost."
           else
-            echo "::warning::No baseline plan; incremental cost equals full projected cost."
+            echo "::error::Could not read the deployed Terraform state for stack '${{ matrix.stack.name }}' (state_key=${{ matrix.stack.state_key }}) to establish a baseline cost - proceeding as if no baseline exists, so the full proposed cost will be treated as incremental. See the 'Terraform plan (deployed target state = baseline cost)' step's own output for the actual error."
+          fi
+
+          # Optional and purely additive: only affects which resources the
+          # report lists as changed, never pricing/threshold/lock. Missing
+          # (e.g. the earlier step failed) just means no action wiring.
+          ACTION_ARG=""
+          if [ -f "$GITHUB_WORKSPACE/action-plan.json" ]; then
+            ACTION_ARG="--action-plan $GITHUB_WORKSPACE/action-plan.json"
           fi
 
           # A cost lock authorises deployment. A stack the registry marks
@@ -336,6 +440,7 @@ jobs:
           finops analyze \
             --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
             $BASELINE_ARG \
+            $ACTION_ARG \
             --stack "${{ matrix.stack.name }}" \
             $LOCK_ARG \
             --commit "${{ github.event.pull_request.head.sha || github.sha }}" \
@@ -362,7 +467,7 @@ jobs:
       # says exactly how to approve or reject it, so append the instructions to
       # the comment the next step posts.
       - name: Request cost approval
-        if: always() && steps.gate.outputs.exit_code == '1' && github.event_name == 'pull_request'
+        if: always() && steps.gate.outputs.exit_code == '1' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         working-directory: head
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -370,6 +475,15 @@ jobs:
           set -euo pipefail
           mkdir -p .finops
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # A pull_request run is bound to "PR #N"; a workflow_dispatch
+          # greenfield run has no PR at all, so it is bound to this run/stack
+          # instead - both phrases feed the same approval-request text below.
+          if [ -n "$PR_NUMBER" ]; then
+            CHANGE_REF="PR #$PR_NUMBER"
+          else
+            CHANGE_REF="this workflow_dispatch run (stack '${{ matrix.stack.name }}')"
+          fi
 
           # Restate the figures the decision is about, from this run's own
           # artifacts. The rendered table above omits a labelled incremental
@@ -405,13 +519,13 @@ jobs:
 
           **1.** This change is **BLOCKED**: the incremental monthly cost exceeds the
           threshold.
-          **2.** This pull request's own pipeline run is now waiting on the
+          **2.** This pipeline run is now waiting on the
           **\`finops-cost-approval\`** GitHub Environment - it needs an explicit
           **Approve** or **Reject** from \`$FINOPS_APPROVER\`. Nothing deploys until then.
 
           > This is the SAME run, paused mid-execution (like a Jenkins \`input\` step) -
           > it does not re-plan or re-price anything. It consumes exactly the plan and
-          > estimate this run already produced for PR #$PR_NUMBER at this exact commit.
+          > estimate this run already produced for $CHANGE_REF at this exact commit.
 
           To decide:
 
@@ -423,10 +537,10 @@ jobs:
 
           Approving does **not** turn this into a PASS - \`finops_decision\` stays
           \`BLOCK\`. It only sets \`deployment_authorization = AUTHORIZED\`, bound to
-          PR #$PR_NUMBER at this exact commit. Any new commit invalidates it and starts
-          a fresh run.
+          $CHANGE_REF at this exact commit. Any new commit (or re-dispatch) invalidates
+          it and starts a fresh run.
           EOF
-          echo "Approval request appended to the pull request comment."
+          echo "Approval request appended to the gate summary."
 
       - name: Publish gate summary
         if: always()
@@ -574,7 +688,7 @@ jobs:
   collect-blocked-stacks:
     name: Collect blocked stacks
     needs: [detect-changes, cost-gate]
-    if: always() && github.event_name == 'pull_request' && needs.detect-changes.result == 'success'
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.detect-changes.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       blocked_stacks: ${{ steps.collect.outputs.blocked_stacks }}
@@ -645,8 +759,10 @@ jobs:
       # "View deployment" link next to Approve/Reject. Points at the pull
       # request, which already carries the full cost breakdown comment
       # (see "Request cost approval" in cost-gate) - so the reviewer is one
-      # click from the figures without leaving the review screen.
-      url: ${{ github.event.pull_request.html_url }}
+      # click from the figures without leaving the review screen. A
+      # workflow_dispatch run has no pull request, so it falls back to this
+      # exact run instead.
+      url: ${{ github.event.pull_request.html_url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
     strategy:
       fail-fast: false
       matrix:
@@ -671,19 +787,27 @@ jobs:
       - name: Record the approval
         id: decision
         env:
+          # A workflow_dispatch greenfield run has no PR - PR_NUMBER stays
+          # empty and --pr is simply omitted; HEAD_SHA falls back to the
+          # dispatched commit itself so the approval still binds to an exact
+          # commit either way.
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           STACK: ${{ matrix.stack }}
         run: |
           set -euo pipefail
           TF_DIR=$(python3 -c "import os;from finops.stacks import get_stack;print(get_stack(os.environ['STACK']).terraform_dir)")
 
           mkdir -p finops-approval
+          PR_ARG=""
+          if [ -n "$PR_NUMBER" ]; then
+            PR_ARG="--pr $PR_NUMBER"
+          fi
           finops approve \
             --action approve \
             --result evaluation/gate-result.json \
             --plan evaluation/proposed-plan.json \
-            --pr "$PR_NUMBER" \
+            $PR_ARG \
             --head-sha "$HEAD_SHA" \
             --stack "$STACK" \
             --terraform-dir "$TF_DIR" \
@@ -708,7 +832,7 @@ jobs:
             echo "deployment_authorization = AUTHORIZED"
             echo '```'
             echo ""
-            echo "Approved by $FINOPS_APPROVER for PR #${{ github.event.pull_request.number }} at \`${{ github.event.pull_request.head.sha }}\`."
+            echo "Approved by $FINOPS_APPROVER for ${{ github.event.pull_request.number && format('PR #{0}', github.event.pull_request.number) || format('workflow_dispatch run {0}', github.run_id) }} at \`${{ github.event.pull_request.head.sha || github.sha }}\`."
             echo ""
             cat decision.json
           } >> "$GITHUB_STEP_SUMMARY"
@@ -743,7 +867,7 @@ jobs:
   authorize-deploy:
     name: Aggregate deployment authorization
     needs: [detect-changes, cost-gate, finops-approval]
-    if: always() && github.event_name == 'pull_request' && needs.detect-changes.result == 'success'
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.detect-changes.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       authorizations: ${{ steps.aggregate.outputs.authorizations }}
@@ -820,7 +944,7 @@ jobs:
     # authorize-deploy itself succeeded (verified live on run 34197717116:
     # authorize-deploy succeeded after an approval, yet deploy still skipped
     # until this fix).
-    if: always() && github.event_name == 'pull_request' && needs.authorize-deploy.result == 'success'
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.authorize-deploy.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: dev

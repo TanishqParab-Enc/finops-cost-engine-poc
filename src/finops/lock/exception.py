@@ -91,7 +91,7 @@ def create_exception(
     plan_doc: dict,
     config: Config,
     *,
-    pr_number: int,
+    pr_number: int | None,
     head_sha: str,
     approver: str,
     justification: str,
@@ -145,7 +145,10 @@ def create_exception(
         # never be accepted for another.
         "stack": stack,
         "terraform_dir": terraform_dir,
-        "pr": int(pr_number),
+        # None for a workflow_dispatch greenfield run - there is no PR to bind
+        # to; _binding_problems only checks this field when a caller actually
+        # supplies a pr_number to verify against.
+        "pr": int(pr_number) if pr_number is not None else None,
         "head_sha": head_sha,
         "plan_fingerprint": plan.fingerprint(),
         "resolved_variables_hash": resolved_variables_hash(plan_doc),
@@ -449,8 +452,9 @@ def verify_environment_approval(
     those steps from ever running. That makes the identity check GitHub's
     job, not this function's - duplicating it here would check nothing
     GitHub has not already enforced. The one channel check kept is
-    ``run_event``: this must be a ``pull_request`` run, the only trigger this
-    workflow ever gates with the Environment.
+    ``run_event``: this must be a ``pull_request`` or ``workflow_dispatch``
+    run - the only two triggers this workflow ever gates with the
+    Environment (brownfield-via-PR and greenfield-via-manual-dispatch).
     """
     if not config.exceptions.enabled:
         return ["Budget exceptions are disabled by policy"]
@@ -461,9 +465,10 @@ def verify_environment_approval(
         terraform_dir=terraform_dir, now=now,
     )
 
-    if run_event != "pull_request":
+    if run_event not in ("pull_request", "workflow_dispatch"):
         problems.append(
-            f"Approval must come from the pull request's own run, not {run_event!r}"
+            f"Approval must come from the pipeline's own pull_request or "
+            f"workflow_dispatch run, not {run_event!r}"
         )
 
     return problems

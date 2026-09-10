@@ -7,7 +7,7 @@ from ..models import GateResult, Status, as_float
 from .breakdown import (
     change_label,
     coverage_breakdown,
-    ordered_resources,
+    pr_changed_resources,
     service_summary,
     top_service_drivers,
 )
@@ -115,30 +115,38 @@ def render_markdown(result: GateResult) -> str:
 
     if estimate and estimate.resources:
         currency = estimate.currency
-        rows = ordered_resources(estimate)
-        shown = rows[:MAX_RESOURCE_ROWS]
+        # Only resources THIS PR actually touches (a real Terraform action) -
+        # the whole-stack totals above stay authoritative and unaffected;
+        # this only controls which resources the table below lists, so an
+        # unchanged resource never appears just because it costs money.
+        rows = pr_changed_resources(estimate)
 
-        lines += [
-            "",
-            "### Cost breakdown",
-            "",
-            "| Resource | Service | Change | Monthly | Incremental |",
-            "|---|---|---|---|---|",
-        ]
-        for resource in shown:
-            lines.append(
-                f"| `{resource.address}` | {resource.resource_type} | {change_label(resource)} | "
-                f"{_money(as_float(resource.new_monthly_cost), currency)} | "
-                f"{_signed(as_float(resource.delta_monthly_cost), currency)} |"
-            )
-        if len(rows) > len(shown):
-            hidden = len(rows) - len(shown)
+        lines += ["", "### Cost breakdown", ""]
+        if not rows:
             lines += [
-                "",
-                f"_{hidden} further priced resource(s) omitted. The complete breakdown, "
-                f"including every cost component, is in `cost-estimate.json` in this run's "
-                f"`finops-{estimate.resources[0].cloud.value}` artifact._",
+                "No infrastructure changes detected.",
+                "No resource-level incremental cost changes.",
             ]
+        else:
+            shown = rows[:MAX_RESOURCE_ROWS]
+            lines += [
+                "| Resource | Service | Change | Monthly | Incremental |",
+                "|---|---|---|---|---|",
+            ]
+            for resource in shown:
+                lines.append(
+                    f"| `{resource.address}` | {resource.resource_type} | {change_label(resource)} | "
+                    f"{_money(as_float(resource.new_monthly_cost), currency)} | "
+                    f"{_signed(as_float(resource.delta_monthly_cost), currency)} |"
+                )
+            if len(rows) > len(shown):
+                hidden = len(rows) - len(shown)
+                lines += [
+                    "",
+                    f"_{hidden} further changed resource(s) omitted. The complete breakdown, "
+                    f"including every cost component, is in `cost-estimate.json` in this run's "
+                    f"`finops-{estimate.resources[0].cloud.value}` artifact._",
+                ]
 
         services = service_summary(estimate)
         if services:

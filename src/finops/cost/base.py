@@ -24,6 +24,11 @@ class EstimationRequest:
     proposed_plan_json: Path
     baseline_plan_json: Path | None = None
     normalized_plan: NormalizedPlan | None = None
+    # A real diff plan against the actual deployed target state, used ONLY
+    # to label which resources this PR genuinely changes in the report's
+    # resource-level breakdown - never for pricing. Falls back to
+    # `normalized_plan` when absent, matching prior behaviour.
+    action_plan: NormalizedPlan | None = None
     currency: str = "USD"
 
 
