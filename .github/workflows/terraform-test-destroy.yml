@@ -29,6 +29,7 @@ name: Terraform Test Stack Destroy
         type: choice
         options:
           - web-platform
+          - ecommerce-platform
       environment:
         description: Environment to destroy
         required: true
