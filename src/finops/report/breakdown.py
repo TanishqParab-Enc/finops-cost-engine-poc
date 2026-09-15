@@ -58,6 +58,10 @@ _ACTION_LABEL = {
     Action.READ: "read",
 }
 
+# Only these Terraform actions mean "this change actually touches this
+# resource" - NOOP/READ/absent do not, whatever the resource costs.
+_PR_CHANGE_ACTIONS = {Action.CREATE, Action.UPDATE, Action.DELETE, Action.REPLACE}
+
 
 def service_of(resource_type: str) -> str:
     lowered = (resource_type or "").lower()
@@ -72,13 +76,26 @@ def service_of(resource_type: str) -> str:
 
 
 def change_label(resource: ResourceCost) -> str:
-    """Prefer the plan's own action; fall back to the direction of the delta."""
-    if resource.action is not None:
+    """The resource's own action when it has one, otherwise the direction of
+    the delta.
+
+    A resource whose cost moved is never reported as "unchanged". Terraform
+    and Infracost describe infrastructure at different granularities, so the
+    action can sit on one resource while the cost lands on another - resizing
+    an instance edits a launch template, but the bill moves on the group that
+    uses it, which Terraform itself reports as no-op. Labelling that row
+    "unchanged" next to a non-zero monthly impact contradicts itself. This is
+    decided from the plan's own action and the delta alone, so it holds for
+    any such relationship, not one resource pair.
+    """
+    if resource.action in _PR_CHANGE_ACTIONS:
         return _ACTION_LABEL.get(resource.action, resource.action.value)
     if resource.delta_monthly_cost > 0:
         return "increased"
     if resource.delta_monthly_cost < 0:
         return "decreased"
+    if resource.action is not None:
+        return _ACTION_LABEL.get(resource.action, resource.action.value)
     return "unchanged"
 
 
@@ -152,20 +169,27 @@ def changed_resources(estimate: CostEstimate) -> list[ResourceCost]:
     return [r for r in estimate.resources if r.delta_monthly_cost != 0]
 
 
-# Only these Terraform actions mean "this PR actually touches this
-# resource" - NOOP/READ/absent do not, whatever the resource costs.
-_PR_CHANGE_ACTIONS = {Action.CREATE, Action.UPDATE, Action.DELETE, Action.REPLACE}
-
-
 def is_pr_change(resource: ResourceCost) -> bool:
-    """Whether Terraform is actually taking an action on this resource for
-    this PR - determined from the plan's own action, never inferred from
-    price alone, so an unchanged resource that merely costs money never
-    counts as a PR change. Falls back to the delta's sign only when no
-    action was wired through at all (e.g. a caller with no plan)."""
+    """Whether this resource is part of what the change actually does.
+
+    A resource whose cost moved is always in scope. Terraform and Infracost
+    describe infrastructure at different granularities: resizing an ASG's
+    instances edits `aws_launch_template` (which Infracost does not price)
+    while the whole cost delta lands on `aws_autoscaling_group` (which
+    Terraform reports as no-op, since the new template version propagates
+    without changing the group itself). Requiring the priced resource to
+    carry its own Terraform action would drop that delta from the report and
+    show "no changes" for a change that demonstrably costs money.
+
+    Otherwise fall back to the plan's action, so a genuine create/delete that
+    happens to price at $0 is still listed. An unchanged resource - no cost
+    movement and no action - never qualifies, whatever it costs.
+    """
+    if resource.delta_monthly_cost != 0:
+        return True
     if resource.action is not None:
         return resource.action in _PR_CHANGE_ACTIONS
-    return resource.delta_monthly_cost != 0
+    return False
 
 
 def pr_changed_resources(estimate: CostEstimate) -> list[ResourceCost]:

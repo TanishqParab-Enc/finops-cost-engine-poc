@@ -104,6 +104,38 @@ class TestPrChangedResourcesFiltering:
         result = pr_changed_resources_from(resources)
         assert [r.address for r in result] == ["no_action.changed"]
 
+    def test_priced_resource_whose_cost_moved_is_shown_even_when_terraform_calls_it_noop(self):
+        """Terraform and Infracost describe infrastructure at different
+        granularities. Observed live on web-platform/dev: resizing the ASG's
+        instances edits `aws_launch_template` (Infracost prices it at $0 and
+        does not list it), while the entire delta lands on
+        `aws_autoscaling_group`, which Terraform reports as no-op because the
+        new template version propagates without changing the group. Requiring
+        the priced resource to carry its own action reported "no changes" for
+        a change that measurably cost +$60.74/mo."""
+        resources = [
+            make_resource(
+                address="module.compute.aws_autoscaling_group.app",
+                action=Action.NOOP,
+                previous="121.472",
+                new="182.208",
+            ),
+            make_resource(address="module.alb.aws_lb.main", action=Action.NOOP, previous="16.4", new="16.4"),
+            make_resource(address="module.database.aws_db_instance.main", action=Action.NOOP, previous="12.4", new="12.4"),
+        ]
+        result = pr_changed_resources_from(resources)
+        assert [r.address for r in result] == ["module.compute.aws_autoscaling_group.app"]
+        assert result[0].delta_monthly_cost == Decimal("60.736")
+
+    def test_unchanged_priced_resources_are_still_excluded_after_that_rule(self):
+        """The cost-moved rule must not readmit the whole stack: a resource
+        with no action and no cost movement never appears."""
+        resources = [
+            make_resource(address=f"expensive.unchanged_{i}", action=Action.NOOP, previous="500", new="500")
+            for i in range(8)
+        ]
+        assert pr_changed_resources_from(resources) == []
+
 
 def pr_changed_resources_from(resources: list[ResourceCost]) -> list[ResourceCost]:
     """Adapter: pr_changed_resources takes a CostEstimate, these tests only

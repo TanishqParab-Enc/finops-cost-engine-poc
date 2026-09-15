@@ -178,11 +178,31 @@ class TestWorkflowEnforcesFailClosed:
         assert 'backend "local"' not in baseline["run"]
         assert "BASELINE_UNAVAILABLE" in baseline["run"]
 
-    def test_action_plan_step_stays_best_effort(self, workflow):
-        """Resource-action labelling is cosmetic and must not fail the gate."""
+    def test_proposed_plan_is_priced_from_real_state_not_a_hermetic_plan(self, workflow):
+        """The proposed cost must be planned in the same real-backend
+        directory as the baseline, so both sides share one state snapshot."""
         steps = workflow["jobs"]["cost-gate"]["steps"]
-        action = next(s for s in steps if s.get("id") == "action-plan")
-        assert action["continue-on-error"] is True
+        proposed = next(s for s in steps if s.get("id") == "proposed")
+        baseline = next(s for s in steps if s.get("id") == "baseline")
+        assert proposed["working-directory"] == baseline["working-directory"]
+        assert 'backend "local"' not in proposed["run"]
+        assert "-refresh=false" in proposed["run"]
+        assert "-lock=false" in proposed["run"]
+        assert "proposed-plan.json" in proposed["run"]
+
+    def test_proposed_plan_step_is_load_bearing_and_cannot_fail_silently(self, workflow):
+        steps = workflow["jobs"]["cost-gate"]["steps"]
+        proposed = next(s for s in steps if s.get("id") == "proposed")
+        assert proposed.get("continue-on-error") is not True
+
+    def test_no_separate_best_effort_action_plan_remains(self, workflow):
+        """The proposed plan is itself a real diff, so it already carries the
+        Terraform actions - a second, optional document would reintroduce the
+        possibility of pricing and actions disagreeing."""
+        steps = workflow["jobs"]["cost-gate"]["steps"]
+        assert not any(s.get("id") == "action-plan" for s in steps)
+        gate = next(s for s in steps if s.get("id") == "gate")
+        assert "--action-plan" not in gate["run"]
 
     def test_gate_step_requires_a_baseline_and_never_falls_through(self, workflow):
         steps = workflow["jobs"]["cost-gate"]["steps"]

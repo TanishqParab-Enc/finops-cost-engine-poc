@@ -317,24 +317,41 @@ jobs:
               json.dump(plan_doc, fh)
           PY
 
-      # Purely cosmetic: labels which resources this change actually touches
-      # in the report's breakdown. It never affects pricing, the threshold,
-      # the cost lock or the AI context, so unlike the baseline above it is
-      # explicitly allowed to fail without failing the gate.
-      - name: Terraform plan (real diff = resource action labels)
-        id: action-plan
-        continue-on-error: true
+      # THE PROPOSED COST. Planned in the same real-backend directory as the
+      # baseline above, so both documents describe the same stack from the
+      # same state snapshot and differ ONLY by what this change actually
+      # does. `-refresh=false` is what makes that true: the plan reuses the
+      # exact state values the baseline was priced from, so a resource the
+      # change does not touch prices identically on both sides and cancels
+      # out of the delta. `-lock=false` so it can never contend with a
+      # concurrent deploy's state lock.
+      #
+      # Planning from EMPTY state instead (the previous hermetic local
+      # backend) silently mispriced any resource whose cost depends on a
+      # reference Terraform cannot resolve until apply. Measured on
+      # web-platform/dev: an autoscaling group's `launch_template.id` is
+      # "known after apply" from empty state, so Infracost could not attach
+      # the launch template and priced the group at $0 - while the
+      # state-derived baseline priced it correctly. A t3.large -> t3.xlarge
+      # upgrade was therefore reported as a $66.04/mo SAVING instead of a
+      # $60.74/mo increase. This is generic, not an autoscaling-group quirk:
+      # any unresolved reference produces the same asymmetry.
+      #
+      # A greenfield stack is unaffected: with no deployed state this plans
+      # every resource as a create, exactly as the hermetic plan did.
+      - name: Terraform plan (proposed state = proposed cost)
+        id: proposed
         working-directory: baseline/${{ matrix.stack.dir }}
         run: |
           set -euo pipefail
-          terraform plan -input=false -no-color -lock=false -refresh=false -out=action.tfplan
-          terraform show -json action.tfplan > "$GITHUB_WORKSPACE/action-plan.json"
+          terraform plan -input=false -no-color -lock=false -refresh=false -out=proposed.tfplan
+          terraform show -json proposed.tfplan > "$GITHUB_WORKSPACE/proposed-plan.json"
 
-      # The proposed plan alone still uses a throwaway local backend (never
-      # live state) - the pull request's change is priced from an ephemeral
-      # empty state, exactly as before this fix; only the BASELINE side now
-      # reads the real deployed state.
-      - name: Terraform plan (PR head = proposed cost)
+      # Only the aws stack's drift assertion below consumes this. It compares
+      # two plans built the SAME hermetic way, so it must keep its own
+      # hermetic document rather than reuse the real proposed plan above.
+      - name: Terraform plan (hermetic head config, aws drift check only)
+        if: matrix.stack.name == 'aws'
         working-directory: head/${{ matrix.stack.dir }}
         run: |
           set -euo pipefail
@@ -345,7 +362,7 @@ jobs:
           EOF
           terraform init -input=false -no-color
           terraform plan -input=false -no-color -refresh=false -out=tfplan.binary
-          terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/proposed-plan.json"
+          terraform show -json tfplan.binary > "$GITHUB_WORKSPACE/head-config-plan.json"
 
       # The gate prices the auto-loaded terraform.tfvars, but a dev deploy
       # applies environments/dev.tfvars on top of it. Nothing otherwise forces
@@ -394,7 +411,7 @@ jobs:
                   sys.exit(1)
               return {name: item.get("value") for name, item in block.items()}
 
-          gated = resolved_vars(ws + "/proposed-plan.json")
+          gated = resolved_vars(ws + "/head-config-plan.json")
           deployed = resolved_vars(ws + "/dev-config-plan.json")
 
           missing = sorted(n for n in REQUIRED if n not in gated or n not in deployed)
@@ -414,7 +431,7 @@ jobs:
               if drift:
                   failed = True
 
-          gfp = normalize_plan_file(ws + "/proposed-plan.json").fingerprint()
+          gfp = normalize_plan_file(ws + "/head-config-plan.json").fingerprint()
           dfp = normalize_plan_file(ws + "/dev-config-plan.json").fingerprint()
           print("")
           print("resource fingerprint  cost-gated : " + gfp)
@@ -460,13 +477,9 @@ jobs:
           fi
           BASELINE_ARG="--baseline-plan $GITHUB_WORKSPACE/baseline-plan.json"
 
-          # Optional and purely additive: only affects which resources the
-          # report lists as changed, never pricing/threshold/lock. Missing
-          # (e.g. the earlier step failed) just means no action wiring.
-          ACTION_ARG=""
-          if [ -f "$GITHUB_WORKSPACE/action-plan.json" ]; then
-            ACTION_ARG="--action-plan $GITHUB_WORKSPACE/action-plan.json"
-          fi
+          # The proposed plan is now itself a real diff against the deployed
+          # state, so it already carries each resource's true Terraform
+          # action - no separate action document is needed.
 
           # A cost lock authorises deployment. A stack the registry marks
           # non-deployable must never mint one, however cheap it prices.
@@ -479,7 +492,6 @@ jobs:
           finops analyze \
             --plan "$GITHUB_WORKSPACE/proposed-plan.json" \
             $BASELINE_ARG \
-            $ACTION_ARG \
             --require-baseline \
             --stack "${{ matrix.stack.name }}" \
             $LOCK_ARG \
