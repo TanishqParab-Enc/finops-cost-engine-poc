@@ -41,6 +41,14 @@ inputs:
     description: Resource name prefix of the deployed workload, for scoping deploy-role IAM/S3 writes
     required: false
     default: ''
+  additional-workload-name-prefixes:
+    description: JSON array of further workload name prefixes, one per additional registered workload
+    required: false
+    default: '[]'
+  data-service-workload-prefixes:
+    description: JSON array of workload prefixes permitted to manage SQS, ElastiCache and their own Secrets Manager entries
+    required: false
+    default: '[]'
 
 runs:
   using: composite
@@ -101,6 +109,9 @@ runs:
 
         extra_deploy_actions = ${{ inputs.extra-deploy-actions }}
         workload_name_prefix = "${{ inputs.workload-name-prefix }}"
+
+        additional_workload_name_prefixes = ${{ inputs.additional-workload-name-prefixes }}
+        data_service_workload_prefixes    = ${{ inputs.data-service-workload-prefixes }}
         EOF
 
     # Plan to a file first, then apply exactly that plan. Applying a saved plan

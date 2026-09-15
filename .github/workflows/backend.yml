@@ -347,6 +347,8 @@ jobs:
           bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
           extra-deploy-actions: ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
           workload-name-prefix: ${{ vars.WORKLOAD_NAME_PREFIX || '' }}
+          additional-workload-name-prefixes: ${{ vars.ADDITIONAL_WORKLOAD_NAME_PREFIXES_JSON || '[]' }}
+          data-service-workload-prefixes: ${{ vars.DATA_SERVICE_WORKLOAD_PREFIXES_JSON || '[]' }}
 
   # Not reachable from a push. Required reviewers are unavailable on this plan,
   # so an automatic production apply would be an unreviewed production change.
@@ -396,3 +398,5 @@ jobs:
           bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
           extra-deploy-actions: ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
           workload-name-prefix: ${{ vars.WORKLOAD_NAME_PREFIX || '' }}
+          additional-workload-name-prefixes: ${{ vars.ADDITIONAL_WORKLOAD_NAME_PREFIXES_JSON || '[]' }}
+          data-service-workload-prefixes: ${{ vars.DATA_SERVICE_WORKLOAD_PREFIXES_JSON || '[]' }}
