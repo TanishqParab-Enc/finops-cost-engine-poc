@@ -2,9 +2,8 @@ name: Backend Terraform
 
 # One workflow for the backend/ Terraform: plan on pull requests and on pushes
 # to main (both environments, read-only, for visibility). Apply NEVER runs
-# automatically - it only runs via a manual workflow_dispatch that picks
-# exactly one environment (dev or prod). A push to main never applies
-# anything and never cascades across environments.
+# automatically - it only runs via a manual workflow_dispatch. A push to main
+# never applies anything and never cascades across environments.
 #
 # BOOTSTRAP IS NOT RUN HERE. backend/bootstrap creates the S3 state bucket, the
 # GitHub OIDC provider and the IAM roles that THIS workflow authenticates with,
@@ -12,16 +11,17 @@ name: Backend Terraform
 # detects the missing configuration and skips everything with a clear message
 # instead of failing on "Could not load credentials".
 #
-# PRODUCTION APPROVAL - VERIFIED LIMITATION (2026-09-02, revised 2026-09-15)
-# This repository is private on a personal account, and the GitHub API rejects
-# required-reviewer rules with HTTP 422 ("billing plan"), so no Environment
-# here gates an apply behind a human. This POC only ever created a `dev`
-# Environment, so apply-prod now references `dev` too - pointing it at a
-# `production` Environment that does not exist was simply an invalid
-# reference, not a control. The typed confirmation on apply-prod remains its
-# only gate, and prod never runs from a push - it requires a manual
-# workflow_dispatch. Create a real `production` Environment with a required
-# reviewer before treating a prod apply as reviewed. See backend/README.md.
+# DEV-ONLY (2026-09-15)
+# This POC deploys dev only. `dev` is the sole GitHub Environment that exists
+# for applies, and the apply-prod job is commented out below rather than
+# deleted so it can be restored by uncommenting. Prod is still PLANNED
+# (read-only) so drift stays visible; nothing can apply it.
+#
+# Before re-enabling prod: create a real `production` Environment with a
+# required reviewer. Note that required-reviewer rules were rejected on this
+# account with HTTP 422 ("billing plan"), so no Environment here currently
+# gates an apply behind a human - the typed confirmation is the only gate.
+# See backend/README.md.
 
 # Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
 "on":
@@ -353,56 +353,56 @@ jobs:
           additional-workload-name-prefixes: ${{ vars.ADDITIONAL_WORKLOAD_NAME_PREFIXES_JSON || '[]' }}
           data-service-workload-prefixes: ${{ vars.DATA_SERVICE_WORKLOAD_PREFIXES_JSON || '[]' }}
 
-  # Not reachable from a push. Required reviewers are unavailable on this plan,
-  # so an automatic production apply would be an unreviewed production change.
-  apply-prod:
-    name: Apply prod
-    needs: [preflight, plan]
-    if: |
-      needs.preflight.outputs.configured == 'true' &&
-      github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
-    runs-on: ubuntu-latest
-    # This POC only has a `dev` GitHub Environment; `production` was never
-    # created, so referencing it was invalid. The typed `prod` confirmation
-    # below remains the gate on this job.
-    environment: dev
-    steps:
-      - name: Verify production confirmation
-        env:
-          CONFIRM: ${{ inputs.confirm }}
-        run: |
-          if [ "$CONFIRM" != "prod" ]; then
-            echo "::error title=Confirmation required::Re-run and type 'prod' in the confirm input."
-            exit 1
-          fi
-          echo "Production apply confirmed by ${{ github.actor }}."
-
-      - uses: actions/checkout@v4
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TERRAFORM_VERSION }}
-          terraform_wrapper: false
-
-      - name: Configure AWS credentials (deploy role)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: backend-apply-prod-${{ github.run_id }}
-
-      - uses: ./.github/actions/terraform-apply
-        with:
-          environment: prod
-          aws-region: ${{ env.AWS_REGION }}
-          state-bucket: ${{ vars.TF_STATE_BUCKET }}
-          state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
-          project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
-          oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
-          bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
-          bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
-          bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
-          extra-deploy-actions: ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
-          workload-name-prefix: ${{ vars.WORKLOAD_NAME_PREFIX || '' }}
-          additional-workload-name-prefixes: ${{ vars.ADDITIONAL_WORKLOAD_NAME_PREFIXES_JSON || '[]' }}
-          data-service-workload-prefixes: ${{ vars.DATA_SERVICE_WORKLOAD_PREFIXES_JSON || '[]' }}
+  # DISABLED for the dev-only POC. Kept verbatim so prod can be restored by
+  # uncommenting this block. Before doing so, create a `production` GitHub
+  # Environment - the `environment:` line below references it, and pointing it
+  # at `dev` instead would give a prod apply dev's secrets and OIDC subject.
+  #
+  # apply-prod:
+  #   name: Apply prod
+  #   needs: [preflight, plan]
+  #   if: |
+  #     needs.preflight.outputs.configured == 'true' &&
+  #     github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
+  #   runs-on: ubuntu-latest
+  #   environment: production
+  #   steps:
+  #     - name: Verify production confirmation
+  #       env:
+  #         CONFIRM: ${{ inputs.confirm }}
+  #       run: |
+  #         if [ "$CONFIRM" != "prod" ]; then
+  #           echo "::error title=Confirmation required::Re-run and type 'prod' in the confirm input."
+  #           exit 1
+  #         fi
+  #         echo "Production apply confirmed by ${{ github.actor }}."
+  #
+  #     - uses: actions/checkout@v4
+  #
+  #     - uses: hashicorp/setup-terraform@v3
+  #       with:
+  #         terraform_version: ${{ env.TERRAFORM_VERSION }}
+  #         terraform_wrapper: false
+  #
+  #     - name: Configure AWS credentials (deploy role)
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+  #         aws-region: ${{ env.AWS_REGION }}
+  #         role-session-name: backend-apply-prod-${{ github.run_id }}
+  #
+  #     - uses: ./.github/actions/terraform-apply
+  #       with:
+  #         environment: prod
+  #         aws-region: ${{ env.AWS_REGION }}
+  #         state-bucket: ${{ vars.TF_STATE_BUCKET }}
+  #         state-key-prefix: ${{ vars.TF_STATE_KEY_PREFIX || 'finops-poc' }}
+  #         project-name: ${{ vars.PROJECT_NAME || 'finops-poc' }}
+  #         oidc-provider-arn: ${{ vars.AWS_OIDC_PROVIDER_ARN }}
+  #         bedrock-model-id: ${{ vars.FINOPS_BEDROCK_MODEL }}
+  #         bedrock-inference-profile-arn: ${{ vars.BEDROCK_INFERENCE_PROFILE_ARN }}
+  #         bedrock-foundation-model-arns: ${{ vars.BEDROCK_FOUNDATION_MODEL_ARNS }}
+  #         extra-deploy-actions: ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
+  #         workload-name-prefix: ${{ vars.WORKLOAD_NAME_PREFIX || '' }}
+  #         additional-workload-name-prefixes: ${{ vars.ADDITIONAL_WORKLOAD_NAME_PREFIXES_JSON || '[]' }}
+  #         data-service-workload-prefixes: ${{ vars.DATA_SERVICE_WORKLOAD_PREFIXES_JSON || '[]' }}
