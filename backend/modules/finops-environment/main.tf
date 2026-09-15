@@ -225,6 +225,70 @@ data "aws_iam_policy_document" "deploy_write" {
   }
 
   # ---------------------------------------------------------------------
+  # Service-linked roles (SLRs). AWS auto-creates certain services' SLR the
+  # first time that service is used in the account - but only if the CALLER
+  # (this deploy role) is allowed to call iam:CreateServiceLinkedRole; without
+  # it, the workload's own create call fails with
+  # ServiceLinkedRoleNotFoundFault (reproduced for real with ElastiCache
+  # below). Each statement is scoped two ways at once, narrower than "any
+  # service": the resource ARN matches only that one service's own fixed SLR
+  # path, and the iam:AWSServiceName condition additionally restricts which
+  # service is allowed to have its role created through that statement - AWS
+  # itself ties the two together per call, so a mismatched (service,
+  # resource) pair can never succeed even if some future statement listed
+  # several of each. None of these paths overlap the deploy/plan role ARNs
+  # DenySelfPrivilegeEscalation protects, and CreateServiceLinkedRole is not
+  # one of the actions that Deny blocks in the first place.
+  #
+  # Auto Scaling, ELB and RDS are unconditional (not gated by any workload
+  # prefix) because every currently registered workload uses an Auto Scaling
+  # group, a load balancer and an RDS instance - they are as foundational as
+  # ManagePocCompute's own EC2 actions above, not specific to one workload.
+  # All three SLRs already exist in this account, so applying this changes
+  # nothing observable today; it exists so a workload deployed against a
+  # DIFFERENT AWS account (where they do not yet exist) does not fail the
+  # same way ElastiCache just did here.
+  # ---------------------------------------------------------------------
+  statement {
+    sid       = "CreateAutoScalingServiceLinkedRole"
+    effect    = "Allow"
+    actions   = ["iam:CreateServiceLinkedRole"]
+    resources = ["arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:AWSServiceName"
+      values   = ["autoscaling.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "CreateElasticLoadBalancingServiceLinkedRole"
+    effect    = "Allow"
+    actions   = ["iam:CreateServiceLinkedRole"]
+    resources = ["arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/elasticloadbalancing.amazonaws.com/AWSServiceRoleForElasticLoadBalancing"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:AWSServiceName"
+      values   = ["elasticloadbalancing.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "CreateRdsServiceLinkedRole"
+    effect    = "Allow"
+    actions   = ["iam:CreateServiceLinkedRole"]
+    resources = ["arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/rds.amazonaws.com/AWSServiceRoleForRDS"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:AWSServiceName"
+      values   = ["rds.amazonaws.com"]
+    }
+  }
+
+  # ---------------------------------------------------------------------
   # Workload IAM: the instance role/profile ANY registered workload creates
   # for its own EC2 instances (never the deploy or plan role itself).
   # Resource: "*" so this pipeline can deploy any registered workload without
@@ -453,6 +517,35 @@ data "aws_iam_policy_document" "deploy_write" {
       resources = ["*"]
     }
   }
+
+  # ElastiCache's own SLR (see the general SLR comment above). Gated by
+  # data_service_workload_prefixes rather than unconditional like the three
+  # above: unlike Auto Scaling/ELB/RDS, not every registered workload uses
+  # ElastiCache, so this only turns on for the ones that do. This SLR does
+  # NOT already exist in this account - reproduced for real: ecommerce-platform
+  # failed CreateCacheSubnetGroup with ServiceLinkedRoleNotFoundFault before
+  # this statement was added.
+  dynamic "statement" {
+    for_each = length(var.data_service_workload_prefixes) > 0 ? [1] : []
+
+    content {
+      sid    = "CreateElastiCacheServiceLinkedRole"
+      effect = "Allow"
+      actions = [
+        "iam:CreateServiceLinkedRole",
+      ]
+      resources = [
+        "arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/elasticache.amazonaws.com/AWSServiceRoleForElastiCache",
+      ]
+
+      condition {
+        test     = "StringEquals"
+        variable = "iam:AWSServiceName"
+        values   = ["elasticache.amazonaws.com"]
+      }
+    }
+  }
+
 
   # ElastiCache's Describe* calls do not support resource-level permissions, so
   # they cannot live in the name-scoped statement above. They are read-only and
