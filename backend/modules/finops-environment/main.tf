@@ -29,9 +29,11 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
 
-  # Every registered workload this deploy role may manage. Each statement below
-  # expands to one name-scoped ARN per prefix, so adding a workload never
-  # widens an existing one's reach.
+  # Registered workloads that TURN ON the generic workload-management
+  # statements below (ManageWorkloadInstanceRole, ManageWorkloadAssetBucket,
+  # ManageWorkloadDataServices, ...). No longer used to SCOPE those
+  # statements - their resources are "*" so any registered workload is
+  # covered without a corresponding IAM change here.
   workload_prefixes = compact(concat([var.workload_name_prefix], var.additional_workload_name_prefixes))
 
   # Must match the names github-actions-roles derives, so the anti-escalation
@@ -223,14 +225,17 @@ data "aws_iam_policy_document" "deploy_write" {
   }
 
   # ---------------------------------------------------------------------
-  # Workload IAM: the instance role/profile the web-platform workload
-  # creates for its own EC2 instances (never the deploy or plan role
-  # itself). Scoped to <workload_name_prefix>-* so this cannot touch any
-  # other IAM role in the account, matching how the backend's own
-  # self-management statements below are scoped to <project_name>-*.
-  # PassRole is additionally restricted to EC2 as the passed-to service, so
-  # the deploy role cannot pass this role to a different, more privileged
-  # context.
+  # Workload IAM: the instance role/profile ANY registered workload creates
+  # for its own EC2 instances (never the deploy or plan role itself).
+  # Resource: "*" so this pipeline can deploy any registered workload without
+  # a corresponding IAM change here - name-scoping this to one workload's
+  # prefix would defeat the point of a shared, generic deploy path. The
+  # deploy/plan roles themselves stay untouchable regardless: the explicit
+  # DenySelfPrivilegeEscalation statement below denies these same write
+  # actions on their exact ARNs, and Deny always wins over Allow. PassRole is
+  # additionally restricted to EC2 as the passed-to service (next statement),
+  # so this cannot be used to hand a role to a different, more privileged
+  # service context.
   # ---------------------------------------------------------------------
   dynamic "statement" {
     for_each = length(local.workload_prefixes) > 0 ? [1] : []
@@ -260,13 +265,13 @@ data "aws_iam_policy_document" "deploy_write" {
         "iam:TagInstanceProfile",
         "iam:UntagInstanceProfile",
       ]
-      resources = concat(
-        [for p in local.workload_prefixes : "arn:${local.partition}:iam::${local.account_id}:role/${p}-*"],
-        [for p in local.workload_prefixes : "arn:${local.partition}:iam::${local.account_id}:instance-profile/${p}-*"],
-      )
+      resources = ["*"]
     }
   }
 
+  # Resource: "*", for the same generic-across-workloads reason as above.
+  # The condition below is what actually bounds this now: an instance can
+  # only ever assume a role AS EC2, never as a more privileged service.
   dynamic "statement" {
     for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
@@ -274,7 +279,7 @@ data "aws_iam_policy_document" "deploy_write" {
       sid       = "PassWorkloadInstanceRoleToEc2Only"
       effect    = "Allow"
       actions   = ["iam:PassRole"]
-      resources = [for p in local.workload_prefixes : "arn:${local.partition}:iam::${local.account_id}:role/${p}-*"]
+      resources = ["*"]
 
       condition {
         test     = "StringEquals"
@@ -284,8 +289,10 @@ data "aws_iam_policy_document" "deploy_write" {
     }
   }
 
-  # Workload's own asset bucket (object-storage module) - never the
-  # Terraform state bucket, which has its own dedicated statement above.
+  # Workload's own asset bucket(s) - never the Terraform state bucket, which
+  # has its own dedicated statement (ManageStateBucketConfig) scoped to
+  # var.state_bucket_name only. Resource: "*" so any registered workload's
+  # bucket, whatever it is named, is covered without an IAM change here.
   dynamic "statement" {
     for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
@@ -307,7 +314,7 @@ data "aws_iam_policy_document" "deploy_write" {
         "s3:PutBucketVersioning",
         "s3:GetBucketVersioning",
       ]
-      resources = [for p in local.workload_prefixes : "arn:${local.partition}:s3:::${p}-*"]
+      resources = ["*"]
     }
   }
 
@@ -399,14 +406,12 @@ data "aws_iam_policy_document" "deploy_write" {
     }
   }
 
-  # SQS, ElastiCache and the workload's OWN Secrets Manager entries, introduced
-  # by the ecommerce-platform workload. All three support resource-level
-  # permissions, so they are scoped by name to <prefix>-* rather than added to
-  # the region-wide ManagePocCompute statement - a deploy role that can create
-  # a queue for one workload still cannot touch another's. Secrets Manager
-  # appends a random 6-character suffix to every secret ARN, hence the trailing
-  # wildcard. This is separate from ManageWorkloadRdsManagedSecret above, which
-  # covers the RDS-generated "rds!" secrets the deploy role does not name.
+  # SQS, ElastiCache and a workload's OWN Secrets Manager entries. All three
+  # support resource-level permissions, but name-scoping them would mean every
+  # newly registered workload needs its own IAM change here - the opposite of
+  # what a shared deploy pipeline is for. Resource: "*" instead. This is
+  # separate from ManageWorkloadRdsManagedSecret above, which covers the
+  # RDS-generated "rds!" secrets the deploy role does not name.
   dynamic "statement" {
     for_each = length(var.data_service_workload_prefixes) > 0 ? [1] : []
 
@@ -434,7 +439,7 @@ data "aws_iam_policy_document" "deploy_write" {
         "elasticache:AddTagsToResource",
         "elasticache:RemoveTagsFromResource",
         "elasticache:ListTagsForResource",
-        # Secrets Manager: the workload's own application config secret only.
+        # Secrets Manager: a workload's own application config secret only.
         "secretsmanager:CreateSecret",
         "secretsmanager:DeleteSecret",
         "secretsmanager:UpdateSecret",
@@ -445,12 +450,7 @@ data "aws_iam_policy_document" "deploy_write" {
         "secretsmanager:UntagResource",
         "secretsmanager:GetResourcePolicy",
       ]
-      resources = concat(
-        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:sqs:${var.aws_region}:${local.account_id}:${p}-*"],
-        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:elasticache:${var.aws_region}:${local.account_id}:replicationgroup:${p}-*"],
-        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:elasticache:${var.aws_region}:${local.account_id}:subnetgroup:${p}-*"],
-        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:secretsmanager:${var.aws_region}:${local.account_id}:secret:${p}-*"],
-      )
+      resources = ["*"]
     }
   }
 
