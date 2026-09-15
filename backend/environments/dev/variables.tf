@@ -110,6 +110,18 @@ variable "workload_name_prefix" {
   default     = ""
 }
 
+variable "additional_workload_name_prefixes" {
+  description = "Further workload name prefixes scoped exactly like workload_name_prefix, one per additional registered workload."
+  type        = list(string)
+  default     = []
+}
+
+variable "data_service_workload_prefixes" {
+  description = "Workload name prefixes permitted to manage SQS, ElastiCache and their own Secrets Manager entries."
+  type        = list(string)
+  default     = []
+}
+
 variable "tags" {
   description = "Additional tags merged onto every resource."
   type        = map(string)

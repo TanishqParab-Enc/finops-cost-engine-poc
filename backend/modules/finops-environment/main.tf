@@ -16,18 +16,23 @@ data "aws_partition" "current" {}
 # than "*", per the narrowest-fix requirement - no customer CMK is created,
 # and none of the default key's own policy needs to change.
 data "aws_kms_key" "workload_rds_default" {
-  count  = var.workload_name_prefix != "" ? 1 : 0
+  count  = length(local.workload_prefixes) > 0 ? 1 : 0
   key_id = "alias/aws/rds"
 }
 
 data "aws_kms_key" "workload_secretsmanager_default" {
-  count  = var.workload_name_prefix != "" ? 1 : 0
+  count  = length(local.workload_prefixes) > 0 ? 1 : 0
   key_id = "alias/aws/secretsmanager"
 }
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
+
+  # Every registered workload this deploy role may manage. Each statement below
+  # expands to one name-scoped ARN per prefix, so adding a workload never
+  # widens an existing one's reach.
+  workload_prefixes = compact(concat([var.workload_name_prefix], var.additional_workload_name_prefixes))
 
   # Must match the names github-actions-roles derives, so the anti-escalation
   # Deny below targets the right role ARNs.
@@ -195,6 +200,7 @@ data "aws_iam_policy_document" "deploy_write" {
       "ec2:DeleteNatGateway",
       "ec2:AllocateAddress",
       "ec2:ReleaseAddress",
+      "ec2:DisassociateAddress",
       "ec2:CreateTags",
       "ec2:DeleteTags",
     ], var.extra_deploy_actions)
@@ -227,7 +233,7 @@ data "aws_iam_policy_document" "deploy_write" {
   # context.
   # ---------------------------------------------------------------------
   dynamic "statement" {
-    for_each = var.workload_name_prefix != "" ? [1] : []
+    for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
     content {
       sid    = "ManageWorkloadInstanceRole"
@@ -254,21 +260,21 @@ data "aws_iam_policy_document" "deploy_write" {
         "iam:TagInstanceProfile",
         "iam:UntagInstanceProfile",
       ]
-      resources = [
-        "arn:${local.partition}:iam::${local.account_id}:role/${var.workload_name_prefix}-*",
-        "arn:${local.partition}:iam::${local.account_id}:instance-profile/${var.workload_name_prefix}-*",
-      ]
+      resources = concat(
+        [for p in local.workload_prefixes : "arn:${local.partition}:iam::${local.account_id}:role/${p}-*"],
+        [for p in local.workload_prefixes : "arn:${local.partition}:iam::${local.account_id}:instance-profile/${p}-*"],
+      )
     }
   }
 
   dynamic "statement" {
-    for_each = var.workload_name_prefix != "" ? [1] : []
+    for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
     content {
       sid       = "PassWorkloadInstanceRoleToEc2Only"
       effect    = "Allow"
       actions   = ["iam:PassRole"]
-      resources = ["arn:${local.partition}:iam::${local.account_id}:role/${var.workload_name_prefix}-*"]
+      resources = [for p in local.workload_prefixes : "arn:${local.partition}:iam::${local.account_id}:role/${p}-*"]
 
       condition {
         test     = "StringEquals"
@@ -281,7 +287,7 @@ data "aws_iam_policy_document" "deploy_write" {
   # Workload's own asset bucket (object-storage module) - never the
   # Terraform state bucket, which has its own dedicated statement above.
   dynamic "statement" {
-    for_each = var.workload_name_prefix != "" ? [1] : []
+    for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
     content {
       sid    = "ManageWorkloadAssetBucket"
@@ -301,7 +307,7 @@ data "aws_iam_policy_document" "deploy_write" {
         "s3:PutBucketVersioning",
         "s3:GetBucketVersioning",
       ]
-      resources = ["arn:${local.partition}:s3:::${var.workload_name_prefix}-*"]
+      resources = [for p in local.workload_prefixes : "arn:${local.partition}:s3:::${p}-*"]
     }
   }
 
@@ -311,7 +317,7 @@ data "aws_iam_policy_document" "deploy_write" {
   # statement without that condition rather than silently risking an
   # implicit deny from a condition that never matches.
   dynamic "statement" {
-    for_each = var.workload_name_prefix != "" ? [1] : []
+    for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
     content {
       sid    = "ManageWorkloadGlobalServices"
@@ -350,7 +356,7 @@ data "aws_iam_policy_document" "deploy_write" {
   # grant for the handful of actions RDS/Secrets Manager need it to take on
   # its behalf - scoped to exactly these two key ARNs, never "*".
   dynamic "statement" {
-    for_each = var.workload_name_prefix != "" ? [1] : []
+    for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
     content {
       sid    = "ManageWorkloadDefaultKmsKeys"
@@ -368,6 +374,109 @@ data "aws_iam_policy_document" "deploy_write" {
         data.aws_kms_key.workload_rds_default[0].arn,
         data.aws_kms_key.workload_secretsmanager_default[0].arn,
       ]
+    }
+  }
+
+  # manage_master_user_password=true makes RDS create the master-password
+  # secret itself, but it does so using the CALLER's (deploy role's) own
+  # credentials, not a service-linked role - so the deploy role needs these
+  # two Secrets Manager actions directly. RDS always names these secrets
+  # with the reserved "rds!" prefix and a randomly-generated suffix it
+  # controls (never a name this config chooses), so "secret:rds!*" is the
+  # narrowest resource pattern AWS permits for this feature - not a guess,
+  # this matches AWS's own documented minimum policy for the feature.
+  dynamic "statement" {
+    for_each = length(local.workload_prefixes) > 0 ? [1] : []
+
+    content {
+      sid    = "ManageWorkloadRdsManagedSecret"
+      effect = "Allow"
+      actions = [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:TagResource",
+      ]
+      resources = ["arn:${local.partition}:secretsmanager:${var.aws_region}:${local.account_id}:secret:rds!*"]
+    }
+  }
+
+  # SQS, ElastiCache and the workload's OWN Secrets Manager entries, introduced
+  # by the ecommerce-platform workload. All three support resource-level
+  # permissions, so they are scoped by name to <prefix>-* rather than added to
+  # the region-wide ManagePocCompute statement - a deploy role that can create
+  # a queue for one workload still cannot touch another's. Secrets Manager
+  # appends a random 6-character suffix to every secret ARN, hence the trailing
+  # wildcard. This is separate from ManageWorkloadRdsManagedSecret above, which
+  # covers the RDS-generated "rds!" secrets the deploy role does not name.
+  dynamic "statement" {
+    for_each = length(var.data_service_workload_prefixes) > 0 ? [1] : []
+
+    content {
+      sid    = "ManageWorkloadDataServices"
+      effect = "Allow"
+      actions = [
+        # SQS: queue lifecycle plus the queue policy, which Terraform applies
+        # through SetQueueAttributes rather than a distinct API call.
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:TagQueue",
+        "sqs:UntagQueue",
+        "sqs:ListQueueTags",
+        # ElastiCache: replication group and its subnet group.
+        "elasticache:CreateReplicationGroup",
+        "elasticache:DeleteReplicationGroup",
+        "elasticache:ModifyReplicationGroup",
+        "elasticache:CreateCacheSubnetGroup",
+        "elasticache:DeleteCacheSubnetGroup",
+        "elasticache:ModifyCacheSubnetGroup",
+        "elasticache:AddTagsToResource",
+        "elasticache:RemoveTagsFromResource",
+        "elasticache:ListTagsForResource",
+        # Secrets Manager: the workload's own application config secret only.
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:TagResource",
+        "secretsmanager:UntagResource",
+        "secretsmanager:GetResourcePolicy",
+      ]
+      resources = concat(
+        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:sqs:${var.aws_region}:${local.account_id}:${p}-*"],
+        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:elasticache:${var.aws_region}:${local.account_id}:replicationgroup:${p}-*"],
+        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:elasticache:${var.aws_region}:${local.account_id}:subnetgroup:${p}-*"],
+        [for p in var.data_service_workload_prefixes : "arn:${local.partition}:secretsmanager:${var.aws_region}:${local.account_id}:secret:${p}-*"],
+      )
+    }
+  }
+
+  # ElastiCache's Describe* calls do not support resource-level permissions, so
+  # they cannot live in the name-scoped statement above. They are read-only and
+  # confined to this region.
+  dynamic "statement" {
+    for_each = length(var.data_service_workload_prefixes) > 0 ? [1] : []
+
+    content {
+      sid    = "DescribeWorkloadDataServices"
+      effect = "Allow"
+      actions = [
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:DescribeCacheSubnetGroups",
+        "elasticache:DescribeCacheClusters",
+        "sqs:ListQueues",
+        "secretsmanager:ListSecrets",
+      ]
+      resources = ["*"]
+
+      condition {
+        test     = "StringEquals"
+        variable = "aws:RequestedRegion"
+        values   = [var.aws_region]
+      }
     }
   }
 

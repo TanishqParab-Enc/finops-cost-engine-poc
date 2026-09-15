@@ -77,9 +77,25 @@ extra_deploy_actions = [
   "logs:DescribeLogGroups", "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",
   "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:DescribeAlarms",
   "cloudwatch:TagResource", "cloudwatch:UntagResource", "cloudwatch:ListTagsForResource",
+
+  # Resource types the ecommerce-platform workload adds. SQS, ElastiCache and
+  # its own Secrets Manager entries support resource-level permissions and are
+  # name-scoped in the module instead (see data_service_workload_prefixes).
+  "rds:CreateDBParameterGroup", "rds:DeleteDBParameterGroup", "rds:ModifyDBParameterGroup",
+  "rds:DescribeDBParameterGroups", "rds:DescribeDBParameters",
+  "autoscaling:PutScalingPolicy", "autoscaling:DeletePolicy", "autoscaling:DescribePolicies",
 ]
 
 # Scopes the module's workload IAM/S3/global-service statements to this
 # workload's own resources (webplatform-dev-*, webplatform-dev-assets).
 workload_name_prefix = "webplatform"
+
+# One entry per additional registered workload. Each contributes its own
+# <prefix>-* ARNs to the same statements, so no workload can reach another's
+# resources. ecommerce-platform names everything shopfront-dev-*.
+additional_workload_name_prefixes = ["shopfront"]
+
+# Only the workloads that actually use SQS, ElastiCache and their own Secrets
+# Manager entry. web-platform is deliberately absent - it uses none of them.
+data_service_workload_prefixes = ["shopfront"]
 

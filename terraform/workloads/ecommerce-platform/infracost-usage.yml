@@ -1,0 +1,54 @@
+# Documented usage assumptions for the consumption-priced parts of this
+# workload, consumed by the shared FinOps pipeline as Infracost --usage-file.
+#
+# S3, CloudFront, SQS and CloudWatch bill on usage, not on configuration, so
+# Terraform alone cannot tell Infracost how much they will cost. Without this
+# file those resources price at $0 and the breakdown silently understates the
+# bill. These are assumptions, not measurements - the parser flags every
+# resource priced this way as usage_based and the gate surfaces a coverage
+# warning.
+#
+# Figures represent a small production storefront: roughly 3M page views and
+# 150k orders per month.
+version: 0.1
+
+resource_usage:
+  module.storage.aws_s3_bucket.assets:
+    standard:
+      storage_gb: 250
+      monthly_tier_1_requests: 300000
+      monthly_tier_2_requests: 3000000
+      monthly_select_data_scanned_gb: 0
+      monthly_select_data_returned_gb: 0
+
+  module.edge.aws_cloudfront_distribution.main[0]:
+    monthly_data_transfer_to_internet_gb:
+      us: 400
+      europe: 150
+    monthly_data_transfer_to_origin_gb:
+      us: 40
+      europe: 15
+    monthly_http_requests:
+      us: 2000000
+      europe: 800000
+    monthly_https_requests:
+      us: 4000000
+      europe: 1600000
+
+  # One request per order plus receive/delete by the worker tier, and long
+  # polling keeps empty receives low.
+  module.messaging.aws_sqs_queue.orders:
+    monthly_requests: 600000
+
+  module.messaging.aws_sqs_queue.orders_dlq:
+    monthly_requests: 5000
+
+  module.monitoring.aws_cloudwatch_log_group.app:
+    monthly_data_ingested_gb: 25
+    storage_gb: 25
+    monthly_data_scanned_gb: 5
+
+  module.monitoring.aws_cloudwatch_log_group.worker:
+    monthly_data_ingested_gb: 10
+    storage_gb: 10
+    monthly_data_scanned_gb: 2

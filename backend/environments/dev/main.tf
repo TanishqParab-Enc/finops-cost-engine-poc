@@ -47,5 +47,8 @@ module "backend" {
   extra_deploy_actions = var.extra_deploy_actions
   workload_name_prefix = var.workload_name_prefix
 
+  additional_workload_name_prefixes = var.additional_workload_name_prefixes
+  data_service_workload_prefixes    = var.data_service_workload_prefixes
+
   tags = var.tags
 }

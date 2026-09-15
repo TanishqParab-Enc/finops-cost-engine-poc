@@ -118,6 +118,24 @@ variable "workload_name_prefix" {
   default     = ""
 }
 
+# A second registered workload does not get a second policy or a widened
+# pattern - it appends its own name-scoped ARNs to the same statements, so each
+# workload still reaches only resources carrying its own prefix.
+variable "additional_workload_name_prefixes" {
+  description = "Further workload name prefixes (e.g. [\"shopfront\"]) scoped exactly like workload_name_prefix. Each adds its own <prefix>-* ARNs; none widens another's."
+  type        = list(string)
+  default     = []
+}
+
+# Deliberately separate from the prefix lists above: only the workloads that
+# actually use SQS/ElastiCache/Secrets Manager get those permissions, so
+# registering a workload never hands another one a capability it cannot use.
+variable "data_service_workload_prefixes" {
+  description = "Workload name prefixes permitted to manage SQS queues, ElastiCache groups and their own Secrets Manager entries."
+  type        = list(string)
+  default     = []
+}
+
 # SECURITY: enabling this lets the deploy role write IAM, which is inherently
 # privilege-adjacent. It is scoped to <project_name>-* resources and paired
 # with an explicit Deny protecting the plan and deploy roles themselves. Set

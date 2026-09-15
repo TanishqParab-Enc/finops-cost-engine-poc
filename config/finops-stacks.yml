@@ -40,3 +40,31 @@ stacks:
     usage_file: terraform/workloads/web-platform/infracost-usage.yml
     paths:
       - terraform/workloads/web-platform/
+
+  # A second, entirely independent workload sharing the same governance engine.
+  # Nothing about the gate, the policy, the approval path or the reporting is
+  # specific to either stack - registering a Terraform root here is all it
+  # takes to bring it under FinOps control.
+  ecommerce-platform:
+    terraform_dir: terraform/workloads/ecommerce-platform
+    cloud: aws
+    # The Dev deploy role was widened for the three services this workload
+    # introduces and web-platform does not use - ElastiCache, SQS and its own
+    # Secrets Manager entry - each scoped by name to shopfront-*, plus RDS
+    # parameter groups and Auto Scaling policies. See
+    # backend/environments/dev/terraform.tfvars.
+    #
+    # PREREQUISITE: that policy change must be applied to the backend layer
+    # before a deploy here can succeed. Cost estimation, gating and reporting
+    # work regardless.
+    deployable: true
+    environment: dev
+    # Its own state object, independent of web-platform. Already covered by the
+    # project-wide finops-poc/* state permission, so no IAM change is needed.
+    state_key: finops-poc/dev/ecommerce-platform/terraform.tfstate
+    var_file: null
+    # S3, CloudFront, SQS and CloudWatch bill on consumption, so Terraform
+    # alone cannot price them.
+    usage_file: terraform/workloads/ecommerce-platform/infracost-usage.yml
+    paths:
+      - terraform/workloads/ecommerce-platform/
