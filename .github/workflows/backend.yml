@@ -211,6 +211,12 @@ jobs:
 
           extra_deploy_actions = ${{ vars.EXTRA_DEPLOY_ACTIONS_JSON || '[]' }}
           workload_name_prefix = "${{ vars.WORKLOAD_NAME_PREFIX || '' }}"
+
+          # One entry per additional registered workload. data_service_* is
+          # deliberately narrower: only workloads that actually use SQS,
+          # ElastiCache or their own Secrets Manager entry belong in it.
+          additional_workload_name_prefixes = ${{ vars.ADDITIONAL_WORKLOAD_NAME_PREFIXES_JSON || '[]' }}
+          data_service_workload_prefixes    = ${{ vars.DATA_SERVICE_WORKLOAD_PREFIXES_JSON || '[]' }}
           EOF
 
           echo "::group::rendered tfvars"
