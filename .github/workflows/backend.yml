@@ -12,13 +12,16 @@ name: Backend Terraform
 # detects the missing configuration and skips everything with a clear message
 # instead of failing on "Could not load credentials".
 #
-# PRODUCTION APPROVAL - VERIFIED LIMITATION (2026-09-02)
+# PRODUCTION APPROVAL - VERIFIED LIMITATION (2026-09-02, revised 2026-09-15)
 # This repository is private on a personal account, and the GitHub API rejects
-# required-reviewer rules with HTTP 422 ("billing plan"). `environment:
-# production` is still declared because it scopes the deploy role's OIDC trust
-# subject, which AWS does enforce - but it does NOT gate the apply behind a
-# human. Production therefore never runs from a push; it requires a manual
-# workflow_dispatch with a typed confirmation. See backend/README.md.
+# required-reviewer rules with HTTP 422 ("billing plan"), so no Environment
+# here gates an apply behind a human. This POC only ever created a `dev`
+# Environment, so apply-prod now references `dev` too - pointing it at a
+# `production` Environment that does not exist was simply an invalid
+# reference, not a control. The typed confirmation on apply-prod remains its
+# only gate, and prod never runs from a push - it requires a manual
+# workflow_dispatch. Create a real `production` Environment with a required
+# reviewer before treating a prod apply as reviewed. See backend/README.md.
 
 # Quoted because YAML 1.1 resolves a bare `on` key to boolean true.
 "on":
@@ -359,7 +362,10 @@ jobs:
       needs.preflight.outputs.configured == 'true' &&
       github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
     runs-on: ubuntu-latest
-    environment: production
+    # This POC only has a `dev` GitHub Environment; `production` was never
+    # created, so referencing it was invalid. The typed `prod` confirmation
+    # below remains the gate on this job.
+    environment: dev
     steps:
       - name: Verify production confirmation
         env:
