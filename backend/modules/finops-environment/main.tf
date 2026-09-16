@@ -369,6 +369,14 @@ data "aws_iam_policy_document" "deploy_write" {
         "s3:ListBucket",
         "s3:GetBucket*",
         "s3:PutBucket*",
+        # PutBucket*/GetBucket* above already cover PutBucketPolicy/
+        # GetBucketPolicy (IAM prefix-matches them), but there is no
+        # DeleteBucket* wildcard - DeleteBucket only deletes the bucket
+        # itself, never a sub-resource config. Without this, destroying the
+        # storage module's aws_s3_bucket_policy resource fails with
+        # AccessDenied on s3:DeleteBucketPolicy (reproduced for real
+        # destroying ecommerce-platform's shopfront-dev-product-assets).
+        "s3:DeleteBucketPolicy",
         "s3:GetEncryptionConfiguration",
         "s3:PutEncryptionConfiguration",
         "s3:GetLifecycleConfiguration",
