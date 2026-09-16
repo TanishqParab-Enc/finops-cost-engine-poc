@@ -98,12 +98,6 @@ variable "extra_plan_actions" {
   default     = []
 }
 
-variable "extra_deploy_actions" {
-  description = "Additional write IAM actions for the deploy role."
-  type        = list(string)
-  default     = []
-}
-
 variable "workload_name_prefix" {
   description = "Resource name prefix of the deployed workload, for scoping deploy-role IAM/S3 writes to its own resources."
   type        = string

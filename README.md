@@ -429,7 +429,36 @@ Edge cases covered: cost exactly equal to threshold (PASS), one cent over (FAIL)
 ---
 
 ## Security
-
+> ### ⚠️ The deploy role is intentionally administrative (POC)
+>
+> `finops-poc-dev-deploy-role` is granted `Action = "*"` on `Resource = "*"`.
+> **This is a deliberate POC trade-off, not a least-privilege production IAM
+> design. Do not copy this role into production as-is.**
+>
+> **Why.** The accelerator's goal is "deploy the backend once per AWS account,
+> then plug in any future Terraform stack without adding stack-specific IAM."
+> IAM is an allow-list, so an explicit action catalog can never satisfy that —
+> a service that isn't listed is a service that's denied, which in practice
+> meant discovering a missing permission on every first deploy of a new
+> workload. Full access removes that class of failure entirely.
+>
+> **What still bounds it.** The blast radius is fenced by explicit `Deny`
+> statements and by the pipeline around the role, not by its action list:
+>
+> | Control | Effect |
+> |---|---|
+> | `DenySelfPrivilegeEscalation` | Denies **every** IAM action except `Get*`/`List*` on `finops-poc-dev-deploy-role` and `finops-poc-dev-plan-role`. Written as a `NotAction` deny so a future AWS IAM write action cannot silently fail open. |
+> | `DenyGitHubOidcTrustTampering` | The role cannot delete the GitHub OIDC provider or retarget its thumbprint/audience — it cannot widen who may assume it. |
+> | `DenyStateBucketTampering` | The role cannot delete the state bucket or weaken its policy/versioning/encryption/public-access settings. Object-level access stays open so Terraform can still read/write state and the `.tflock` lock object. |
+> | OIDC trust policy | Only GitHub Actions, only the trusted repo, branch and environment, may assume the role. |
+> | FinOps gate | Plan → Infracost → deterministic threshold policy → approval environment all run **before** apply; the apply consumes the saved plan rather than re-planning. Full AWS permissions do not skip any of these. |
+> | Destroy approval | The `finops-destroy-approval` environment still gates every destroy. |
+>
+> **Residual risk, stated plainly.** Within a single governed run the role can
+> still create *new* IAM principals (roles/users/keys) or disable account-level
+> logging — those are not part of the FinOps control plane and are not denied.
+> A production deployment should replace this with a scoped policy plus SCPs
+> or a permissions boundary.
 - **No secrets in source control.** Credentials come from env vars; [.env.example](.env.example) documents them; `.gitignore` excludes `.env`, `*.tfstate`, `*.pem`, `*.key`.
 - **Infracost receives no plan file, no credentials.** Per Infracost's FAQ it sends only cost-determining attributes (instance type, region, tenancy) to `pricing.api.infracost.io`.
 - **Separate AI trust boundary.** [src/finops/plan/sanitizer.py](src/finops/plan/sanitizer.py) applies an allowlist of ~50 cost-relevant attributes, then redacts anything matching sensitive patterns (`password`, `secret`, `token`, `private_key`, `user_data`, …) including nested keys, truncates long strings, and caps list length. A test asserts no SSH key or secret material appears in the AI payload.

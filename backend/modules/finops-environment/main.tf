@@ -81,7 +81,8 @@ locals {
 #
 # The POC provisions aws_instance, aws_ebs_volume and aws_nat_gateway. Actions
 # are listed explicitly so the blast radius is obvious in review; extend via
-# extra_plan_actions / extra_deploy_actions as the POC grows.
+# extra_plan_actions as the POC grows. The deploy role's own write access is
+# no longer extended this way - see DeployAnyWorkloadResource below.
 # ---------------------------------------------------------------------------
 data "aws_iam_policy_document" "plan_read" {
   # terraform plan refreshes state, which requires Describe on every managed
@@ -184,400 +185,43 @@ data "aws_iam_policy_document" "plan_read" {
 }
 
 data "aws_iam_policy_document" "deploy_write" {
-  statement {
-    sid    = "ManagePocCompute"
-    effect = "Allow"
-    actions = concat([
-      "ec2:RunInstances",
-      "ec2:TerminateInstances",
-      "ec2:StartInstances",
-      "ec2:StopInstances",
-      "ec2:ModifyInstanceAttribute",
-      "ec2:CreateVolume",
-      "ec2:DeleteVolume",
-      "ec2:AttachVolume",
-      "ec2:DetachVolume",
-      "ec2:ModifyVolume",
-      "ec2:CreateNatGateway",
-      "ec2:DeleteNatGateway",
-      "ec2:AllocateAddress",
-      "ec2:ReleaseAddress",
-      "ec2:DisassociateAddress",
-      "ec2:CreateTags",
-      "ec2:DeleteTags",
-    ], var.extra_deploy_actions)
-    resources = ["*"]
-
-    # Confine writes to this region; the POC is single-region.
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestedRegion"
-      values   = [var.aws_region]
-    }
-  }
-
-  # Apply also refreshes state, so it needs the same read actions.
-  statement {
-    sid       = "DescribeInfrastructureForApply"
-    effect    = "Allow"
-    actions   = ["ec2:Describe*", "sts:GetCallerIdentity"]
-    resources = ["*"]
-  }
-
   # ---------------------------------------------------------------------
-  # Service-linked roles (SLRs). AWS auto-creates certain services' SLR the
-  # first time that service is used in the account - but only if the CALLER
-  # (this deploy role) is allowed to call iam:CreateServiceLinkedRole; without
-  # it, the workload's own create call fails with
-  # ServiceLinkedRoleNotFoundFault (reproduced for real with ElastiCache
-  # below). Each statement is scoped two ways at once, narrower than "any
-  # service": the resource ARN matches only that one service's own fixed SLR
-  # path, and the iam:AWSServiceName condition additionally restricts which
-  # service is allowed to have its role created through that statement - AWS
-  # itself ties the two together per call, so a mismatched (service,
-  # resource) pair can never succeed even if some future statement listed
-  # several of each. None of these paths overlap the deploy/plan role ARNs
-  # DenySelfPrivilegeEscalation protects, and CreateServiceLinkedRole is not
-  # one of the actions that Deny blocks in the first place.
+  # POC DESIGN DECISION (2026-09-16): full administrative deployment access.
   #
-  # Auto Scaling, ELB and RDS are unconditional (not gated by any workload
-  # prefix) because every currently registered workload uses an Auto Scaling
-  # group, a load balancer and an RDS instance - they are as foundational as
-  # ManagePocCompute's own EC2 actions above, not specific to one workload.
-  # All three SLRs already exist in this account, so applying this changes
-  # nothing observable today; it exists so a workload deployed against a
-  # DIFFERENT AWS account (where they do not yet exist) does not fail the
-  # same way ElastiCache just did here.
-  # ---------------------------------------------------------------------
-  statement {
-    sid       = "CreateAutoScalingServiceLinkedRole"
-    effect    = "Allow"
-    actions   = ["iam:CreateServiceLinkedRole"]
-    resources = ["arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "iam:AWSServiceName"
-      values   = ["autoscaling.amazonaws.com"]
-    }
-  }
-
-  statement {
-    sid       = "CreateElasticLoadBalancingServiceLinkedRole"
-    effect    = "Allow"
-    actions   = ["iam:CreateServiceLinkedRole"]
-    resources = ["arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/elasticloadbalancing.amazonaws.com/AWSServiceRoleForElasticLoadBalancing"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "iam:AWSServiceName"
-      values   = ["elasticloadbalancing.amazonaws.com"]
-    }
-  }
-
-  statement {
-    sid       = "CreateRdsServiceLinkedRole"
-    effect    = "Allow"
-    actions   = ["iam:CreateServiceLinkedRole"]
-    resources = ["arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/rds.amazonaws.com/AWSServiceRoleForRDS"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "iam:AWSServiceName"
-      values   = ["rds.amazonaws.com"]
-    }
-  }
-
-  # ---------------------------------------------------------------------
-  # Workload IAM: the instance role/profile ANY registered workload creates
-  # for its own EC2 instances (never the deploy or plan role itself).
-  # Resource: "*" so this pipeline can deploy any registered workload without
-  # a corresponding IAM change here - name-scoping this to one workload's
-  # prefix would defeat the point of a shared, generic deploy path. The
-  # deploy/plan roles themselves stay untouchable regardless: the explicit
-  # DenySelfPrivilegeEscalation statement below denies these same write
-  # actions on their exact ARNs, and Deny always wins over Allow. PassRole is
-  # additionally restricted to EC2 as the passed-to service (next statement),
-  # so this cannot be used to hand a role to a different, more privileged
-  # service context.
+  # This is deliberately NOT a least-privilege production IAM design. The
+  # requirement is that a FUTURE Terraform codebase using ANY AWS service can
+  # be onboarded without editing this file, which an explicit action catalog
+  # can never guarantee - IAM is an allow-list, so an unlisted service is a
+  # denied service. Every bounded per-service statement that used to live
+  # here (compute, networking, S3, RDS, ElastiCache, CloudFront/Route 53,
+  # SQS, Secrets Manager, KMS, and the Auto Scaling/ELB/RDS/ElastiCache
+  # service-linked-role grants) is subsumed by this one statement, including
+  # every Create/Read/Update/Delete/Tag/Attach/Detach/Replace/PassRole/
+  # CreateServiceLinkedRole call Terraform makes for any service.
+  #
+  # The blast radius is bounded NOT by this statement's actions but by:
+  #   1. the Deny statements below, which fence off the FinOps control plane
+  #      (both CI roles, the GitHub OIDC provider, the Terraform state
+  #      bucket) so this role can never rewrite what governs it;
+  #   2. the OIDC trust policy, which only lets GitHub Actions assume this
+  #      role from the trusted repo/branch/environment;
+  #   3. the FinOps gate itself - plan, Infracost, the deterministic cost
+  #      policy and the approval environment all run BEFORE any apply, and
+  #      the apply consumes the saved plan rather than re-planning.
+  #
+  # The previous design's aws:RequestedRegion confinement is intentionally
+  # dropped here: a future workload may be multi-region, and re-adding the
+  # condition would reintroduce exactly the per-workload IAM edits this
+  # change exists to eliminate.
   # ---------------------------------------------------------------------
   dynamic "statement" {
     for_each = length(local.workload_prefixes) > 0 ? [1] : []
 
     content {
-      sid    = "ManageWorkloadInstanceRole"
-      effect = "Allow"
-      actions = [
-        "iam:CreateRole",
-        "iam:DeleteRole",
-        "iam:GetRole",
-        "iam:UpdateRole",
-        "iam:UpdateRoleDescription",
-        "iam:PutRolePolicy",
-        "iam:DeleteRolePolicy",
-        "iam:GetRolePolicy",
-        "iam:ListRolePolicies",
-        "iam:ListAttachedRolePolicies",
-        "iam:TagRole",
-        "iam:UntagRole",
-        "iam:ListInstanceProfilesForRole",
-        "iam:CreateInstanceProfile",
-        "iam:DeleteInstanceProfile",
-        "iam:GetInstanceProfile",
-        "iam:AddRoleToInstanceProfile",
-        "iam:RemoveRoleFromInstanceProfile",
-        "iam:TagInstanceProfile",
-        "iam:UntagInstanceProfile",
-      ]
-      resources = ["*"]
-    }
-  }
-
-  # Resource: "*", for the same generic-across-workloads reason as above.
-  # The condition below is what actually bounds this now: an instance can
-  # only ever assume a role AS EC2, never as a more privileged service.
-  dynamic "statement" {
-    for_each = length(local.workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid       = "PassWorkloadInstanceRoleToEc2Only"
+      sid       = "DeployAnyWorkloadResource"
       effect    = "Allow"
-      actions   = ["iam:PassRole"]
+      actions   = ["*"]
       resources = ["*"]
-
-      condition {
-        test     = "StringEquals"
-        variable = "iam:PassedToService"
-        values   = ["ec2.amazonaws.com"]
-      }
-    }
-  }
-
-  # Workload's own asset bucket(s) - never the Terraform state bucket, which
-  # has its own dedicated statement (ManageStateBucketConfig) scoped to
-  # var.state_bucket_name only. Resource: "*" so any registered workload's
-  # bucket, whatever it is named, is covered without an IAM change here.
-  dynamic "statement" {
-    for_each = length(local.workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid    = "ManageWorkloadAssetBucket"
-      effect = "Allow"
-      actions = [
-        "s3:CreateBucket",
-        "s3:DeleteBucket",
-        "s3:ListBucket",
-        "s3:GetBucket*",
-        "s3:PutBucket*",
-        # PutBucket*/GetBucket* above already cover PutBucketPolicy/
-        # GetBucketPolicy (IAM prefix-matches them), but there is no
-        # DeleteBucket* wildcard - DeleteBucket only deletes the bucket
-        # itself, never a sub-resource config. Without this, destroying the
-        # storage module's aws_s3_bucket_policy resource fails with
-        # AccessDenied on s3:DeleteBucketPolicy (reproduced for real
-        # destroying ecommerce-platform's shopfront-dev-product-assets).
-        "s3:DeleteBucketPolicy",
-        "s3:GetEncryptionConfiguration",
-        "s3:PutEncryptionConfiguration",
-        "s3:GetLifecycleConfiguration",
-        "s3:PutLifecycleConfiguration",
-        "s3:GetAccelerateConfiguration",
-        "s3:GetReplicationConfiguration",
-        "s3:PutBucketVersioning",
-        "s3:GetBucketVersioning",
-      ]
-      resources = ["*"]
-    }
-  }
-
-  # CloudFront and Route53 are global services - their API calls are not
-  # reliably tagged with aws:RequestedRegion the way the region-scoped
-  # ManagePocCompute statement above assumes, so they get their own
-  # statement without that condition rather than silently risking an
-  # implicit deny from a condition that never matches.
-  dynamic "statement" {
-    for_each = length(local.workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid    = "ManageWorkloadGlobalServices"
-      effect = "Allow"
-      actions = [
-        "cloudfront:CreateOriginAccessControl",
-        "cloudfront:DeleteOriginAccessControl",
-        "cloudfront:GetOriginAccessControl",
-        "cloudfront:UpdateOriginAccessControl",
-        "cloudfront:CreateDistribution",
-        "cloudfront:GetDistribution",
-        "cloudfront:UpdateDistribution",
-        "cloudfront:DeleteDistribution",
-        "cloudfront:TagResource",
-        "cloudfront:UntagResource",
-        "cloudfront:ListTagsForResource",
-        "route53:CreateHostedZone",
-        "route53:DeleteHostedZone",
-        "route53:GetHostedZone",
-        "route53:ListHostedZones",
-        "route53:ListHostedZonesByName",
-        "route53:ChangeResourceRecordSets",
-        "route53:ListResourceRecordSets",
-        "route53:GetChange",
-        "route53:ChangeTagsForResource",
-        "route53:ListTagsForResource",
-      ]
-      resources = ["*"]
-    }
-  }
-
-  # aws_db_instance.main uses storage_encrypted + manage_master_user_password
-  # with no customer CMK, so it relies on the account's default AWS-managed
-  # keys (alias/aws/rds, alias/aws/secretsmanager). Those keys are owned by
-  # AWS, not this account's IAM, so the deploy role still needs an explicit
-  # grant for the handful of actions RDS/Secrets Manager need it to take on
-  # its behalf - scoped to exactly these two key ARNs, never "*".
-  dynamic "statement" {
-    for_each = length(local.workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid    = "ManageWorkloadDefaultKmsKeys"
-      effect = "Allow"
-      actions = [
-        "kms:DescribeKey",
-        "kms:CreateGrant",
-        "kms:ListGrants",
-        "kms:RevokeGrant",
-        "kms:GenerateDataKey",
-        "kms:GenerateDataKeyWithoutPlaintext",
-        "kms:Decrypt",
-      ]
-      resources = [
-        data.aws_kms_key.workload_rds_default[0].arn,
-        data.aws_kms_key.workload_secretsmanager_default[0].arn,
-      ]
-    }
-  }
-
-  # manage_master_user_password=true makes RDS create the master-password
-  # secret itself, but it does so using the CALLER's (deploy role's) own
-  # credentials, not a service-linked role - so the deploy role needs these
-  # two Secrets Manager actions directly. RDS always names these secrets
-  # with the reserved "rds!" prefix and a randomly-generated suffix it
-  # controls (never a name this config chooses), so "secret:rds!*" is the
-  # narrowest resource pattern AWS permits for this feature - not a guess,
-  # this matches AWS's own documented minimum policy for the feature.
-  dynamic "statement" {
-    for_each = length(local.workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid    = "ManageWorkloadRdsManagedSecret"
-      effect = "Allow"
-      actions = [
-        "secretsmanager:CreateSecret",
-        "secretsmanager:TagResource",
-      ]
-      resources = ["arn:${local.partition}:secretsmanager:${var.aws_region}:${local.account_id}:secret:rds!*"]
-    }
-  }
-
-  # SQS, ElastiCache and a workload's OWN Secrets Manager entries. All three
-  # support resource-level permissions, but name-scoping them would mean every
-  # newly registered workload needs its own IAM change here - the opposite of
-  # what a shared deploy pipeline is for. Resource: "*" instead. This is
-  # separate from ManageWorkloadRdsManagedSecret above, which covers the
-  # RDS-generated "rds!" secrets the deploy role does not name.
-  dynamic "statement" {
-    for_each = length(var.data_service_workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid    = "ManageWorkloadDataServices"
-      effect = "Allow"
-      actions = [
-        # SQS: queue lifecycle plus the queue policy, which Terraform applies
-        # through SetQueueAttributes rather than a distinct API call.
-        "sqs:CreateQueue",
-        "sqs:DeleteQueue",
-        "sqs:GetQueueAttributes",
-        "sqs:SetQueueAttributes",
-        "sqs:GetQueueUrl",
-        "sqs:TagQueue",
-        "sqs:UntagQueue",
-        "sqs:ListQueueTags",
-        # ElastiCache: replication group and its subnet group.
-        "elasticache:CreateReplicationGroup",
-        "elasticache:DeleteReplicationGroup",
-        "elasticache:ModifyReplicationGroup",
-        "elasticache:CreateCacheSubnetGroup",
-        "elasticache:DeleteCacheSubnetGroup",
-        "elasticache:ModifyCacheSubnetGroup",
-        "elasticache:AddTagsToResource",
-        "elasticache:RemoveTagsFromResource",
-        "elasticache:ListTagsForResource",
-        # Secrets Manager: a workload's own application config secret only.
-        "secretsmanager:CreateSecret",
-        "secretsmanager:DeleteSecret",
-        "secretsmanager:UpdateSecret",
-        "secretsmanager:PutSecretValue",
-        "secretsmanager:DescribeSecret",
-        "secretsmanager:GetSecretValue",
-        "secretsmanager:TagResource",
-        "secretsmanager:UntagResource",
-        "secretsmanager:GetResourcePolicy",
-      ]
-      resources = ["*"]
-    }
-  }
-
-  # ElastiCache's own SLR (see the general SLR comment above). Gated by
-  # data_service_workload_prefixes rather than unconditional like the three
-  # above: unlike Auto Scaling/ELB/RDS, not every registered workload uses
-  # ElastiCache, so this only turns on for the ones that do. This SLR does
-  # NOT already exist in this account - reproduced for real: ecommerce-platform
-  # failed CreateCacheSubnetGroup with ServiceLinkedRoleNotFoundFault before
-  # this statement was added.
-  dynamic "statement" {
-    for_each = length(var.data_service_workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid    = "CreateElastiCacheServiceLinkedRole"
-      effect = "Allow"
-      actions = [
-        "iam:CreateServiceLinkedRole",
-      ]
-      resources = [
-        "arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/elasticache.amazonaws.com/AWSServiceRoleForElastiCache",
-      ]
-
-      condition {
-        test     = "StringEquals"
-        variable = "iam:AWSServiceName"
-        values   = ["elasticache.amazonaws.com"]
-      }
-    }
-  }
-
-
-  # ElastiCache's Describe* calls do not support resource-level permissions, so
-  # they cannot live in the name-scoped statement above. They are read-only and
-  # confined to this region.
-  dynamic "statement" {
-    for_each = length(var.data_service_workload_prefixes) > 0 ? [1] : []
-
-    content {
-      sid    = "DescribeWorkloadDataServices"
-      effect = "Allow"
-      actions = [
-        "elasticache:DescribeReplicationGroups",
-        "elasticache:DescribeCacheSubnetGroups",
-        "elasticache:DescribeCacheClusters",
-        "sqs:ListQueues",
-        "secretsmanager:ListSecrets",
-      ]
-      resources = ["*"]
-
-      condition {
-        test     = "StringEquals"
-        variable = "aws:RequestedRegion"
-        values   = [var.aws_region]
-      }
     }
   }
 
@@ -672,27 +316,78 @@ data "aws_iam_policy_document" "deploy_write" {
     }
   }
 
-  # Prevents the deploy role from granting itself more privilege, or from
-  # disabling the plan role. Deny always wins over Allow.
-  dynamic "statement" {
-    for_each = var.enable_backend_self_management ? [1] : []
+  # ---------------------------------------------------------------------
+  # FinOps control-plane boundary.
+  #
+  # DeployAnyWorkloadResource above grants Action="*" / Resource="*", so
+  # these Deny statements - not the Allow list - are what actually stops this
+  # role rewriting the governance that constrains it. Deny always wins over
+  # Allow. Unlike the Allow statements they are deliberately NOT gated on
+  # enable_backend_self_management: the full-access grant applies regardless
+  # of that flag, so the fence has to as well, otherwise disabling backend
+  # self-management would remove the fence while leaving Action="*" in place.
+  # ---------------------------------------------------------------------
 
-    content {
-      sid    = "DenySelfPrivilegeEscalation"
-      effect = "Deny"
-      actions = [
-        "iam:UpdateAssumeRolePolicy",
-        "iam:PutRolePolicy",
-        "iam:DeleteRolePolicy",
-        "iam:AttachRolePolicy",
-        "iam:DetachRolePolicy",
-        "iam:DeleteRole",
-      ]
-      resources = [
-        "arn:${local.partition}:iam::${local.account_id}:role/${local.deploy_role_name}",
-        "arn:${local.partition}:iam::${local.account_id}:role/${local.plan_role_name}",
-      ]
-    }
+  # Every mutating IAM call against either CI role, expressed as "everything
+  # except reads" rather than a fixed action list: under Action="*" a fixed
+  # list silently fails open the day AWS ships a new IAM write action, which
+  # is exactly the failure mode this boundary must not have. Get*/List* stay
+  # allowed so plan/apply can still refresh the backend layer's own state.
+  statement {
+    sid    = "DenySelfPrivilegeEscalation"
+    effect = "Deny"
+
+    not_actions = [
+      "iam:Get*",
+      "iam:List*",
+    ]
+
+    resources = [
+      "arn:${local.partition}:iam::${local.account_id}:role/${local.deploy_role_name}",
+      "arn:${local.partition}:iam::${local.account_id}:role/${local.plan_role_name}",
+    ]
+  }
+
+  # The OIDC provider IS the authentication boundary - deleting it or
+  # retargeting its thumbprint/audience would let a different repository
+  # assume these roles. This deliberately supersedes ManageGitHubOidcProvider
+  # above; legitimate OIDC changes run through the privileged human/local
+  # path, which is a different principal and so unaffected by this Deny.
+  statement {
+    sid    = "DenyGitHubOidcTrustTampering"
+    effect = "Deny"
+    actions = [
+      "iam:DeleteOpenIDConnectProvider",
+      "iam:UpdateOpenIDConnectProviderThumbprint",
+      "iam:AddClientIDToOpenIDConnectProvider",
+      "iam:RemoveClientIDFromOpenIDConnectProvider",
+    ]
+    resources = [
+      "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com",
+    ]
+  }
+
+  # The state bucket holds every stack's Terraform state and the cost-lock
+  # evidence the gate reads. Bucket-level destruction and the settings that
+  # protect it are denied. Object-level access is deliberately NOT denied:
+  # Terraform must still read/write state objects and create/delete the
+  # .tflock object that S3 native locking (use_lockfile) depends on.
+  statement {
+    sid    = "DenyStateBucketTampering"
+    effect = "Deny"
+    actions = [
+      "s3:DeleteBucket",
+      "s3:PutBucketPolicy",
+      "s3:DeleteBucketPolicy",
+      "s3:PutBucketVersioning",
+      "s3:PutBucketPublicAccessBlock",
+      "s3:PutEncryptionConfiguration",
+      "s3:PutBucketAcl",
+      "s3:PutBucketOwnershipControls",
+    ]
+    resources = [
+      "arn:${local.partition}:s3:::${var.state_bucket_name}",
+    ]
   }
 
   dynamic "statement" {

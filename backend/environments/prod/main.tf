@@ -43,8 +43,7 @@ module "backend" {
   bedrock_inference_profile_arn = var.bedrock_inference_profile_arn
   bedrock_foundation_model_arns = var.bedrock_foundation_model_arns
 
-  extra_plan_actions   = var.extra_plan_actions
-  extra_deploy_actions = var.extra_deploy_actions
+  extra_plan_actions = var.extra_plan_actions
 
   tags = var.tags
 }

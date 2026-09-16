@@ -209,12 +209,16 @@ Assumable **only** from `repo:<owner>/<repo>:environment:<environment>`, so GitH
 
 Write actions are enumerated explicitly and constrained with `aws:RequestedRegion`.
 
-Extend either role without editing modules:
+Extend the plan role's read access without editing modules:
 
 ```hcl
-extra_plan_actions   = ["rds:DescribeDBInstances"]
-extra_deploy_actions = ["rds:CreateDBInstance"]
+extra_plan_actions = ["rds:DescribeDBInstances"]
 ```
+
+The deploy role no longer has an `extra_deploy_actions` equivalent: it has
+full write access (`DeployAnyWorkloadResource`, `Action="*"`/`Resource="*"`)
+in `backend/modules/finops-environment/main.tf`, gated on a workload being
+registered.
 
 ### Bedrock permission
 

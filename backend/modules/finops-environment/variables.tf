@@ -102,12 +102,6 @@ variable "extra_plan_actions" {
   default     = []
 }
 
-variable "extra_deploy_actions" {
-  description = "Additional write IAM actions for the deploy role as the POC adds resource types."
-  type        = list(string)
-  default     = []
-}
-
 # Scopes the deploy role's workload IAM/S3 statements (instance role, instance
 # profile, asset bucket) to <this>-* resources, mirroring the backend's own
 # <project_name>-* self-management scoping. Empty disables those statements

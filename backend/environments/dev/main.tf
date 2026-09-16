@@ -44,7 +44,6 @@ module "backend" {
   bedrock_foundation_model_arns = var.bedrock_foundation_model_arns
 
   extra_plan_actions   = var.extra_plan_actions
-  extra_deploy_actions = var.extra_deploy_actions
   workload_name_prefix = var.workload_name_prefix
 
   additional_workload_name_prefixes = var.additional_workload_name_prefixes

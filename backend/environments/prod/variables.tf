@@ -98,12 +98,6 @@ variable "extra_plan_actions" {
   default     = []
 }
 
-variable "extra_deploy_actions" {
-  description = "Additional write IAM actions for the deploy role."
-  type        = list(string)
-  default     = []
-}
-
 variable "tags" {
   description = "Additional tags merged onto every resource."
   type        = map(string)
