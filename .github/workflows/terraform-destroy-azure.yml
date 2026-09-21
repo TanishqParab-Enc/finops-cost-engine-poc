@@ -1,0 +1,323 @@
+name: Terraform Destroy (Azure)
+
+# Azure sibling of terraform-test-destroy.yml. ADDITIVE: the AWS destroy
+# workflow is not modified, not called, and not aware of this file.
+#
+# Same safety shape as the validated AWS destroy:
+#   validate-destroy -> destroy-approval -> destroy -> post-destroy-verify
+# with a fresh destroy plan, a SHA-256 fingerprint, and an apply of exactly
+# the approved plan (never a re-plan, never -auto-approve).
+
+"on":
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: Azure stack to destroy (must be deployable in config/finops-stacks.yml)
+        required: true
+        type: choice
+        options:
+          - azure-sandbox
+      environment:
+        description: Environment to destroy
+        required: true
+        type: choice
+        options:
+          - dev
+      confirmation:
+        description: "Type DESTROY (exactly, all caps) to confirm"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHON_VERSION: '3.12'
+  TERRAFORM_VERSION: '1.11.0'
+  AWS_REGION: us-east-1
+  SELECTED_CLOUD: azure
+
+# A destroy must never race a deploy against the same workload state.
+concurrency:
+  group: terraform-destroy-azure-${{ inputs.stack }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-destroy:
+    name: Validate and plan destroy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      terraform_dir: ${{ steps.resolve.outputs.terraform_dir }}
+      state_key: ${{ steps.resolve.outputs.state_key }}
+      subscription_id: ${{ steps.resolve.outputs.subscription_id }}
+      resource_group: ${{ steps.resolve.outputs.resource_group }}
+      name_prefix: ${{ steps.resolve.outputs.name_prefix }}
+      fingerprint: ${{ steps.fingerprint.outputs.sha256 }}
+    steps:
+      - name: Fail closed unless confirmation is exactly DESTROY
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRMATION" != "DESTROY" ]; then
+            echo "::error title=Confirmation required::Type DESTROY exactly (all caps) to proceed."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      # Registry is truth. Runs BEFORE any credential exchange, so a mismatched
+      # cloud/environment can never reach Azure or the state bucket.
+      - name: Resolve and validate the stack from the trusted registry
+        id: resolve
+        env:
+          STACK: ${{ inputs.stack }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, sys
+          from finops.errors import ConfigurationError
+          from finops.stacks import get_stack, validate_selection
+
+          try:
+              stack = get_stack(os.environ["STACK"])
+              validate_selection(stack, "azure", os.environ["ENVIRONMENT"], require_deployable=True)
+          except ConfigurationError as exc:
+              sys.exit(f"::error title=Destroy refused::{exc}")
+
+          print(f"terraform_dir={stack.terraform_dir}")
+          print(f"state_key={stack.state_key}")
+          print(f"subscription_id={stack.subscription_id}")
+          print(f"resource_group={stack.resource_group}")
+          print(f"name_prefix={stack.name_prefix}")
+          PY
+
+      - name: Configure AWS credentials (state-only role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: destroy-azure-validate-${{ github.run_id }}
+
+      - name: Authenticate to Azure (deploy identity)
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.resolve.outputs.subscription_id }}
+
+      - name: Terraform init (shared S3 backend)
+        uses: ./.github/actions/tf-backend-init/multicloud
+        with:
+          working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ steps.resolve.outputs.state_key }}
+          aws-region: ${{ env.AWS_REGION }}
+          expected-cloud: azure
+
+      # Always a FRESH destroy plan. A stale plan from an earlier, partially
+      # failed run must never be reused.
+      - name: Terraform plan (destroy mode)
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        env:
+          TF_VAR_subscription_id: ${{ steps.resolve.outputs.subscription_id }}
+          TF_VAR_admin_ssh_public_key: ${{ vars.AZURE_SANDBOX_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          terraform plan -destroy -input=false -no-color -lock-timeout=5m -out=destroy.tfplan
+          terraform show -no-color destroy.tfplan > destroy-plan.txt
+          terraform show -json destroy.tfplan > destroy-plan.json
+
+      - name: Capture the resource group for post-destroy verification
+        id: scope
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        run: |
+          set -euo pipefail
+          RG=$(python3 -c "
+          import json
+          d = json.load(open('destroy-plan.json'))
+          rgs = [c['change']['before']['name'] for c in d.get('resource_changes',[])
+                 if c['type']=='azurerm_resource_group' and c['change'].get('before')]
+          print(rgs[0] if rgs else '')
+          ")
+          echo "resource_group=$RG" >> "$GITHUB_OUTPUT"
+          echo "Resource group to be destroyed: ${RG:-<none found>}"
+
+      - name: Compute destroy plan fingerprint
+        id: fingerprint
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        run: |
+          set -euo pipefail
+          SHA=$(sha256sum destroy.tfplan | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Destroy plan fingerprint: $SHA"
+
+      - name: Write destroy metadata
+        working-directory: ${{ steps.resolve.outputs.terraform_dir }}
+        run: |
+          set -euo pipefail
+          cat > destroy-metadata.json <<EOF
+          {
+            "stack": "${{ inputs.stack }}",
+            "cloud": "azure",
+            "environment": "${{ inputs.environment }}",
+            "state_key": "${{ steps.resolve.outputs.state_key }}",
+            "subscription_id": "${{ steps.resolve.outputs.subscription_id }}",
+            "resource_group": "${{ steps.scope.outputs.resource_group }}",
+            "fingerprint": "${{ steps.fingerprint.outputs.sha256 }}",
+            "run_id": "${{ github.run_id }}",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
+          cat destroy-metadata.json
+
+      - name: Upload the destroy plan and metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: destroy-azure-${{ inputs.stack }}-${{ inputs.environment }}-${{ github.run_id }}
+          path: |
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy.tfplan
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy-plan.txt
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy-plan.json
+            ${{ steps.resolve.outputs.terraform_dir }}/destroy-metadata.json
+          retention-days: 30
+
+  # Shared destroy approval Environment - not a per-cloud one.
+  destroy-approval:
+    name: "Manual destroy approval (finops-destroy-approval)"
+    needs: validate-destroy
+    runs-on: ubuntu-latest
+    environment:
+      name: finops-destroy-approval
+    steps:
+      - name: Record what is being approved
+        run: |
+          echo "Cloud:       azure"
+          echo "Stack:       ${{ inputs.stack }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "State key:   ${{ needs.validate-destroy.outputs.state_key }}"
+          echo "Fingerprint: ${{ needs.validate-destroy.outputs.fingerprint }}"
+
+  destroy:
+    name: Apply destroy plan
+    needs: [validate-destroy, destroy-approval]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Download the exact approved destroy plan
+        uses: actions/download-artifact@v4
+        with:
+          name: destroy-azure-${{ inputs.stack }}-${{ inputs.environment }}-${{ github.run_id }}
+          path: approved
+
+      # The plan applied must be byte-identical to the plan approved.
+      - name: Verify fingerprint and metadata match what was approved
+        env:
+          EXPECTED_FINGERPRINT: ${{ needs.validate-destroy.outputs.fingerprint }}
+          EXPECTED_STATE_KEY: ${{ needs.validate-destroy.outputs.state_key }}
+        run: |
+          set -euo pipefail
+          ACTUAL=$(sha256sum approved/destroy.tfplan | cut -d' ' -f1)
+          if [ "$ACTUAL" != "$EXPECTED_FINGERPRINT" ]; then
+            echo "::error title=Fingerprint mismatch::Approved $EXPECTED_FINGERPRINT but downloaded $ACTUAL. Refusing to apply."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          m = json.load(open("approved/destroy-metadata.json"))
+          if m["cloud"] != "azure":
+              sys.exit(f"::error title=Cloud mismatch::metadata says {m['cloud']}")
+          if m["state_key"] != os.environ["EXPECTED_STATE_KEY"]:
+              sys.exit("::error title=State key mismatch::approved plan targets a different state object")
+          print(f"Verified approved destroy plan for {m['stack']} ({m['cloud']}/{m['environment']})")
+          PY
+
+      - name: Configure AWS credentials (state-only role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: destroy-azure-apply-${{ github.run_id }}
+
+      - name: Authenticate to Azure (deploy identity)
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ needs.validate-destroy.outputs.subscription_id }}
+
+      - name: Terraform init (same shared backend/state key)
+        uses: ./.github/actions/tf-backend-init/multicloud
+        with:
+          working-directory: ${{ needs.validate-destroy.outputs.terraform_dir }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ needs.validate-destroy.outputs.state_key }}
+          aws-region: ${{ env.AWS_REGION }}
+          expected-cloud: azure
+
+      # Applies EXACTLY the approved saved plan. No re-plan, no -auto-approve.
+      - name: Terraform apply (saved destroy plan only)
+        working-directory: ${{ needs.validate-destroy.outputs.terraform_dir }}
+        run: |
+          set -euo pipefail
+          cp "$GITHUB_WORKSPACE/approved/destroy.tfplan" ./destroy.tfplan
+          terraform apply -input=false -no-color -lock-timeout=5m destroy.tfplan
+
+  post-destroy-verify:
+    name: Post-destroy verification (read-only)
+    needs: [validate-destroy, destroy]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (deploy identity)
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ needs.validate-destroy.outputs.subscription_id }}
+
+      - name: Verify the workload is gone
+        if: needs.validate-destroy.outputs.resource_group != ''
+        uses: ./.github/actions/post-destroy-verify/azure
+        with:
+          resource-group: ${{ needs.validate-destroy.outputs.resource_group }}
+          subscription-id: ${{ needs.validate-destroy.outputs.subscription_id }}
+          name-prefix: ${{ needs.validate-destroy.outputs.name_prefix }}
+
+      # Workload teardown must never touch the FinOps control plane. The
+      # state-only role cannot delete the bucket, and this asserts the state
+      # object's own prefix is still the expected one.
+      - name: Confirm the shared state backend is intact
+        run: |
+          set -euo pipefail
+          KEY="${{ needs.validate-destroy.outputs.state_key }}"
+          if [[ "$KEY" != finops-poc/*/azure/*/terraform.tfstate ]]; then
+            echo "::error title=Unexpected state key::'$KEY' is outside the Azure prefix."
+            exit 1
+          fi
+          echo "Confirmed: destroy operated only within the Azure state prefix ($KEY)."
+          echo "The shared S3 state bucket and the AWS backend layer were never in scope."

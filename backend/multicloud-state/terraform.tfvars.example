@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and fill in. No secrets belong in this file -
+# only non-secret identifiers.
+
+state_bucket_name = "REPLACE_WITH_EXISTING_STATE_BUCKET"
+
+github_owner      = "REPLACE_WITH_GITHUB_OWNER"
+github_repository = "REPLACE_WITH_GITHUB_REPOSITORY"
+
+# From: gh api /repos/<owner>/<repo> --jq '.owner.id, .id'
+# Required because this repo's GitHub OIDC tokens use the immutable subject form.
+github_owner_id      = "REPLACE_WITH_NUMERIC_OWNER_ID"
+github_repository_id = "REPLACE_WITH_NUMERIC_REPO_ID"
+
+allowed_branches    = ["main"]
+github_environments = ["dev"]
+environments        = ["dev"]
+managed_clouds      = ["azure", "gcp"]

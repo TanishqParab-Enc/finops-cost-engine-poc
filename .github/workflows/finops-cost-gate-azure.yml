@@ -1,0 +1,492 @@
+name: FinOps Cost Gate (Azure)
+
+# Azure sibling of finops-cost-gate.yml. ADDITIVE: the AWS workflow is not
+# modified, not called, and not aware of this file.
+#
+# The FinOps engine is NOT duplicated here. Every governance decision is made
+# by the same `finops` CLI the AWS path uses - this workflow only supplies
+# Azure authentication and the shared-S3 backend init around it.
+#
+# TWO INDEPENDENT IDENTITIES per job, by design:
+#   AWS_MULTICLOUD_STATE_ROLE_ARN -> Terraform state in S3, nothing else
+#   Azure Entra identity          -> the actual Azure deployment
+# Neither can do the other's job.
+
+"on":
+  pull_request:
+    paths:
+      - 'terraform/workloads/azure/**'
+      - 'config/finops-policy.yaml'
+      - 'config/finops-stacks.yml'
+      - '.github/workflows/finops-cost-gate-azure.yml'
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "Registered Azure stack from config/finops-stacks.yml (e.g. azure-sandbox)"
+        required: true
+        type: string
+      environment:
+        description: "Environment the stack is registered for (e.g. dev)"
+        required: true
+        type: string
+      apply:
+        description: "Apply after the stack passes (or is approved through) the gate. Unchecked = evaluate cost only."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write   # required for BOTH the AWS state role and Entra WIF
+
+env:
+  PYTHON_VERSION: '3.12'
+  TERRAFORM_VERSION: '1.11.0'
+  INFRACOST_VERSION: '0.10.45'
+  AWS_REGION: us-east-1
+  SELECTED_CLOUD: azure
+  FINOPS_APPROVER: ${{ vars.FINOPS_APPROVER || 'TanishqParab-Enc' }}
+
+concurrency:
+  group: finops-azure-${{ github.event.inputs.stack || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Resolve the stack from the TRUSTED registry and fail closed on any
+  # cloud/environment mismatch - BEFORE any credential exchange.
+  # ---------------------------------------------------------------------
+  resolve-stack:
+    name: Resolve and validate Azure stack
+    runs-on: ubuntu-latest
+    outputs:
+      stacks: ${{ steps.resolve.outputs.stacks }}
+      has_stacks: ${{ steps.resolve.outputs.has_stacks }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      - name: Resolve
+        id: resolve
+        env:
+          DISPATCH_STACK: ${{ github.event.inputs.stack }}
+          DISPATCH_ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            STACKS=$(python3 - <<'PY'
+          import json, os, sys
+          from finops.errors import ConfigurationError
+          from finops.stacks import get_stack, validate_selection
+
+          try:
+              stack = get_stack(os.environ["DISPATCH_STACK"])
+              # Fail closed: the registry, not the operator, decides the cloud.
+              validate_selection(stack, "azure", os.environ["DISPATCH_ENVIRONMENT"])
+          except ConfigurationError as exc:
+              sys.exit(f"::error title=Stack selection rejected::{exc}")
+
+          print(json.dumps([{
+              "name": stack.name, "dir": stack.terraform_dir, "cloud": stack.cloud,
+              "deployable": stack.deployable, "environment": stack.environment,
+              "usage_file": stack.usage_file or "", "state_key": stack.state_key,
+              "subscription_id": stack.subscription_id or "", "location": stack.location or "",
+          }]))
+          PY
+            )
+          else
+            STACKS=$(python3 - <<'PY'
+          import json, subprocess
+          from finops.stacks import load_stacks
+
+          base = "origin/${{ github.base_ref || github.event.repository.default_branch }}"
+          changed = subprocess.run(
+              ["git", "diff", "--name-only", base, "HEAD"],
+              capture_output=True, text=True, check=True,
+          ).stdout.split()
+
+          # Only azure stacks; the AWS workflow owns aws stacks and is untouched.
+          out = []
+          for stack in load_stacks().values():
+              if stack.cloud != "azure":
+                  continue
+              if any(c.replace("\\\\", "/").startswith(p) for c in changed for p in stack.paths):
+                  out.append({
+                      "name": stack.name, "dir": stack.terraform_dir, "cloud": stack.cloud,
+                      "deployable": stack.deployable, "environment": stack.environment,
+                      "usage_file": stack.usage_file or "", "state_key": stack.state_key,
+                      "subscription_id": stack.subscription_id or "", "location": stack.location or "",
+                  })
+          print(json.dumps(out))
+          PY
+            )
+          fi
+          echo "stacks=$STACKS" >> "$GITHUB_OUTPUT"
+          COUNT=$(STACKS="$STACKS" python3 -c "import json,os;print(len(json.loads(os.environ['STACKS'])))")
+          echo "has_stacks=$([ "$COUNT" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Selected: $STACKS"
+
+  # ---------------------------------------------------------------------
+  # Baseline + proposed plan -> Infracost -> SHARED policy engine.
+  # ---------------------------------------------------------------------
+  cost-gate:
+    name: Cost gate (${{ matrix.stack.name }})
+    needs: resolve-stack
+    if: needs.resolve-stack.outputs.has_stacks == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.resolve-stack.outputs.stacks) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          version: ${{ env.INFRACOST_VERSION }}
+          currency: USD
+
+      - name: Install engine
+        run: pip install --quiet -e '.[bedrock]'
+
+      # IDENTITY 1: AWS, for Terraform state in S3 only. This role has no AWS
+      # deployment rights and cannot reach AWS workload state prefixes.
+      - name: Configure AWS credentials (state-only role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: finops-azure-state-${{ github.run_id }}
+
+      # IDENTITY 2: Azure, for reading/planning the actual resources.
+      - name: Authenticate to Azure (plan identity)
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_PLAN_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ matrix.stack.subscription_id }}
+
+      - name: Terraform init (shared S3 backend)
+        uses: ./.github/actions/tf-backend-init/multicloud
+        with:
+          working-directory: ${{ matrix.stack.dir }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ matrix.stack.state_key }}
+          aws-region: ${{ env.AWS_REGION }}
+          expected-cloud: azure
+
+      - name: Terraform validate
+        working-directory: ${{ matrix.stack.dir }}
+        run: terraform validate -no-color
+
+      # Baseline = what is ACTUALLY deployed. A pure read of the state object;
+      # no refresh, no provider mutation. Empty state (greenfield) reshapes to
+      # a real, positively-established $0 baseline.
+      - name: Baseline plan (deployed state)
+        working-directory: ${{ matrix.stack.dir }}
+        run: |
+          set -euo pipefail
+          terraform show -json > state.json
+          python3 -c "
+          import json
+          from finops.plan.state_shim import state_json_to_plan_json
+          json.dump(state_json_to_plan_json(json.load(open('state.json'))), open('baseline-plan.json','w'))
+          "
+
+      # -refresh=false so both documents read the identical state snapshot and
+      # untouched resources cancel out of the delta.
+      - name: Proposed plan
+        working-directory: ${{ matrix.stack.dir }}
+        env:
+          TF_VAR_subscription_id: ${{ matrix.stack.subscription_id }}
+          TF_VAR_admin_ssh_public_key: ${{ vars.AZURE_SANDBOX_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -no-color -lock=false -refresh=false -out=proposed.tfplan
+          terraform show -json proposed.tfplan > proposed-plan.json
+
+      # THE SHARED ENGINE. Same CLI, same policy, same threshold, same cost
+      # lock as AWS. No Azure-specific pricing or decision logic exists.
+      - name: FinOps cost gate
+        id: gate
+        working-directory: ${{ matrix.stack.dir }}
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+          FINOPS_INFRACOST_USAGE_FILE: ${{ matrix.stack.usage_file }}
+          FINOPS_THRESHOLD_VALUE: ${{ vars.FINOPS_THRESHOLD_VALUE || '100' }}
+          FINOPS_THRESHOLD_METRIC: ${{ vars.FINOPS_THRESHOLD_METRIC || 'incremental_monthly_cost' }}
+        run: |
+          set +e
+          finops analyze \
+            --plan proposed-plan.json \
+            --baseline-plan baseline-plan.json \
+            --require-baseline \
+            --stack "${{ matrix.stack.name }}" \
+            $([ "${{ matrix.stack.deployable }}" = "true" ] || echo "--no-cost-lock") \
+            --commit "${{ github.sha }}" \
+            --execution-id "${{ github.run_id }}" \
+            --markdown > gate.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          cat gate.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compute deployment authorization
+        id: authz
+        working-directory: ${{ matrix.stack.dir }}
+        run: |
+          set -euo pipefail
+          finops authorize-deployment --exit-code "${{ steps.gate.outputs.exit_code }}" --json > authorization.json
+          python3 -c "
+          import json, os
+          d = json.load(open('authorization.json'))
+          d['stack'] = '${{ matrix.stack.name }}'
+          d['cloud'] = 'azure'
+          json.dump(d, open('authorization.json','w'), indent=2)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f\"finops_decision={d['finops_decision']}\n\")
+              f.write(f\"deployment_authorization={d['deployment_authorization']}\n\")
+          "
+          cat authorization.json
+
+      - name: Upload FinOps artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-azure-${{ matrix.stack.name }}-${{ github.run_id }}
+          path: |
+            ${{ matrix.stack.dir }}/gate.md
+            ${{ matrix.stack.dir }}/authorization.json
+            ${{ matrix.stack.dir }}/proposed.tfplan
+            ${{ matrix.stack.dir }}/proposed-plan.json
+            ${{ matrix.stack.dir }}/baseline-plan.json
+            ${{ matrix.stack.dir }}/.finops/
+          retention-days: 90
+          if-no-files-found: warn
+
+      # A threshold BLOCK (exit 1) is an expected governance state, not a
+      # pipeline error. Only exit 2 (cost untrusted) fails the job.
+      - name: Enforce gate
+        run: |
+          case "${{ steps.gate.outputs.exit_code }}" in
+            0) echo "PASS - cost locked." ;;
+            1) echo "::notice::FinOps threshold exceeded (BLOCK). Approval required in finops-cost-approval." ;;
+            *) echo "::error::Cost could not be established. Failing safe."; exit 1 ;;
+          esac
+
+  # ---------------------------------------------------------------------
+  # Shared approval Environment - NOT a per-cloud one.
+  # ---------------------------------------------------------------------
+  finops-approval:
+    name: "Manual cost approval (finops-cost-approval)"
+    needs: [resolve-stack, cost-gate]
+    if: always() && needs.cost-gate.result != 'skipped'
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.resolve-stack.outputs.stacks) }}
+    runs-on: ubuntu-latest
+    environment:
+      name: finops-cost-approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      - name: Download this stack's evaluation (this run only)
+        uses: actions/download-artifact@v4
+        with:
+          name: finops-azure-${{ matrix.stack.name }}-${{ github.run_id }}
+          path: evaluation
+
+      # Consumes ONLY this run's artifact. Never re-plans, never re-prices,
+      # never touches Azure. Approval authorises deployment; it does not
+      # rewrite finops_decision - a BLOCK stays a BLOCK.
+      - name: Record the approval
+        run: |
+          set -euo pipefail
+          finops approve \
+            --action approve \
+            --result evaluation/.finops/gate-result.json \
+            --plan evaluation/proposed-plan.json \
+            --head-sha "${{ github.sha }}" \
+            --stack "${{ matrix.stack.name }}" \
+            --terraform-dir "${{ matrix.stack.dir }}" \
+            --run-event "${{ github.event_name }}" \
+            --approver "$FINOPS_APPROVER" \
+            --out "approval/${{ matrix.stack.name }}-exception.json" \
+            --json | tee decision.json
+
+          finops authorize-deployment --exit-code 1 --exception-valid --json > authz.json
+          python3 -c "
+          import json
+          d = json.load(open('authz.json')); d['stack']='${{ matrix.stack.name }}'; d['cloud']='azure'
+          json.dump(d, open('approval/authorization.json','w'), indent=2)
+          "
+          cat approval/authorization.json
+
+      - name: Upload the approval record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-azure-approval-${{ matrix.stack.name }}-${{ github.run_id }}
+          path: approval/
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  # Apply the EXACT saved plan. Never a fresh plan, never -auto-approve.
+  # ---------------------------------------------------------------------
+  deploy:
+    name: Deploy (gated) [${{ matrix.stack.name }}]
+    needs: [resolve-stack, cost-gate, finops-approval]
+    if: >-
+      always() &&
+      needs.resolve-stack.outputs.has_stacks == 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.apply == true) &&
+      (needs.cost-gate.result == 'success' || needs.finops-approval.result == 'success')
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.resolve-stack.outputs.stacks) }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ matrix.stack.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install engine
+        run: pip install --quiet -e .
+
+      # Re-validate against the trusted registry on the trusted ref, before
+      # any credential exchange - deployability is enforced twice.
+      - name: Re-verify stack against the trusted registry
+        env:
+          STACK: ${{ matrix.stack.name }}
+          ENVIRONMENT: ${{ matrix.stack.environment }}
+          EXPECTED_STATE_KEY: ${{ matrix.stack.state_key }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          from finops.errors import ConfigurationError
+          from finops.stacks import get_stack, validate_selection
+
+          try:
+              stack = get_stack(os.environ["STACK"])
+              validate_selection(stack, "azure", os.environ["ENVIRONMENT"], require_deployable=True)
+          except ConfigurationError as exc:
+              sys.exit(f"::error title=Deployment refused::{exc}")
+
+          if stack.state_key != os.environ["EXPECTED_STATE_KEY"]:
+              sys.exit(
+                  "::error title=State key mismatch::The registry's state_key "
+                  f"{stack.state_key!r} differs from the gated key "
+                  f"{os.environ['EXPECTED_STATE_KEY']!r}."
+              )
+          print(f"Verified {stack.name} -> {stack.state_key}")
+          PY
+
+      - name: Download the gated evaluation (this run only)
+        uses: actions/download-artifact@v4
+        with:
+          name: finops-azure-${{ matrix.stack.name }}-${{ github.run_id }}
+          path: evaluation
+
+      - name: Verify deployment authorization
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("evaluation/authorization.json"))
+          approved = False
+          try:
+              a = json.load(open("approval/authorization.json"))
+              approved = a.get("deployment_authorization") == "AUTHORIZED"
+          except FileNotFoundError:
+              pass
+          if d.get("deployment_authorization") != "AUTHORIZED" and not approved:
+              sys.exit(
+                  "::error title=Deployment not authorized::"
+                  f"finops_decision={d.get('finops_decision')} "
+                  f"deployment_authorization={d.get('deployment_authorization')}"
+              )
+          print("Deployment authorized.")
+          PY
+
+      - name: Download the approval record (if the gate blocked)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: finops-azure-approval-${{ matrix.stack.name }}-${{ github.run_id }}
+          path: approval
+
+      - name: Configure AWS credentials (state-only role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: finops-azure-apply-state-${{ github.run_id }}
+
+      - name: Authenticate to Azure (deploy identity)
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ matrix.stack.subscription_id }}
+
+      - name: Terraform init (same shared backend/state key)
+        uses: ./.github/actions/tf-backend-init/multicloud
+        with:
+          working-directory: ${{ matrix.stack.dir }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ matrix.stack.state_key }}
+          aws-region: ${{ env.AWS_REGION }}
+          expected-cloud: azure
+
+      # Applies the plan file this run already gated and priced. No fresh
+      # plan is generated here and -auto-approve is never used: a saved plan
+      # file is itself the approval Terraform requires.
+      - name: Apply the exact gated plan
+        working-directory: ${{ matrix.stack.dir }}
+        run: |
+          set -euo pipefail
+          cp "$GITHUB_WORKSPACE/evaluation/proposed.tfplan" ./gated.tfplan
+
+          DESTROY=$(terraform show -json gated.tfplan | python3 -c "import json,sys;d=json.load(sys.stdin);print(sum(1 for c in d.get('resource_changes',[]) if 'delete' in c['change']['actions']))")
+          if [ "$DESTROY" != "0" ]; then
+            echo "::error title=Destructive apply blocked::The gated plan would destroy $DESTROY resource(s). Use the governed destroy workflow instead."
+            exit 1
+          fi
+
+          terraform apply -input=false -no-color -lock-timeout=5m gated.tfplan
