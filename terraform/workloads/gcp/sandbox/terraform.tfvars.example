@@ -1,0 +1,19 @@
+# The value the committed terraform.tfvars deliberately omits. Supply it via
+# -var at plan time or a local (gitignored) terraform.tfvars.
+#
+# A project ID is an identifier, not a secret. Never place a service-account
+# key or any credential in this file.
+
+project_id = "REPLACE_WITH_GCP_PROJECT_ID"
+
+region           = "us-central1"
+zone             = "us-central1-a"
+environment      = "dev"
+application_name = "gcpsandbox"
+
+machine_type         = "e2-small"
+boot_disk_size_gb    = 20
+boot_disk_type       = "pd-balanced"
+data_disk_type       = "pd-balanced"
+data_disk_size_gb    = 32
+bucket_storage_class = "STANDARD"

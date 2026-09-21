@@ -35,7 +35,7 @@ SUPPORTED_CLOUDS = ("aws", "azure", "gcp")
 _CLOUD_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "aws": (),
     "azure": ("subscription_id", "location", "resource_group", "name_prefix"),
-    "gcp": ("project_id", "region"),
+    "gcp": ("project_id", "region", "name_prefix"),
 }
 
 # Azure/GCP state keys are machine-generated and must be provably isolated per
@@ -296,3 +296,29 @@ def select_stacks(
                     selected[stack.name] = stack
                 break
     return [selected[name] for name in sorted(selected)]
+
+
+def stack_matrix_entry(stack: Stack) -> dict:
+    """The payload a workflow matrix job needs to run one stack end to end.
+
+    Both the cost gate and the destroy workflow build their matrix from this,
+    so a stack is described identically no matter which trigger resolved it.
+    Cloud-scoped identifiers are emitted as empty strings rather than null
+    because GitHub Actions renders a null expression as the literal "None".
+    """
+    return {
+        "name": stack.name,
+        "dir": stack.terraform_dir,
+        "cloud": stack.cloud,
+        "deployable": stack.deployable,
+        "environment": stack.environment,
+        "usage_file": stack.usage_file or "",
+        "state_key": stack.state_key,
+        "subscription_id": stack.subscription_id or "",
+        "location": stack.location or "",
+        "project_id": stack.project_id or "",
+        "region": stack.region or "",
+        "zone": stack.zone or "",
+        "resource_group": stack.resource_group or "",
+        "name_prefix": stack.name_prefix or "",
+    }

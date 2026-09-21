@@ -107,9 +107,12 @@ stacks:
     environment: dev
     state_key: finops-poc/dev/gcp/sandbox/terraform.tfstate
     var_file: null
-    project_id: REPLACE_WITH_GCP_PROJECT_ID
+    project_id: ai-tagging-poc
     region: us-central1
     zone: us-central1-a
+    # Pre-existing and shared with unrelated workloads: this stack owns only
+    # what starts with name_prefix, and destroy is bounded to that.
+    name_prefix: gcpsandbox-dev
     # Cloud Storage bills on consumption, so Terraform alone cannot price it.
     usage_file: terraform/workloads/gcp/sandbox/infracost-usage.yml
     paths:

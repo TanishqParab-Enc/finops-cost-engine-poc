@@ -1,0 +1,75 @@
+name: GCP post-destroy verification
+description: >-
+  READ-ONLY confirmation that the workload's compute instance, network and
+  bucket are gone. Performs no mutation of any kind.
+
+inputs:
+  project-id:
+    description: Project the workload lived in.
+    required: true
+  zone:
+    description: Zone the instance lived in.
+    required: true
+  instance-name:
+    description: Compute Engine instance the workload owned.
+    required: true
+  network-name:
+    description: VPC network the workload owned.
+    required: true
+  bucket-name:
+    description: Cloud Storage bucket the workload owned.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the compute instance is gone (read-only)
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project-id }}
+        ZONE: ${{ inputs.zone }}
+        INSTANCE: ${{ inputs.instance-name }}
+      run: |
+        set -euo pipefail
+        # `list --filter` is a pure read and returns empty rather than failing
+        # when the instance is absent, so "gone" is distinguishable from "error".
+        FOUND=$(gcloud compute instances list \
+          --project "$PROJECT" --zones "$ZONE" \
+          --filter="name=$INSTANCE" --format="value(name)" | wc -l | tr -d ' ')
+        if [ "$FOUND" != "0" ]; then
+          echo "::error title=Destroy incomplete::Instance '$INSTANCE' still exists in $PROJECT/$ZONE."
+          exit 1
+        fi
+        echo "Confirmed: instance '$INSTANCE' no longer exists."
+
+    - name: Verify the VPC network is gone (read-only)
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project-id }}
+        NETWORK: ${{ inputs.network-name }}
+      run: |
+        set -euo pipefail
+        FOUND=$(gcloud compute networks list \
+          --project "$PROJECT" \
+          --filter="name=$NETWORK" --format="value(name)" | wc -l | tr -d ' ')
+        if [ "$FOUND" != "0" ]; then
+          echo "::error title=Destroy incomplete::Network '$NETWORK' still exists in $PROJECT."
+          exit 1
+        fi
+        echo "Confirmed: network '$NETWORK' no longer exists."
+
+    - name: Verify the storage bucket is gone (read-only)
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project-id }}
+        BUCKET: ${{ inputs.bucket-name }}
+      run: |
+        set -euo pipefail
+        FOUND=$(gcloud storage buckets list \
+          --project "$PROJECT" \
+          --filter="name=$BUCKET" --format="value(name)" | wc -l | tr -d ' ')
+        if [ "$FOUND" != "0" ]; then
+          echo "::error title=Destroy incomplete::Bucket '$BUCKET' still exists in $PROJECT."
+          exit 1
+        fi
+        echo "Confirmed: bucket '$BUCKET' no longer exists."

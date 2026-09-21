@@ -26,6 +26,17 @@ name: FinOps Cost Gate
   # never hard-codes or favours any particular stack.
   workflow_dispatch:
     inputs:
+      # Greenfield only. A pull_request never asks for this - there the
+      # registry alone resolves each changed stack's cloud (see detect-changes).
+      cloud:
+        description: "Cloud to run the greenfield path for"
+        required: true
+        default: AWS
+        type: choice
+        options:
+          - AWS
+          - Azure
+          - GCP
       stack:
         description: "Registered stack name from config/finops-stacks.yml (e.g. web-platform)"
         required: true
@@ -83,6 +94,7 @@ jobs:
         env:
           DISPATCH_STACK: ${{ github.event.inputs.stack }}
           DISPATCH_ENVIRONMENT: ${{ github.event.inputs.environment }}
+          DISPATCH_CLOUD: ${{ github.event.inputs.cloud }}
         run: |
           set -euo pipefail
 
@@ -99,35 +111,22 @@ jobs:
           import sys
 
           from finops.errors import ConfigurationError
-          from finops.stacks import get_stack
+          from finops.stacks import get_stack, stack_matrix_entry, validate_selection
 
           stack_name = os.environ["DISPATCH_STACK"]
           environment = os.environ["DISPATCH_ENVIRONMENT"]
+          # The dropdown is a convenience, not an authority: the registry must
+          # agree, so picking the wrong cloud fails before any credential
+          # exchange rather than authenticating to it.
+          cloud = os.environ["DISPATCH_CLOUD"].strip().lower()
 
           try:
               stack = get_stack(stack_name)
+              validate_selection(stack, cloud, environment)
           except ConfigurationError as exc:
-              sys.exit(f"::error title=Unknown stack::{exc}")
+              sys.exit(f"::error title=Stack selection rejected::{exc}")
 
-          if stack.environment != environment:
-              sys.exit(
-                  f"::error title=Environment mismatch::Stack {stack_name!r} is "
-                  f"registered for environment {stack.environment!r}, not {environment!r}."
-              )
-
-          # This workflow only holds AWS credentials; another cloud's stack is
-          # owned by that cloud's gate.
-          if stack.cloud != "aws":
-              sys.exit(
-                  f"::error title=Wrong cloud::Stack {stack_name!r} is registered for "
-                  f"cloud {stack.cloud!r}. Use the {stack.cloud} cost gate instead."
-              )
-
-          print(json.dumps([{
-              "name": stack.name, "dir": stack.terraform_dir, "cloud": stack.cloud,
-              "deployable": stack.deployable, "environment": stack.environment,
-              "usage_file": stack.usage_file or "", "state_key": stack.state_key,
-          }]))
+          print(json.dumps([stack_matrix_entry(stack)]))
           PY
             )
             echo "stacks=$STACKS" >> "$GITHUB_OUTPUT"
@@ -150,19 +149,15 @@ jobs:
           # arbitrary Terraform directory or mark itself deployable.
           STACKS=$(python - <<'PY'
           import json
-          from finops.stacks import select_stacks
+          from finops.stacks import select_stacks, stack_matrix_entry
           files = json.load(open('changes.json'))['infrastructure_files']
           # No fallback. A change that maps to no stack must evaluate nothing:
           # defaulting to aws priced an untouched stack and minted a real cost
           # lock for it, which is a deployment authorisation nobody asked for.
-          # cloud="aws": this workflow only supplies AWS credentials, so another
-          # cloud's stack could only fail here on variables it cannot provide.
-          print(json.dumps([
-              {"name": s.name, "dir": s.terraform_dir, "cloud": s.cloud,
-               "deployable": s.deployable, "environment": s.environment,
-               "usage_file": s.usage_file or "", "state_key": s.state_key}
-              for s in select_stacks(files, cloud="aws")
-          ]))
+          # Deliberately UNFILTERED by cloud: a pull request never selects a
+          # cloud, so each changed stack carries its own from the registry and
+          # the matrix routes it to the matching auth adapter.
+          print(json.dumps([stack_matrix_entry(s) for s in select_stacks(files)]))
           PY
           )
           echo "stacks=$STACKS" >> "$GITHUB_OUTPUT"
@@ -231,11 +226,63 @@ jobs:
         working-directory: head
         run: pip install --quiet -e '.[bedrock]'
 
+      # AWS keeps its existing single-role behaviour unchanged: the plan role
+      # covers both the Terraform state in S3 and the AWS provider itself.
       - name: Configure AWS credentials (OIDC)
+        if: matrix.stack.cloud == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      # Azure/GCP split those two concerns. This role reaches ONLY their state
+      # prefix in the shared bucket and cannot deploy anything in AWS, so a
+      # non-AWS stack never holds AWS deployment rights.
+      - name: Configure AWS credentials (multicloud state role)
+        if: matrix.stack.cloud != 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: finops-${{ matrix.stack.cloud }}-state-${{ github.run_id }}
+
+      - name: Authenticate to Azure (plan identity)
+        if: matrix.stack.cloud == 'azure'
+        uses: ./head/.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_PLAN_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ matrix.stack.subscription_id }}
+
+      - name: Authenticate to GCP (plan service account)
+        if: matrix.stack.cloud == 'gcp'
+        uses: ./head/.github/actions/cloud-auth/gcp
+        with:
+          workload-identity-provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ secrets.GCP_PLAN_SERVICE_ACCOUNT }}
+          project-id: ${{ matrix.stack.project_id }}
+
+      # Non-AWS stacks take their identifiers from the registry. Written as an
+      # auto-loaded tfvars file rather than TF_VAR_* so that an empty value for
+      # one cloud can never shadow a same-named variable in another - TF_VAR_
+      # env is process-wide, a file is not, and AWS stacks skip this entirely.
+      - name: Materialise registry variables for the stack's cloud
+        if: matrix.stack.cloud != 'aws'
+        env:
+          CLOUD: ${{ matrix.stack.cloud }}
+          STACK_DIR: ${{ matrix.stack.dir }}
+          # Both checkouts plan this stack, so both need the file.
+          TFVARS_ROOTS: head baseline
+          SUBSCRIPTION_ID: ${{ matrix.stack.subscription_id }}
+          RESOURCE_GROUP: ${{ matrix.stack.resource_group }}
+          LOCATION: ${{ matrix.stack.location }}
+          PROJECT_ID: ${{ matrix.stack.project_id }}
+          GCP_REGION: ${{ matrix.stack.region }}
+          GCP_ZONE: ${{ matrix.stack.zone }}
+          AZURE_SSH_PUBLIC_KEY: ${{ vars.AZURE_SANDBOX_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          python3 head/.github/scripts/write_cloud_tfvars.py
 
       # The baseline must be what is ACTUALLY deployed for this stack in its
       # registered target environment right now - never "whatever main/base
@@ -1119,6 +1166,7 @@ jobs:
       # backend/README.md "Why only two tiers").
       - name: Resolve deploy role for the target environment
         id: role
+        if: matrix.stack.cloud == 'aws'
         env:
           DEV_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         run: |
@@ -1135,10 +1183,55 @@ jobs:
           terraform_wrapper: false
 
       - name: Configure AWS credentials (deploy role)
+        if: matrix.stack.cloud == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ steps.role.outputs.arn }}
           aws-region: ${{ env.AWS_REGION }}
+
+      # Azure/GCP: state access and deployment rights are two different
+      # identities, and neither can do the other's job.
+      - name: Configure AWS credentials (multicloud state role)
+        if: matrix.stack.cloud != 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: finops-${{ matrix.stack.cloud }}-apply-state-${{ github.run_id }}
+
+      - name: Authenticate to Azure (deploy identity)
+        if: matrix.stack.cloud == 'azure'
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ matrix.stack.subscription_id }}
+
+      - name: Authenticate to GCP (deploy service account)
+        if: matrix.stack.cloud == 'gcp'
+        uses: ./.github/actions/cloud-auth/gcp
+        with:
+          workload-identity-provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          project-id: ${{ matrix.stack.project_id }}
+
+      # Same registry-driven inputs the cost gate planned with, so the applied
+      # configuration cannot differ from the priced one.
+      - name: Materialise registry variables for the stack's cloud
+        if: matrix.stack.cloud != 'aws'
+        env:
+          CLOUD: ${{ matrix.stack.cloud }}
+          STACK_DIR: ${{ matrix.stack.dir }}
+          SUBSCRIPTION_ID: ${{ matrix.stack.subscription_id }}
+          RESOURCE_GROUP: ${{ matrix.stack.resource_group }}
+          LOCATION: ${{ matrix.stack.location }}
+          PROJECT_ID: ${{ matrix.stack.project_id }}
+          GCP_REGION: ${{ matrix.stack.region }}
+          GCP_ZONE: ${{ matrix.stack.zone }}
+          AZURE_SSH_PUBLIC_KEY: ${{ vars.AZURE_SANDBOX_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/write_cloud_tfvars.py
 
       # The state key is the registry's own `state_key` for this stack, not a
       # string rebuilt from TARGET_ENV - now that the environment is

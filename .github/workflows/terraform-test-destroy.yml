@@ -23,6 +23,17 @@ name: Terraform Test Stack Destroy
 "on":
   workflow_dispatch:
     inputs:
+      # The dropdown picks the auth adapter; the registry still has the final
+      # say and rejects a stack registered for a different cloud.
+      cloud:
+        description: Cloud the stack is registered for
+        required: true
+        default: AWS
+        type: choice
+        options:
+          - AWS
+          - Azure
+          - GCP
       stack:
         description: Stack to destroy (must be deployable in config/finops-stacks.yml)
         required: true
@@ -30,6 +41,8 @@ name: Terraform Test Stack Destroy
         options:
           - web-platform
           - ecommerce-platform
+          - azure-sandbox
+          - gcp-sandbox
       environment:
         description: Environment to destroy
         required: true
@@ -70,6 +83,14 @@ jobs:
       terraform_dir: ${{ steps.resolve.outputs.terraform_dir }}
       state_key: ${{ steps.resolve.outputs.state_key }}
       var_file: ${{ steps.resolve.outputs.var_file }}
+      cloud: ${{ steps.resolve.outputs.cloud }}
+      subscription_id: ${{ steps.resolve.outputs.subscription_id }}
+      location: ${{ steps.resolve.outputs.location }}
+      resource_group: ${{ steps.resolve.outputs.resource_group }}
+      name_prefix: ${{ steps.resolve.outputs.name_prefix }}
+      project_id: ${{ steps.resolve.outputs.project_id }}
+      region: ${{ steps.resolve.outputs.region }}
+      zone: ${{ steps.resolve.outputs.zone }}
       plan_sha256: ${{ steps.fingerprint.outputs.plan_sha256 }}
     steps:
       - name: Fail closed unless confirmation is exactly DESTROY
@@ -99,6 +120,7 @@ jobs:
         env:
           STACK: ${{ inputs.stack }}
           ENVIRONMENT: ${{ inputs.environment }}
+          CLOUD: ${{ inputs.cloud }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -129,26 +151,92 @@ jobs:
           state_key = stack["state_key"]
           if state_key == forbidden_key:
               sys.exit(f"::error title=Forbidden state key::Resolved state key {state_key!r} matches the backend layer's own state. Refusing to proceed.")
-          if not state_key.startswith(f"finops-poc/{environment}/{stack_name}/"):
-              sys.exit(f"::error title=Unexpected state key::Resolved state key {state_key!r} does not match the expected finops-poc/{environment}/{stack_name}/... shape.")
+
+          cloud = stack.get("cloud")
+          selected = os.environ["CLOUD"].strip().lower()
+          if cloud != selected:
+              sys.exit(f"::error title=Cloud mismatch::{stack_name!r} is registered for cloud {cloud!r}, but {selected!r} was selected.")
+
+          # AWS keeps its original assertion verbatim. Azure/GCP live under a
+          # cloud-segmented prefix, so they get their own equally strict one.
+          if cloud == "aws":
+              if not state_key.startswith(f"finops-poc/{environment}/{stack_name}/"):
+                  sys.exit(f"::error title=Unexpected state key::Resolved state key {state_key!r} does not match the expected finops-poc/{environment}/{stack_name}/... shape.")
+          else:
+              expected_prefix = f"finops-poc/{environment}/{cloud}/"
+              if not state_key.startswith(expected_prefix):
+                  sys.exit(f"::error title=Unexpected state key::Resolved state key {state_key!r} does not start with {expected_prefix!r}.")
 
           terraform_dir = stack["terraform_dir"]
           var_file = stack.get("var_file") or ""
 
-          print(f"Stack={stack_name!r} environment={environment!r} terraform_dir={terraform_dir!r} state_key={state_key!r}")
+          print(f"Stack={stack_name!r} cloud={cloud!r} environment={environment!r} terraform_dir={terraform_dir!r} state_key={state_key!r}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"terraform_dir={terraform_dir}\n")
               out.write(f"state_key={state_key}\n")
               out.write(f"var_file={var_file}\n")
+              out.write(f"cloud={cloud}\n")
+              out.write(f"subscription_id={stack.get('subscription_id') or ''}\n")
+              out.write(f"location={stack.get('location') or ''}\n")
+              out.write(f"resource_group={stack.get('resource_group') or ''}\n")
+              out.write(f"name_prefix={stack.get('name_prefix') or ''}\n")
+              out.write(f"project_id={stack.get('project_id') or ''}\n")
+              out.write(f"region={stack.get('region') or ''}\n")
+              out.write(f"zone={stack.get('zone') or ''}\n")
           PY
 
       - name: Configure AWS credentials (OIDC, deploy role)
+        if: steps.resolve.outputs.cloud == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: terraform-test-destroy-${{ inputs.stack }}-${{ github.run_id }}
+
+      - name: Configure AWS credentials (multicloud state role)
+        if: steps.resolve.outputs.cloud != 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-test-destroy-state-${{ inputs.stack }}-${{ github.run_id }}
+
+      - name: Authenticate to Azure (deploy identity)
+        if: steps.resolve.outputs.cloud == 'azure'
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.resolve.outputs.subscription_id }}
+
+      - name: Authenticate to GCP (deploy service account)
+        if: steps.resolve.outputs.cloud == 'gcp'
+        uses: ./.github/actions/cloud-auth/gcp
+        with:
+          workload-identity-provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          project-id: ${{ steps.resolve.outputs.project_id }}
+
+      # A destroy plan still evaluates the whole configuration, so the same
+      # registry inputs the gate priced with must be present or Terraform
+      # fails on undefined variables. AWS skips this entirely.
+      - name: Materialise registry variables for the stack's cloud
+        if: steps.resolve.outputs.cloud != 'aws'
+        env:
+          CLOUD: ${{ steps.resolve.outputs.cloud }}
+          STACK_DIR: ${{ steps.resolve.outputs.terraform_dir }}
+          SUBSCRIPTION_ID: ${{ steps.resolve.outputs.subscription_id }}
+          RESOURCE_GROUP: ${{ steps.resolve.outputs.resource_group }}
+          LOCATION: ${{ steps.resolve.outputs.location }}
+          PROJECT_ID: ${{ steps.resolve.outputs.project_id }}
+          GCP_REGION: ${{ steps.resolve.outputs.region }}
+          GCP_ZONE: ${{ steps.resolve.outputs.zone }}
+          AZURE_SSH_PUBLIC_KEY: ${{ vars.AZURE_SANDBOX_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/write_cloud_tfvars.py
+
 
       # Fails closed rather than silently planning/destroying in the wrong
       # account or region.
@@ -353,15 +441,58 @@ jobs:
           terraform_wrapper: false
 
       - name: Configure AWS credentials (OIDC, deploy role)
+        if: needs.validate-destroy.outputs.cloud == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: terraform-test-destroy-apply-${{ inputs.stack }}-${{ github.run_id }}
 
+      - name: Configure AWS credentials (multicloud state role)
+        if: needs.validate-destroy.outputs.cloud != 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-test-destroy-apply-state-${{ inputs.stack }}-${{ github.run_id }}
+
+      - name: Authenticate to Azure (deploy identity)
+        if: needs.validate-destroy.outputs.cloud == 'azure'
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ needs.validate-destroy.outputs.subscription_id }}
+
+      - name: Authenticate to GCP (deploy service account)
+        if: needs.validate-destroy.outputs.cloud == 'gcp'
+        uses: ./.github/actions/cloud-auth/gcp
+        with:
+          workload-identity-provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          project-id: ${{ needs.validate-destroy.outputs.project_id }}
+
       # Same remote backend/key the plan was produced against - reinitialized
       # fresh in this job, never assumed to still be configured from job 1
       # (each job runs on its own clean runner).
+      # The saved destroy plan is applied verbatim, but Terraform still loads
+      # the configuration around it, so the same registry inputs must be here.
+      - name: Materialise registry variables for the stack's cloud
+        if: needs.validate-destroy.outputs.cloud != 'aws'
+        env:
+          CLOUD: ${{ needs.validate-destroy.outputs.cloud }}
+          STACK_DIR: ${{ needs.validate-destroy.outputs.terraform_dir }}
+          SUBSCRIPTION_ID: ${{ needs.validate-destroy.outputs.subscription_id }}
+          RESOURCE_GROUP: ${{ needs.validate-destroy.outputs.resource_group }}
+          LOCATION: ${{ needs.validate-destroy.outputs.location }}
+          PROJECT_ID: ${{ needs.validate-destroy.outputs.project_id }}
+          GCP_REGION: ${{ needs.validate-destroy.outputs.region }}
+          GCP_ZONE: ${{ needs.validate-destroy.outputs.zone }}
+          AZURE_SSH_PUBLIC_KEY: ${{ vars.AZURE_SANDBOX_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/write_cloud_tfvars.py
+
       - name: Terraform init (same remote backend/state key)
         working-directory: ${{ needs.validate-destroy.outputs.terraform_dir }}
         env:
@@ -398,11 +529,58 @@ jobs:
     environment: ${{ inputs.environment }}
     steps:
       - name: Configure AWS credentials (OIDC, deploy role)
+        if: needs.validate-destroy.outputs.cloud == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: terraform-test-destroy-verify-${{ inputs.stack }}-${{ github.run_id }}
+
+      - name: Configure AWS credentials (multicloud state role)
+        if: needs.validate-destroy.outputs.cloud != 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_MULTICLOUD_STATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-test-destroy-verify-state-${{ inputs.stack }}-${{ github.run_id }}
+
+      - name: Authenticate to Azure (deploy identity)
+        if: needs.validate-destroy.outputs.cloud == 'azure'
+        uses: ./.github/actions/cloud-auth/azure
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ needs.validate-destroy.outputs.subscription_id }}
+
+      - name: Authenticate to GCP (deploy service account)
+        if: needs.validate-destroy.outputs.cloud == 'gcp'
+        uses: ./.github/actions/cloud-auth/gcp
+        with:
+          workload-identity-provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          project-id: ${{ needs.validate-destroy.outputs.project_id }}
+
+      # Cloud-specific adapters: the AWS checks below are unchanged and stay
+      # AWS-only; Azure/GCP get their own equivalent read-only verification.
+      - name: Verify Azure teardown (read-only)
+        if: needs.validate-destroy.outputs.cloud == 'azure'
+        uses: ./.github/actions/post-destroy-verify/azure
+        with:
+          resource-group: ${{ needs.validate-destroy.outputs.resource_group }}
+          subscription-id: ${{ needs.validate-destroy.outputs.subscription_id }}
+          name-prefix: ${{ needs.validate-destroy.outputs.name_prefix }}
+
+      - name: Verify GCP teardown (read-only)
+        if: needs.validate-destroy.outputs.cloud == 'gcp'
+        uses: ./.github/actions/post-destroy-verify/gcp
+        with:
+          project-id: ${{ needs.validate-destroy.outputs.project_id }}
+          zone: ${{ needs.validate-destroy.outputs.zone }}
+          # Names the sandbox builds from its own prefix - see
+          # terraform/workloads/gcp/sandbox/main.tf.
+          instance-name: ${{ needs.validate-destroy.outputs.name_prefix }}-vm
+          network-name: ${{ needs.validate-destroy.outputs.name_prefix }}-vpc
+          bucket-name: ${{ needs.validate-destroy.outputs.name_prefix }}-assets-${{ needs.validate-destroy.outputs.project_id }}
 
       # Read-only. Confirms the workload is actually gone and, just as
       # importantly, that the backend/IAM/OIDC bootstrap infrastructure and
@@ -472,6 +650,11 @@ jobs:
           echo "Confirmed: expected web-platform resources are absent."
 
       - name: Verify Terraform state bucket and backend infrastructure untouched
+        # AWS-only: head-bucket sends no s3:prefix and iam:get-role is
+        # explicitly denied, so the multicloud state role cannot run these.
+        # That denial IS the equivalent guarantee for Azure/GCP; the step
+        # below verifies what that role is actually permitted to see.
+        if: needs.validate-destroy.outputs.cloud == 'aws'
         env:
           STATE_KEY: ${{ needs.validate-destroy.outputs.state_key }}
         run: |
@@ -496,3 +679,35 @@ jobs:
           aws iam get-role --role-name finops-poc-dev-deploy-role >/dev/null
           aws iam get-role --role-name finops-poc-dev-plan-role >/dev/null
           echo "- ✅ IAM/OIDC backend roles (finops-poc-dev-deploy-role, finops-poc-dev-plan-role) still exist, untouched" >> "$GITHUB_STEP_SUMMARY"
+
+      # Azure/GCP equivalent, bounded by what the state-only role may do. It
+      # asserts the destroyed stack's state stayed inside its own cloud prefix
+      # and that reaching outside it is still refused.
+      - name: Verify centralized state boundary held (read-only)
+        if: needs.validate-destroy.outputs.cloud != 'aws'
+        env:
+          STATE_KEY: ${{ needs.validate-destroy.outputs.state_key }}
+          CLOUD: ${{ needs.validate-destroy.outputs.cloud }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          echo "## Backend/state verification (${CLOUD})" >> "$GITHUB_STEP_SUMMARY"
+
+          EXPECTED_PREFIX="finops-poc/${ENVIRONMENT}/${CLOUD}/"
+          case "$STATE_KEY" in
+            "$EXPECTED_PREFIX"*) ;;
+            *) echo "::error title=State key escaped its cloud prefix::$STATE_KEY is not under $EXPECTED_PREFIX"; exit 1 ;;
+          esac
+          echo "- ✅ State key $STATE_KEY is under $EXPECTED_PREFIX" >> "$GITHUB_STEP_SUMMARY"
+
+          aws s3api list-objects-v2 --bucket "${{ vars.TF_STATE_BUCKET }}" \
+            --prefix "$EXPECTED_PREFIX" --query 'length(Contents)' --output text >/dev/null
+          echo "- ✅ State prefix is reachable with the state-only role" >> "$GITHUB_STEP_SUMMARY"
+
+          # Must be refused. A success here means the role's fence is gone.
+          if aws s3api get-object --bucket "${{ vars.TF_STATE_BUCKET }}" \
+               --key "finops-poc/${ENVIRONMENT}/terraform.tfstate" /dev/null >/dev/null 2>&1; then
+            echo "::error title=State isolation broken::The state-only role could read the AWS backend layer's state."
+            exit 1
+          fi
+          echo "- ✅ AWS backend/workload state remains unreachable from this role" >> "$GITHUB_STEP_SUMMARY"

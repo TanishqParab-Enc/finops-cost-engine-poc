@@ -1,0 +1,52 @@
+name: GCP Workload Identity Federation authentication
+description: >-
+  Exchange the GitHub Actions OIDC token for Google credentials via Workload
+  Identity Federation. Authentication only - no Terraform, no FinOps logic, no
+  state access.
+
+inputs:
+  workload-identity-provider:
+    description: >-
+      Full WIF provider resource name, e.g.
+      projects/<n>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+    required: true
+  service-account:
+    description: Service account email to impersonate.
+    required: true
+  project-id:
+    description: Target GCP project ID.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Requires `permissions: id-token: write` on the calling job. No
+    # service-account JSON key is used or accepted anywhere in this action.
+    #
+    # The repository restriction lives on the WIF provider's attribute
+    # condition (assertion.repository), configured in the GCP bootstrap - not
+    # here, so a workflow edit cannot widen who may federate in.
+    - name: Google auth (Workload Identity Federation)
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+        create_credentials_file: true
+        export_environment_variables: true
+
+    - name: Export google provider configuration
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "GOOGLE_PROJECT=${{ inputs.project-id }}" >> "$GITHUB_ENV"
+        echo "TF_VAR_project_id=${{ inputs.project-id }}" >> "$GITHUB_ENV"
+
+    - name: Confirm the Google credential resolves
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+          echo "::error title=No Google credentials::Workload Identity Federation did not produce a credentials file."
+          exit 1
+        fi
+        echo "Federated credentials written for project ${{ inputs.project-id }}"
