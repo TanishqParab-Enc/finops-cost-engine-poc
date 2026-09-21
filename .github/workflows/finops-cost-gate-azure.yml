@@ -64,7 +64,11 @@ jobs:
       stacks: ${{ steps.resolve.outputs.stacks }}
       has_stacks: ${{ steps.resolve.outputs.has_stacks }}
     steps:
+      # Full history: the PR path diffs against the base ref, which a shallow
+      # clone does not contain.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -147,6 +151,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
