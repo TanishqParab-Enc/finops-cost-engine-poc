@@ -267,9 +267,20 @@ def validate_selection(
 
 
 
-def select_stacks(changed_files: list[str], path: str | Path | None = None) -> list[Stack]:
+def select_stacks(
+    changed_files: list[str],
+    path: str | Path | None = None,
+    cloud: str | None = None,
+) -> list[Stack]:
     """Stacks whose paths a change touches. Longest prefix wins, so a nested
-    workload is never attributed to the stack it happens to sit under."""
+    workload is never attributed to the stack it happens to sit under.
+
+    `cloud` scopes the result to one provider's workflow: each cloud's gate
+    supplies only its own credentials, so evaluating another cloud's stack can
+    only fail on missing variables.
+    """
+    if cloud is not None:
+        _validate_cloud(cloud, "select_stacks")
     stacks = load_stacks(path)
     ordered = sorted(
         ((prefix, stack) for stack in stacks.values() for prefix in stack.paths),
@@ -281,6 +292,7 @@ def select_stacks(changed_files: list[str], path: str | Path | None = None) -> l
         normalised = str(changed).replace("\\", "/").lstrip("./")
         for prefix, stack in ordered:
             if normalised.startswith(prefix):
-                selected[stack.name] = stack
+                if cloud is None or stack.cloud == cloud:
+                    selected[stack.name] = stack
                 break
     return [selected[name] for name in sorted(selected)]

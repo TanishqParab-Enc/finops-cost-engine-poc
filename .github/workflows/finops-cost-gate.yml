@@ -115,6 +115,14 @@ jobs:
                   f"registered for environment {stack.environment!r}, not {environment!r}."
               )
 
+          # This workflow only holds AWS credentials; another cloud's stack is
+          # owned by that cloud's gate.
+          if stack.cloud != "aws":
+              sys.exit(
+                  f"::error title=Wrong cloud::Stack {stack_name!r} is registered for "
+                  f"cloud {stack.cloud!r}. Use the {stack.cloud} cost gate instead."
+              )
+
           print(json.dumps([{
               "name": stack.name, "dir": stack.terraform_dir, "cloud": stack.cloud,
               "deployable": stack.deployable, "environment": stack.environment,
@@ -147,11 +155,13 @@ jobs:
           # No fallback. A change that maps to no stack must evaluate nothing:
           # defaulting to aws priced an untouched stack and minted a real cost
           # lock for it, which is a deployment authorisation nobody asked for.
+          # cloud="aws": this workflow only supplies AWS credentials, so another
+          # cloud's stack could only fail here on variables it cannot provide.
           print(json.dumps([
               {"name": s.name, "dir": s.terraform_dir, "cloud": s.cloud,
                "deployable": s.deployable, "environment": s.environment,
                "usage_file": s.usage_file or "", "state_key": s.state_key}
-              for s in select_stacks(files)
+              for s in select_stacks(files, cloud="aws")
           ]))
           PY
           )

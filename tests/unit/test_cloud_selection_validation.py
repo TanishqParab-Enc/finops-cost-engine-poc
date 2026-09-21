@@ -18,6 +18,7 @@ from finops.stacks import (
     Stack,
     expected_state_key,
     load_stacks,
+    select_stacks,
     validate_selection,
 )
 
@@ -179,3 +180,44 @@ class TestCloudSelectionValidation:
         stacks = load_stacks(REAL_REGISTRY)
         for stack in stacks.values():
             assert validate_selection(stack, stack.cloud, stack.environment) is stack
+
+
+# ---------------------------------------------------------------------------
+# Each cloud's gate must only claim its own stacks. Adding Azure/GCP entries to
+# the shared registry previously made the AWS gate try to price an Azure stack
+# with AWS-only credentials.
+# ---------------------------------------------------------------------------
+
+
+def test_aws_gate_does_not_claim_azure_stack():
+    selected = select_stacks(
+        ["terraform/workloads/azure/sandbox/main.tf"], REAL_REGISTRY, cloud="aws"
+    )
+    assert selected == []
+
+
+def test_azure_gate_does_not_claim_aws_stack():
+    selected = select_stacks(
+        ["terraform/workloads/ecommerce-platform/main.tf"], REAL_REGISTRY, cloud="azure"
+    )
+    assert selected == []
+
+
+def test_azure_gate_claims_its_own_stack():
+    names = [s.name for s in select_stacks(
+        ["terraform/workloads/azure/sandbox/main.tf"], REAL_REGISTRY, cloud="azure"
+    )]
+    assert names == ["azure-sandbox"]
+
+
+def test_unfiltered_selection_is_unchanged():
+    """Omitting cloud must keep the pre-multicloud behaviour."""
+    names = [s.name for s in select_stacks(
+        ["terraform/workloads/azure/sandbox/main.tf"], REAL_REGISTRY
+    )]
+    assert names == ["azure-sandbox"]
+
+
+def test_select_stacks_rejects_unsupported_cloud():
+    with pytest.raises(ConfigurationError):
+        select_stacks(["terraform/aws/main.tf"], REAL_REGISTRY, cloud="oracle")
