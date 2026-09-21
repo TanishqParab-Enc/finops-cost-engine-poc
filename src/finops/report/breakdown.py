@@ -10,44 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ..models import Action, CostConfidence, CostEstimate, ResourceCost, money
-
-# Terraform resource type -> the service a FinOps reviewer thinks in.
-_SERVICE_BY_PREFIX = (
-    ("aws_autoscaling_group", "EC2"),
-    ("aws_launch_template", "EC2"),
-    ("aws_launch_configuration", "EC2"),
-    ("aws_instance", "EC2"),
-    ("aws_spot_instance_request", "EC2"),
-    ("aws_ebs_volume", "EBS"),
-    ("aws_ebs_snapshot", "EBS"),
-    ("aws_db_instance", "RDS"),
-    ("aws_rds_cluster", "RDS"),
-    ("aws_db_", "RDS"),
-    ("aws_elasticache", "ElastiCache"),
-    ("aws_dynamodb", "DynamoDB"),
-    ("aws_s3_", "S3"),
-    ("aws_lb", "Load Balancing"),
-    ("aws_alb", "Load Balancing"),
-    ("aws_elb", "Load Balancing"),
-    ("aws_nat_gateway", "NAT Gateway"),
-    ("aws_eip", "Elastic IP"),
-    ("aws_vpn", "VPN"),
-    ("aws_vpc_endpoint", "VPC Endpoint"),
-    ("aws_cloudfront", "CloudFront"),
-    ("aws_route53", "Route 53"),
-    ("aws_cloudwatch", "CloudWatch"),
-    ("aws_lambda", "Lambda"),
-    ("aws_ecs", "ECS"),
-    ("aws_eks", "EKS"),
-    ("aws_sqs", "SQS"),
-    ("aws_sns", "SNS"),
-    ("aws_kms", "KMS"),
-    ("aws_secretsmanager", "Secrets Manager"),
-    ("aws_apigateway", "API Gateway"),
-    ("aws_api_gateway", "API Gateway"),
-    ("aws_efs", "EFS"),
-    ("aws_fsx", "FSx"),
-)
+from .clouds import service_of as _adapter_service_of
 
 _ACTION_LABEL = {
     Action.CREATE: "added",
@@ -64,15 +27,10 @@ _PR_CHANGE_ACTIONS = {Action.CREATE, Action.UPDATE, Action.DELETE, Action.REPLAC
 
 
 def service_of(resource_type: str) -> str:
-    lowered = (resource_type or "").lower()
-    for prefix, service in _SERVICE_BY_PREFIX:
-        if lowered.startswith(prefix):
-            return service
-    if lowered.startswith("azurerm_"):
-        return lowered.removeprefix("azurerm_").split("_")[0].title()
-    if lowered.startswith("google_"):
-        return lowered.removeprefix("google_").split("_")[0].title()
-    return resource_type or "unknown"
+    """Delegates to the cloud adapters. AWS labels are unchanged; Azure/GCP no
+    longer fall back to the first token of the resource type, which produced
+    "Linux" for a VM and "Managed" for a disk."""
+    return _adapter_service_of(resource_type)
 
 
 def change_label(resource: ResourceCost) -> str:
