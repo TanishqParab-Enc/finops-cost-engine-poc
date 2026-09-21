@@ -1,0 +1,50 @@
+name: Azure OIDC authentication
+description: >-
+  Exchange the GitHub Actions OIDC token for Azure credentials via Microsoft
+  Entra Workload Identity Federation. Authentication only - no Terraform, no
+  FinOps logic, no state access.
+
+inputs:
+  client-id:
+    description: Client ID of the Entra identity (plan or deploy) to federate into.
+    required: true
+  tenant-id:
+    description: Entra tenant ID.
+    required: true
+  subscription-id:
+    description: Target Azure subscription ID.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Requires `permissions: id-token: write` on the calling job. No client
+    # secret is used or accepted anywhere in this action.
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        subscription-id: ${{ inputs.subscription-id }}
+
+    # The azurerm provider reads these directly. ARM_USE_OIDC makes it perform
+    # its own federated exchange rather than expecting a secret.
+    - name: Export azurerm provider OIDC configuration
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "ARM_USE_OIDC=true" >> "$GITHUB_ENV"
+        echo "ARM_CLIENT_ID=${{ inputs.client-id }}" >> "$GITHUB_ENV"
+        echo "ARM_TENANT_ID=${{ inputs.tenant-id }}" >> "$GITHUB_ENV"
+        echo "ARM_SUBSCRIPTION_ID=${{ inputs.subscription-id }}" >> "$GITHUB_ENV"
+
+    - name: Confirm the Azure context
+      shell: bash
+      run: |
+        set -euo pipefail
+        ACTUAL=$(az account show --query id -o tsv)
+        if [ "$ACTUAL" != "${{ inputs.subscription-id }}" ]; then
+          echo "::error title=Azure subscription mismatch::Authenticated to '$ACTUAL' but the stack is registered for '${{ inputs.subscription-id }}'. Refusing to continue."
+          exit 1
+        fi
+        echo "Authenticated to Azure subscription $ACTUAL"

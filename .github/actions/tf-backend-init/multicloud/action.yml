@@ -1,0 +1,74 @@
+name: Terraform S3 backend init (multi-cloud)
+description: >-
+  Initialise Terraform against the CENTRALISED S3 state bucket for an Azure or
+  GCP workload. The Terraform backend is independent of the cloud being
+  deployed, so all three clouds share one bucket and differ only by key prefix.
+  Backend init only - no plan, no apply, no FinOps logic.
+
+inputs:
+  working-directory:
+    description: Terraform root to initialise.
+    required: true
+  state-bucket:
+    description: The shared Terraform state bucket.
+    required: true
+  state-key:
+    description: >-
+      The stack's state_key, taken from the trusted registry. Never hand-built
+      from workflow inputs, so the gated baseline and the applied state are
+      provably the same object.
+    required: true
+  aws-region:
+    description: Region of the state bucket.
+    required: false
+    default: us-east-1
+  expected-cloud:
+    description: azure | gcp - used to re-assert key isolation at init time.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Defence in depth. src/finops/stacks.py already enforces this shape when
+    # the registry loads; re-checking here means a malformed key can never
+    # reach `terraform init` even if a caller bypassed the resolver.
+    - name: Re-assert state key isolation
+      shell: bash
+      env:
+        STATE_KEY: ${{ inputs.state-key }}
+        EXPECTED_CLOUD: ${{ inputs.expected-cloud }}
+      run: |
+        set -euo pipefail
+        case "$EXPECTED_CLOUD" in
+          azure|gcp) ;;
+          *) echo "::error title=Unsupported cloud::expected-cloud must be azure or gcp, got '$EXPECTED_CLOUD'."; exit 1 ;;
+        esac
+
+        if [[ "$STATE_KEY" != finops-poc/*/"$EXPECTED_CLOUD"/*/terraform.tfstate ]]; then
+          echo "::error title=State key isolation violation::'$STATE_KEY' is not a finops-poc/<env>/$EXPECTED_CLOUD/<workload>/terraform.tfstate key. Refusing to initialise - this could target another cloud's state."
+          exit 1
+        fi
+        echo "State key accepted: $STATE_KEY"
+
+    # FAIL CLOSED. An unreadable backend means the deployed cost is UNKNOWN,
+    # never "nothing is deployed". No continue-on-error and no local-backend
+    # fallback: if init cannot reach the bucket/key, the job fails and no
+    # baseline, cost lock or deployment is produced.
+    #
+    # The greenfield case is different and still supported: init against a
+    # reachable bucket holding no object for this key succeeds, and the empty
+    # state prices as a genuine $0 baseline.
+    - name: Terraform init (shared S3 backend)
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        if ! terraform init -input=false -no-color \
+          -backend-config="bucket=${{ inputs.state-bucket }}" \
+          -backend-config="key=${{ inputs.state-key }}" \
+          -backend-config="region=${{ inputs.aws-region }}" \
+          -backend-config="use_lockfile=true" \
+          -backend-config="encrypt=true"; then
+          echo "::error title=BASELINE_UNAVAILABLE::COST_ESTIMATION/BASELINE_UNAVAILABLE - could not initialise the shared backend (bucket=${{ inputs.state-bucket }}, key=${{ inputs.state-key }}). The deployed cost is unknown, so the gate fails closed: no baseline, no cost lock, no deployment."
+          exit 1
+        fi

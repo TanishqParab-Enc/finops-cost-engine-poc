@@ -1,0 +1,22 @@
+# Values the committed terraform.tfvars deliberately omits. Supply them via
+# -var at plan time or a local (gitignored) terraform.tfvars.
+#
+# Neither is a secret: a subscription ID is an identifier, and an SSH PUBLIC
+# key is public by definition. Never place a private key or client secret here.
+
+subscription_id      = "REPLACE_WITH_AZURE_SUBSCRIPTION_ID"
+admin_ssh_public_key = "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY comment"
+
+# Must already exist. This configuration reads it and never creates or
+# destroys it, so it is safe to share with unrelated workloads.
+resource_group_name = "Azure-AI-Tagging-POC"
+
+location         = "eastus"
+environment      = "dev"
+application_name = "azsandbox"
+
+vm_size                  = "Standard_B2s"
+os_disk_type             = "StandardSSD_LRS"
+data_disk_type           = "StandardSSD_LRS"
+data_disk_size_gb        = 32
+storage_replication_type = "LRS"

@@ -68,3 +68,52 @@ stacks:
     usage_file: terraform/workloads/ecommerce-platform/infracost-usage.yml
     paths:
       - terraform/workloads/ecommerce-platform/
+
+  # -------------------------------------------------------------------------
+  # Multi-cloud (2026-09-18). Azure and GCP reuse the SAME governance engine,
+  # the SAME threshold and the SAME S3 state bucket as AWS - only the key
+  # prefix, the deployment credentials and the Terraform provider differ.
+  #
+  # Their state_key MUST be finops-poc/<environment>/<cloud>/<workload>/
+  # terraform.tfstate. src/finops/stacks.py enforces that shape for azure/gcp
+  # so a run can never initialise against an AWS workload's state. The AWS
+  # entries above predate this convention and are deliberately exempt.
+  #
+  # subscription_id / project_id are non-secret identifiers. Credentials are
+  # never stored in this registry.
+  # -------------------------------------------------------------------------
+  azure-sandbox:
+    terraform_dir: terraform/workloads/azure/sandbox
+    cloud: azure
+    deployable: true
+    environment: dev
+    state_key: finops-poc/dev/azure/sandbox/terraform.tfstate
+    var_file: null
+    subscription_id: ce847125-30f1-42d7-830f-3f74c0e681ed
+    location: eastus
+    # Pre-existing and shared with unrelated workloads: read, never created,
+    # never destroyed. Everything this stack owns starts with name_prefix.
+    resource_group: Azure-AI-Tagging-POC
+    name_prefix: azsandbox-dev
+    # Blob storage bills on consumption, so Terraform alone cannot price it.
+    usage_file: terraform/workloads/azure/sandbox/infracost-usage.yml
+    paths:
+      - terraform/workloads/azure/sandbox/
+
+  gcp-sandbox:
+    terraform_dir: terraform/workloads/gcp/sandbox
+    cloud: gcp
+    deployable: true
+    environment: dev
+    state_key: finops-poc/dev/gcp/sandbox/terraform.tfstate
+    var_file: null
+    project_id: ai-tagging-poc
+    region: us-central1
+    zone: us-central1-a
+    # Pre-existing and shared with unrelated workloads: this stack owns only
+    # what starts with name_prefix, and destroy is bounded to that.
+    name_prefix: gcpsandbox-dev
+    # Cloud Storage bills on consumption, so Terraform alone cannot price it.
+    usage_file: terraform/workloads/gcp/sandbox/infracost-usage.yml
+    paths:
+      - terraform/workloads/gcp/sandbox/

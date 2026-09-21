@@ -265,11 +265,21 @@ class TestWorkflowFileGovernanceParity:
 
     def test_workflow_dispatch_trigger_has_stack_and_environment_inputs(self, workflow):
         dispatch = workflow["on"]["workflow_dispatch"]
-        assert set(dispatch["inputs"]) == {"stack", "environment", "apply"}
+        assert set(dispatch["inputs"]) == {"cloud", "stack", "environment", "apply"}
         assert dispatch["inputs"]["stack"]["required"] is True
         assert dispatch["inputs"]["environment"]["required"] is True
         # Free-text, not a hard-coded choice list of stack names.
         assert dispatch["inputs"]["stack"]["type"] == "string"
+
+    def test_dispatch_cloud_is_a_closed_choice_of_the_supported_clouds(self, workflow):
+        """Greenfield picks the cloud in the UI, so the list must be closed -
+        an unsupported cloud can never reach a credential exchange."""
+        cloud = workflow["on"]["workflow_dispatch"]["inputs"]["cloud"]
+        assert cloud["type"] == "choice"
+        assert cloud["required"] is True
+        assert {opt.lower() for opt in cloud["options"]} == {"aws", "azure", "gcp"}
+        # AWS stays the default so the validated path is the zero-input one.
+        assert str(cloud["default"]).lower() == "aws"
 
     def test_apply_input_is_an_opt_in_boolean(self, workflow):
         apply_input = workflow["on"]["workflow_dispatch"]["inputs"]["apply"]
@@ -368,9 +378,36 @@ class TestNoLegacyCloudDispatchPath:
         return WORKFLOW_PATH.read_text(encoding="utf-8")
 
     def test_dispatch_has_no_cloud_or_deploy_inputs(self, workflow):
+        """`cloud` is now a legitimate GREENFIELD input, but it must be the
+        only one added: a dispatch still must not carry its own deploy target,
+        which would bypass the registry."""
         inputs = workflow["on"]["workflow_dispatch"]["inputs"]
-        for legacy in ("cloud", "deploy", "deploy_environment"):
+        for legacy in ("deploy", "deploy_environment"):
             assert legacy not in inputs
+
+    def test_dispatch_cloud_is_validated_against_the_registry(self, workflow):
+        """The UI selection is a request, not an authority. The registry must
+        confirm it, and a mismatch must fail closed rather than be silently
+        overridden with the registry's own value."""
+        steps = workflow["jobs"]["detect-changes"]["steps"]
+        detect = next(s for s in steps if s.get("id") == "detect")
+        script = detect["run"]
+        assert detect["env"]["DISPATCH_CLOUD"] == "${{ github.event.inputs.cloud }}"
+        # validate_selection raises on a cloud/environment mismatch.
+        assert "validate_selection" in script
+        assert 'validate_selection(stack, cloud, environment)' in script
+        assert "Stack selection rejected" in script
+
+    def test_pull_request_never_takes_a_manual_cloud(self, workflow):
+        """Brownfield resolves the cloud dynamically from the registry, so the
+        PR branch must not consult the dispatch input at all."""
+        steps = workflow["jobs"]["detect-changes"]["steps"]
+        detect = next(s for s in steps if s.get("id") == "detect")
+        script = detect["run"]
+        pr_branch = script.split("BASE=", 1)[1]
+        assert "DISPATCH_CLOUD" not in pr_branch
+        # Unfiltered by cloud: every changed stack carries its own.
+        assert "select_stacks(files)" in pr_branch
 
     def test_no_job_matrixes_over_cloud_names(self, raw):
         assert "matrix.cloud" not in raw
@@ -410,14 +447,46 @@ class TestNoLegacyCloudDispatchPath:
         assert 'backend "local"' not in init["run"]
 
     def test_detect_changes_emits_state_key_on_both_trigger_paths(self, workflow):
+        """Assert the BEHAVIOUR of the shared routing helper both branches use,
+        rather than counting string literals in the workflow text."""
+        from finops.stacks import load_stacks, stack_matrix_entry
+
         steps = workflow["jobs"]["detect-changes"]["steps"]
         detect = next(s for s in steps if s.get("id") == "detect")
         script = detect["run"]
-        # workflow_dispatch branch resolves through the registry ...
-        assert "from finops.stacks import get_stack" in script
-        assert 'get_stack(stack_name)' in script
-        # ... and both branches publish the state_key the cost gate consumes.
-        assert script.count('"state_key"') >= 2
+        # Both branches build their matrix from the one helper.
+        assert script.count("stack_matrix_entry") >= 2
+
+        registry = load_stacks(REPO_ROOT / "config" / "finops-stacks.yml")
+        for stack in registry.values():
+            entry = stack_matrix_entry(stack)
+            assert entry["state_key"] == stack.state_key
+            assert entry["cloud"] == stack.cloud
+            # GitHub renders a null expression as the literal "None".
+            assert None not in entry.values()
+
+    def test_state_keys_are_routed_per_cloud(self, workflow):
+        """Azure/GCP live under their own prefix; existing AWS keys are frozen."""
+        from finops.stacks import load_stacks, stack_matrix_entry
+
+        registry = load_stacks(REPO_ROOT / "config" / "finops-stacks.yml")
+
+        assert stack_matrix_entry(registry["azure-sandbox"])["state_key"] == (
+            "finops-poc/dev/azure/sandbox/terraform.tfstate"
+        )
+        assert stack_matrix_entry(registry["gcp-sandbox"])["state_key"] == (
+            "finops-poc/dev/gcp/sandbox/terraform.tfstate"
+        )
+        # Frozen AWS keys - these must never move.
+        assert registry["web-platform"].state_key == "finops-poc/dev/web-platform/terraform.tfstate"
+        assert registry["aws"].state_key == "finops-poc/dev/aws/terraform.tfstate"
+
+        for stack in registry.values():
+            if stack.cloud == "aws":
+                assert "/azure/" not in stack.state_key
+                assert "/gcp/" not in stack.state_key
+            else:
+                assert stack.state_key.startswith(f"finops-poc/dev/{stack.cloud}/")
 
     def test_dispatch_branch_hard_codes_no_stack_name(self, workflow):
         steps = workflow["jobs"]["detect-changes"]["steps"]
@@ -469,14 +538,75 @@ class TestSingleSharedPipeline:
         assert "pull_request" not in str(job.get("if", ""))
 
     def test_exactly_one_oidc_role_assumption_path_for_deployment(self, workflow):
+        """Multi-cloud replaces "exactly one credentials step" with a stronger
+        rule: every credentials step must declare WHICH cloud it serves, and
+        the two role families must never cross over.
+
+        - AWS plan/deploy roles only when cloud == 'aws'
+        - the state-only role only when cloud != 'aws'
+        so no Azure/GCP path can hold AWS deployment rights, and the state-only
+        role can never stand in as a target-cloud deployment role.
+        """
         steps = workflow["jobs"]["deploy"]["steps"]
         creds = [s for s in steps if "configure-aws-credentials" in str(s.get("uses", ""))]
-        assert len(creds) == 1
-        assert "role-to-assume" in creds[0]["with"]
+        assert creds, "the deploy job must assume a role via OIDC"
+
+        aws_family = ("AWS_DEPLOY_ROLE_ARN", "AWS_PLAN_ROLE_ARN", "steps.role.outputs.arn")
+        for step in creds:
+            role = str(step["with"]["role-to-assume"])
+            condition = str(step.get("if", ""))
+            assert "role-to-assume" in step["with"]
+            if "AWS_MULTICLOUD_STATE_ROLE_ARN" in role:
+                assert condition == "matrix.stack.cloud != 'aws'", (
+                    "the state-only role must be reachable only for non-AWS stacks"
+                )
+            else:
+                assert any(token in role for token in aws_family), f"unknown role source: {role}"
+                assert condition == "matrix.stack.cloud == 'aws'", (
+                    "AWS plan/deploy roles must be reachable only for AWS stacks"
+                )
+
+        # Exactly one of each family - not an open-ended set of credential paths.
+        state_only = [s for s in creds if "AWS_MULTICLOUD_STATE_ROLE_ARN" in str(s["with"]["role-to-assume"])]
+        assert len(state_only) == 1
+        assert len(creds) - len(state_only) == 1
+
         # No static credentials anywhere in the pipeline.
         raw = WORKFLOW_PATH.read_text(encoding="utf-8")
         assert "aws-access-key-id" not in raw
         assert "aws-secret-access-key" not in raw
+
+    def test_target_cloud_auth_adapters_are_mutually_exclusive(self, workflow):
+        """Azure and GCP deployment credentials are guarded by their own cloud,
+        so one cloud's run can never authenticate to another's."""
+        expected = {
+            "./.github/actions/cloud-auth/azure": "matrix.stack.cloud == 'azure'",
+            "./.github/actions/cloud-auth/gcp": "matrix.stack.cloud == 'gcp'",
+        }
+        for job_name in ("cost-gate", "deploy"):
+            steps = workflow["jobs"][job_name]["steps"]
+            seen = {}
+            for step in steps:
+                uses = str(step.get("uses", ""))
+                for action, condition in expected.items():
+                    if uses.endswith(action.lstrip(".")) or uses == action or uses == f"./head{action[1:]}":
+                        seen[action] = str(step.get("if", ""))
+            for action, condition in expected.items():
+                assert action in seen, f"{job_name} is missing the {action} adapter"
+                assert seen[action] == condition
+
+    def test_no_cross_cloud_use_of_the_state_only_role(self, workflow):
+        """The state-only role must never be handed to a cloud provider as a
+        deployment identity, and AWS roles must never appear in a non-AWS step."""
+        for job in workflow["jobs"].values():
+            for step in job.get("steps") or []:
+                rendered = str(step.get("with", "")) + str(step.get("env", ""))
+                condition = str(step.get("if", ""))
+                if "cloud == 'azure'" in condition or "cloud == 'gcp'" in condition:
+                    assert "AWS_DEPLOY_ROLE_ARN" not in rendered
+                    assert "AWS_PLAN_ROLE_ARN" not in rendered
+                if "AWS_MULTICLOUD_STATE_ROLE_ARN" in rendered:
+                    assert "cloud != 'aws'" in condition
 
     def test_oidc_role_is_not_branched_on_the_event_type(self, workflow):
         steps = workflow["jobs"]["deploy"]["steps"]

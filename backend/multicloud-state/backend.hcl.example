@@ -1,0 +1,7 @@
+# terraform init -backend-config=backend.hcl
+# Its own state object - never the AWS backend layer's key.
+bucket       = "REPLACE_WITH_EXISTING_STATE_BUCKET"
+key          = "finops-poc/dev/multicloud-state-role/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true

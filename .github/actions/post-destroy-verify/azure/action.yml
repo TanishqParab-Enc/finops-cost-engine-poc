@@ -1,0 +1,73 @@
+name: Azure post-destroy verification
+description: >-
+  READ-ONLY confirmation that every FinOps sandbox resource is gone, that the
+  SHARED resource group survived, and that unrelated workloads in that group
+  were not touched. Performs no mutation of any kind.
+
+inputs:
+  resource-group:
+    description: Shared resource group the workload deployed into. Must still exist afterwards.
+    required: true
+  subscription-id:
+    description: Subscription the workload lived in.
+    required: true
+  name-prefix:
+    description: Isolated name prefix the sandbox owns (e.g. azsandbox-dev). Only these may be gone.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The group is shared with unrelated workloads. Its disappearance would
+    # mean the destroy blast radius escaped the sandbox, so that is an error.
+    - name: Verify the shared resource group SURVIVED (read-only)
+      shell: bash
+      env:
+        RG: ${{ inputs.resource-group }}
+        SUBSCRIPTION: ${{ inputs.subscription-id }}
+      run: |
+        set -euo pipefail
+        EXISTS=$(az group exists --name "$RG" --subscription "$SUBSCRIPTION")
+        if [ "$EXISTS" != "true" ]; then
+          echo "::error title=Blast radius escaped::Shared resource group '$RG' no longer exists. Destroy removed more than the sandbox owned."
+          exit 1
+        fi
+        echo "Confirmed: shared resource group '$RG' still exists."
+
+    - name: Verify no sandbox-prefixed resources remain (read-only)
+      shell: bash
+      env:
+        RG: ${{ inputs.resource-group }}
+        SUBSCRIPTION: ${{ inputs.subscription-id }}
+        PREFIX: ${{ inputs.name-prefix }}
+      run: |
+        set -euo pipefail
+        # Storage account names strip hyphens, so match that spelling too.
+        FLAT="${PREFIX//-/}"
+        REMAINING=$(az resource list \
+          --resource-group "$RG" --subscription "$SUBSCRIPTION" \
+          --query "[?starts_with(name, '${PREFIX}') || starts_with(name, '${FLAT}')].name" \
+          -o tsv)
+        if [ -n "$REMAINING" ]; then
+          echo "::error title=Destroy incomplete::Sandbox resources still present:"
+          echo "$REMAINING"
+          exit 1
+        fi
+        echo "Confirmed: no resources matching '${PREFIX}*' or '${FLAT}*' remain."
+
+    - name: Confirm unrelated resources were left intact (read-only)
+      shell: bash
+      env:
+        RG: ${{ inputs.resource-group }}
+        SUBSCRIPTION: ${{ inputs.subscription-id }}
+        PREFIX: ${{ inputs.name-prefix }}
+      run: |
+        set -euo pipefail
+        FLAT="${PREFIX//-/}"
+        SURVIVORS=$(az resource list \
+          --resource-group "$RG" --subscription "$SUBSCRIPTION" \
+          --query "[?!starts_with(name, '${PREFIX}') && !starts_with(name, '${FLAT}')].name" \
+          -o tsv)
+        COUNT=$(printf '%s\n' "$SURVIVORS" | grep -c . || true)
+        echo "Unrelated resources still present in '$RG': $COUNT"
+        printf '%s\n' "$SURVIVORS"

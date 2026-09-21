@@ -8,10 +8,16 @@ re-runs the gate itself.
 ``deployable`` is the authorisation boundary. A non-deployable stack is priced
 and reported like any other, but must never mint a cost lock and can never be
 applied.
+
+Multi-cloud (2026-09-18): every cloud stores Terraform state in the SAME S3
+bucket; only the key prefix differs. Azure/GCP therefore carry cloud-scoped
+identifiers (subscription/project) as registry metadata. Credentials are never
+stored here - only non-secret identifiers.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +26,25 @@ from .errors import ConfigurationError
 
 DEFAULT_STACKS_PATH = Path("config/finops-stacks.yml")
 SCHEMA_VERSION = "1.0"
+
+SUPPORTED_CLOUDS = ("aws", "azure", "gcp")
+
+# Fields a cloud must supply beyond the common required set. AWS is
+# deliberately empty: its existing entries predate multi-cloud and must keep
+# validating byte-identically.
+_CLOUD_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "aws": (),
+    "azure": ("subscription_id", "location", "resource_group", "name_prefix"),
+    "gcp": ("project_id", "region", "name_prefix"),
+}
+
+# Azure/GCP state keys are machine-generated and must be provably isolated per
+# cloud/environment/workload. AWS keys predate this convention (e.g.
+# finops-poc/dev/web-platform/terraform.tfstate has no cloud segment) and are
+# intentionally exempt so existing entries keep working unchanged.
+_MULTICLOUD_STATE_KEY_RE = re.compile(
+    r"^finops-poc/(?P<environment>[a-z0-9-]+)/(?P<cloud>azure|gcp)/(?P<workload>[a-z0-9-]+)/terraform\.tfstate$"
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +59,16 @@ class Stack:
     var_file: str | None = None
     usage_file: str | None = None
     deferred_reason: str | None = None
+    # Cloud-scoped, non-secret identifiers. None for clouds that do not use them.
+    subscription_id: str | None = None
+    location: str | None = None
+    project_id: str | None = None
+    region: str | None = None
+    zone: str | None = None
+    # Pre-existing container the workload deploys into but does not own.
+    resource_group: str | None = None
+    # Isolated prefix the workload owns; bounds destroy verification.
+    name_prefix: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -47,13 +82,71 @@ class Stack:
             "usage_file": self.usage_file,
             "paths": list(self.paths),
             "deferred_reason": self.deferred_reason,
+            "subscription_id": self.subscription_id,
+            "location": self.location,
+            "project_id": self.project_id,
+            "region": self.region,
+            "zone": self.zone,
+            "resource_group": self.resource_group,
+            "name_prefix": self.name_prefix,
         }
+
+
+def expected_state_key(cloud: str, environment: str, workload: str) -> str:
+    """The one canonical state key for a non-AWS workload.
+
+    Deterministic so a workflow can never hand-build a key that drifts from the
+    one the gate baselined against.
+    """
+    return f"finops-poc/{environment}/{cloud}/{workload}/terraform.tfstate"
 
 
 def _require(raw: dict, key: str, name: str) -> Any:
     if key not in raw or raw[key] in (None, ""):
         raise ConfigurationError(f"Stack {name!r} is missing required field {key!r}")
     return raw[key]
+
+
+def _validate_cloud(cloud: str, name: str) -> str:
+    if cloud not in SUPPORTED_CLOUDS:
+        raise ConfigurationError(
+            f"Stack {name!r} declares unsupported cloud {cloud!r}",
+            detail="Supported clouds: " + ", ".join(SUPPORTED_CLOUDS),
+        )
+    return cloud
+
+
+def _validate_state_key(cloud: str, environment: str, state_key: str, name: str) -> None:
+    """Azure/GCP keys must be cloud- and environment-isolated.
+
+    This is what stops an Azure run initialising against an AWS workload's
+    state object, which would corrupt a validated AWS deployment.
+    """
+    if cloud == "aws":
+        return
+
+    match = _MULTICLOUD_STATE_KEY_RE.match(state_key)
+    if not match:
+        raise ConfigurationError(
+            f"Stack {name!r} ({cloud}) has a non-conforming state_key",
+            detail=(
+                f"Expected finops-poc/<environment>/{cloud}/<workload>/terraform.tfstate, "
+                f"got {state_key!r}"
+            ),
+        )
+    if match.group("cloud") != cloud:
+        raise ConfigurationError(
+            f"Stack {name!r} declares cloud {cloud!r} but its state_key targets "
+            f"{match.group('cloud')!r}",
+            detail=state_key,
+        )
+    if match.group("environment") != environment:
+        raise ConfigurationError(
+            f"Stack {name!r} is registered for environment {environment!r} but its "
+            f"state_key targets {match.group('environment')!r}",
+            detail=state_key,
+        )
+
 
 
 def load_stacks(path: str | Path | None = None) -> dict[str, Stack]:
@@ -91,17 +184,33 @@ def load_stacks(path: str | Path | None = None) -> dict[str, Stack]:
                 detail=terraform_dir,
             )
         paths = tuple(str(p) for p in (body.get("paths") or [f"{terraform_dir}/"]))
+        cloud = _validate_cloud(str(_require(body, "cloud", name)), name)
+        environment = str(_require(body, "environment", name))
+        state_key = str(_require(body, "state_key", name))
+
+        _validate_state_key(cloud, environment, state_key, name)
+
+        for field in _CLOUD_REQUIRED_FIELDS[cloud]:
+            _require(body, field, name)
+
         stacks[name] = Stack(
             name=name,
             terraform_dir=terraform_dir,
-            cloud=str(_require(body, "cloud", name)),
+            cloud=cloud,
             deployable=bool(body.get("deployable", False)),
-            environment=str(_require(body, "environment", name)),
-            state_key=str(_require(body, "state_key", name)),
+            environment=environment,
+            state_key=state_key,
             paths=paths,
             var_file=body.get("var_file") or None,
             usage_file=body.get("usage_file") or None,
             deferred_reason=(body.get("deferred_reason") or None),
+            subscription_id=(body.get("subscription_id") or None),
+            location=(body.get("location") or None),
+            project_id=(body.get("project_id") or None),
+            region=(body.get("region") or None),
+            zone=(body.get("zone") or None),
+            resource_group=(body.get("resource_group") or None),
+            name_prefix=(body.get("name_prefix") or None),
         )
 
     keys = [s.state_key for s in stacks.values()]
@@ -123,9 +232,55 @@ def get_stack(name: str, path: str | Path | None = None) -> Stack:
     return stacks[name]
 
 
-def select_stacks(changed_files: list[str], path: str | Path | None = None) -> list[Stack]:
+def validate_selection(
+    stack: Stack,
+    cloud: str,
+    environment: str,
+    require_deployable: bool = False,
+) -> Stack:
+    """Fail closed when an operator's selection disagrees with the registry.
+
+    The operator supplies cloud/environment; the registry is the truth. This
+    must run BEFORE any credential exchange or Terraform command, so a run
+    dispatched as `cloud=aws` can never execute against an Azure stack (or
+    vice versa) and reach the wrong cloud's credentials or state key.
+    """
+    if stack.cloud != cloud:
+        raise ConfigurationError(
+            f"Cloud mismatch for stack {stack.name!r}",
+            detail=f"registry declares cloud={stack.cloud!r}, selection requested {cloud!r}",
+        )
+    if stack.environment != environment:
+        raise ConfigurationError(
+            f"Environment mismatch for stack {stack.name!r}",
+            detail=(
+                f"registry declares environment={stack.environment!r}, "
+                f"selection requested {environment!r}"
+            ),
+        )
+    if require_deployable and not stack.deployable:
+        raise ConfigurationError(
+            f"Stack {stack.name!r} is not deployable",
+            detail="The registry marks this stack deployable: false; refusing to apply or destroy it.",
+        )
+    return stack
+
+
+
+def select_stacks(
+    changed_files: list[str],
+    path: str | Path | None = None,
+    cloud: str | None = None,
+) -> list[Stack]:
     """Stacks whose paths a change touches. Longest prefix wins, so a nested
-    workload is never attributed to the stack it happens to sit under."""
+    workload is never attributed to the stack it happens to sit under.
+
+    `cloud` scopes the result to one provider's workflow: each cloud's gate
+    supplies only its own credentials, so evaluating another cloud's stack can
+    only fail on missing variables.
+    """
+    if cloud is not None:
+        _validate_cloud(cloud, "select_stacks")
     stacks = load_stacks(path)
     ordered = sorted(
         ((prefix, stack) for stack in stacks.values() for prefix in stack.paths),
@@ -137,6 +292,33 @@ def select_stacks(changed_files: list[str], path: str | Path | None = None) -> l
         normalised = str(changed).replace("\\", "/").lstrip("./")
         for prefix, stack in ordered:
             if normalised.startswith(prefix):
-                selected[stack.name] = stack
+                if cloud is None or stack.cloud == cloud:
+                    selected[stack.name] = stack
                 break
     return [selected[name] for name in sorted(selected)]
+
+
+def stack_matrix_entry(stack: Stack) -> dict:
+    """The payload a workflow matrix job needs to run one stack end to end.
+
+    Both the cost gate and the destroy workflow build their matrix from this,
+    so a stack is described identically no matter which trigger resolved it.
+    Cloud-scoped identifiers are emitted as empty strings rather than null
+    because GitHub Actions renders a null expression as the literal "None".
+    """
+    return {
+        "name": stack.name,
+        "dir": stack.terraform_dir,
+        "cloud": stack.cloud,
+        "deployable": stack.deployable,
+        "environment": stack.environment,
+        "usage_file": stack.usage_file or "",
+        "state_key": stack.state_key,
+        "subscription_id": stack.subscription_id or "",
+        "location": stack.location or "",
+        "project_id": stack.project_id or "",
+        "region": stack.region or "",
+        "zone": stack.zone or "",
+        "resource_group": stack.resource_group or "",
+        "name_prefix": stack.name_prefix or "",
+    }
