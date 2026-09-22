@@ -4,6 +4,10 @@
 #
 # Deliberately small. The point is to prove the reusable FinOps pipeline on a
 # second cloud, not to mirror the AWS ecommerce-platform resource-for-resource.
+#
+# Comment-only marker so this path appears in the pull request diff and the
+# registry's brownfield routing selects azure-sandbox. No resource, variable,
+# provider, backend, state key, name, tag or dependency is affected.
 
 locals {
   name_prefix = "${var.application_name}-${var.environment}"

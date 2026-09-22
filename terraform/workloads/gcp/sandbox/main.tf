@@ -1,6 +1,10 @@
 # GCP sandbox: the smallest workload that still exercises the full governed
 # lifecycle on a third cloud, using GCP-native services rather than a
 # resource-for-resource translation of the AWS or Azure workloads.
+#
+# Comment-only marker so this path appears in the pull request diff and the
+# registry's brownfield routing selects gcp-sandbox. No resource, variable,
+# provider, backend, state key, name, tag or dependency is affected.
 
 locals {
   name_prefix = "${var.application_name}-${var.environment}"
