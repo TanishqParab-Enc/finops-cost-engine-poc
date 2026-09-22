@@ -21,7 +21,7 @@ from finops.models import (
     ResourceCost,
     Status,
 )
-from finops.report.breakdown import change_label
+from finops.report.breakdown import change_label, coverage_breakdown, coverage_label
 from finops.report.markdown import render_markdown
 
 pytestmark = pytest.mark.unit
@@ -139,4 +139,87 @@ class TestNegativeDeltaReporting:
         assert "`FINOPS: BLOCKED`" in markdown
         assert "Monthly savings" not in markdown
         assert "Cost reduction detected" not in markdown
+
+
+class TestCoverageLabelsAreDistinct:
+    """NO_PRICE and UNSUPPORTED previously shared the single label
+    "UNSUPPORTED / UNESTIMATED", making a resource Infracost genuinely prices
+    (but with an unpriced optional component) indistinguishable from one it
+    does not support at all."""
+
+    def _resource(self, confidence: CostConfidence, new: str = "10") -> ResourceCost:
+        return ResourceCost(
+            address="module.thing.aws_thing.x",
+            resource_type="aws_thing",
+            cloud=Cloud.AWS,
+            previous_monthly_cost=Decimal("0"),
+            new_monthly_cost=Decimal(new),
+            delta_monthly_cost=Decimal(new),
+            confidence=confidence,
+        )
+
+    def test_no_price_and_unsupported_render_different_labels(self):
+        no_price = coverage_label(self._resource(CostConfidence.NO_PRICE))
+        unsupported = coverage_label(self._resource(CostConfidence.UNSUPPORTED))
+        assert no_price != unsupported
+        assert no_price == "UNESTIMATED"
+        assert unsupported == "UNSUPPORTED"
+
+    def test_usage_based_and_priced_labels_unchanged(self):
+        assert coverage_label(self._resource(CostConfidence.USAGE_BASED)) == "USAGE-BASED"
+        assert coverage_label(self._resource(CostConfidence.PRICED)) == "PRICED"
+
+    def test_coverage_breakdown_groups_no_price_and_unsupported_separately(self):
+        estimate = CostEstimate(
+            currency="USD",
+            estimator="infracost",
+            trust=EstimatorTrust.AUTHORITATIVE,
+            previous_monthly_cost=Decimal("0"),
+            new_monthly_cost=Decimal("32.77"),
+            incremental_monthly_cost=Decimal("32.77"),
+            resources=[
+                self._resource(CostConfidence.USAGE_BASED, "32.77"),
+                self._resource(CostConfidence.UNSUPPORTED, "0"),
+            ],
+        )
+        groups = coverage_breakdown(estimate)
+        assert "USAGE-BASED" in groups
+        assert "UNSUPPORTED" in groups
+        assert "UNSUPPORTED / UNESTIMATED" not in groups
+
+    def test_azure_style_report_no_longer_mislabels_priced_resources(self):
+        """The exact real-CI shape: three genuinely priced Azure resources
+        must render as USAGE-BASED, never as UNSUPPORTED / UNESTIMATED, and
+        the total must stay authoritative and unchanged."""
+        vm = self._resource(CostConfidence.USAGE_BASED, "32.77")
+        vm.address, vm.resource_type = "azurerm_linux_virtual_machine.app", "azurerm_linux_virtual_machine"
+        disk = self._resource(CostConfidence.USAGE_BASED, "2.40")
+        disk.address, disk.resource_type = "azurerm_managed_disk.data", "azurerm_managed_disk"
+        storage = self._resource(CostConfidence.USAGE_BASED, "0.17")
+        storage.address, storage.resource_type = "azurerm_storage_account.assets", "azurerm_storage_account"
+
+        estimate = CostEstimate(
+            currency="USD",
+            estimator="infracost",
+            trust=EstimatorTrust.AUTHORITATIVE,
+            previous_monthly_cost=Decimal("0"),
+            new_monthly_cost=Decimal("35.34"),
+            incremental_monthly_cost=Decimal("35.34"),
+            resources=[vm, disk, storage],
+        )
+        decision = PolicyDecision(
+            status=Status.PASS,
+            metric="incremental_monthly_cost",
+            observed_value=Decimal("35.34"),
+            threshold_value=Decimal("100"),
+            currency="USD",
+            comparison="<=",
+        )
+        markdown = render_markdown(GateResult(status=Status.PASS, decision=decision, estimate=estimate))
+
+        assert "UNSUPPORTED / UNESTIMATED" not in markdown
+        assert "| USAGE-BASED | 3 | USD 35.34 |" in markdown
+        # The totals stay authoritative and byte-identical regardless of label.
+        assert "USD 35.34" in markdown
+        assert "**PASS**" in markdown
 

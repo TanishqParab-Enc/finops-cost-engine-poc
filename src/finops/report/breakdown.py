@@ -101,12 +101,16 @@ def top_service_drivers(estimate: CostEstimate, limit: int = 5) -> list[ServiceT
 
 # How Infracost classified each resource. Kept explicit so an unpriced resource
 # is never silently reported as costing nothing.
+#
+# NO_PRICE and UNSUPPORTED were previously both rendered as the single label
+# "UNSUPPORTED / UNESTIMATED", which made a resource Infracost genuinely
+# supports and prices indistinguishable from one it does not support at all.
 COVERAGE_LABELS = {
     CostConfidence.PRICED: "PRICED",
     CostConfidence.USAGE_BASED: "USAGE-BASED",
     CostConfidence.FREE: "NO DIRECT CHARGE",
-    CostConfidence.NO_PRICE: "UNSUPPORTED / UNESTIMATED",
-    CostConfidence.UNSUPPORTED: "UNSUPPORTED / UNESTIMATED",
+    CostConfidence.NO_PRICE: "UNESTIMATED",
+    CostConfidence.UNSUPPORTED: "UNSUPPORTED",
 }
 
 
@@ -116,7 +120,7 @@ def coverage_label(resource: ResourceCost) -> str:
 
 def coverage_breakdown(estimate: CostEstimate) -> dict[str, list[ResourceCost]]:
     """Resources grouped by classification, in reporting order."""
-    order = ["PRICED", "USAGE-BASED", "NO DIRECT CHARGE", "UNSUPPORTED / UNESTIMATED"]
+    order = ["PRICED", "USAGE-BASED", "NO DIRECT CHARGE", "UNESTIMATED", "UNSUPPORTED"]
     grouped: dict[str, list[ResourceCost]] = {}
     for resource in estimate.resources:
         grouped.setdefault(coverage_label(resource), []).append(resource)

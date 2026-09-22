@@ -223,7 +223,7 @@ def render_markdown(result: GateResult) -> str:
             for label, items in groups.items():
                 subtotal = sum((float(r.new_monthly_cost) for r in items), 0.0)
                 lines.append(f"| {label} | {len(items)} | {_money(subtotal, currency)} |")
-            unpriced = groups.get("UNSUPPORTED / UNESTIMATED", [])
+            unpriced = groups.get("UNESTIMATED", []) + groups.get("UNSUPPORTED", [])
             if unpriced:
                 lines += ["", "Not estimated because usage data or pricing coverage is "
                           "unavailable - these are **not** zero-cost:"]
