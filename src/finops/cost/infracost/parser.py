@@ -66,13 +66,29 @@ class ParsedResource:
         return detect_cloud(self.resource_type, "")
 
     def confidence(self) -> CostConfidence:
+        """Classify by what the resource HAS, not by one thing it lacks.
+
+        A resource with a real parent monthlyCost is priced, whatever its
+        nested/optional components are missing - Azure's os_disk "Disk
+        operations" and storage account "Blob index" are usage-based
+        components Infracost itself leaves unpriced (monthlyCost: null)
+        alongside a fully-priced parent. Checking has_missing_price before the
+        parent's own monthly_cost previously classified a $32.77 VM as
+        UNSUPPORTED / UNESTIMATED, contradicting Infracost's own
+        totalSupportedResources/totalUnsupportedResources for the same run.
+
+        The parent's monthly_cost must be present (not None) before a missing
+        nested component can demote PRICED to USAGE_BASED - a resource with NO
+        authoritative cost at all is NO_PRICE, never USAGE_BASED, regardless
+        of what its components look like.
+        """
         if not self.is_supported:
             return CostConfidence.UNSUPPORTED
-        if self.has_missing_price:
+        if self.monthly_cost is None:
             return CostConfidence.NO_PRICE
-        if self.has_usage_based:
+        if self.has_usage_based or self.has_missing_price:
             return CostConfidence.USAGE_BASED
-        if self.is_free or (self.monthly_cost is not None and self.monthly_cost == ZERO):
+        if self.is_free or self.monthly_cost == ZERO:
             return CostConfidence.FREE
         return CostConfidence.PRICED
 

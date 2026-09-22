@@ -40,6 +40,35 @@ def build_prompt_context(
     decision: PolicyDecision,
     max_resources: int = 40,
 ) -> dict[str, Any]:
+    # Same join the deterministic report uses, so the AI explains the exact
+    # configuration the report shows rather than extracting its own facts.
+    # The field mappings are an allowlist, so only mapped cost-relevant
+    # attributes can reach the model.
+    from ..report.join import join_estimate_with_plan, views_by_address
+
+    views = views_by_address(join_estimate_with_plan(estimate, plan))
+
+    def driver(resource) -> dict[str, Any]:
+        view = views.get(resource.address)
+        entry: dict[str, Any] = {
+            "address": resource.address,
+            "resource_type": resource.resource_type,
+            "cloud": resource.cloud.value,
+            "delta_monthly_cost": as_float(resource.delta_monthly_cost),
+            "monthly_cost": as_float(resource.new_monthly_cost),
+            "confidence": resource.confidence.value,
+        }
+        if view is not None:
+            entry["service"] = view.service
+            if view.configuration:
+                entry["configuration"] = dict(view.configuration)
+            if view.changed_fields:
+                entry["configuration_changes"] = {
+                    label: {"before": old, "after": new}
+                    for label, (old, new) in view.changed_fields.items()
+                }
+        return entry
+
     return {
         "infrastructure_change": sanitize_plan(plan, max_resources=max_resources),
         "authoritative_cost_estimate": {
@@ -48,16 +77,7 @@ def build_prompt_context(
             "previous_monthly_cost": as_float(estimate.previous_monthly_cost),
             "new_monthly_cost": as_float(estimate.new_monthly_cost),
             "incremental_monthly_cost": as_float(estimate.incremental_monthly_cost),
-            "top_cost_drivers": [
-                {
-                    "address": r.address,
-                    "resource_type": r.resource_type,
-                    "cloud": r.cloud.value,
-                    "delta_monthly_cost": as_float(r.delta_monthly_cost),
-                    "confidence": r.confidence.value,
-                }
-                for r in estimate.top_cost_drivers()
-            ],
+            "top_cost_drivers": [driver(r) for r in estimate.top_cost_drivers()],
             "coverage_warnings": estimate.warnings,
         },
         "policy_decision": {

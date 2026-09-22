@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from finops.cost.infracost.parser import (
+    ParsedResource,
     build_estimate,
     detect_schema,
     parse_document,
@@ -258,3 +259,115 @@ class TestBuildEstimate:
         baseline = parse_document(v2_doc("70", [v2_resource("aws_instance.a", "aws_instance", "70")]))
         estimate = build_estimate(proposed, baseline, "infracost")
         assert estimate.resources[0].action is None
+
+
+class TestConfidenceClassification:
+    """Regression coverage for a real CI defect: `ParsedResource.confidence()`
+    checked has_missing_price before the parent's own monthly_cost, so a
+    resource with a genuine parent price but one null nested/optional
+    component (Azure's os_disk "Disk operations", storage account's "Blob
+    index") was reported as UNSUPPORTED / UNESTIMATED - contradicting
+    Infracost's own totalSupportedResources/totalUnsupportedResources for the
+    same run. Classification now looks at what a resource HAS
+    (monthly_cost, usage-based/missing components) rather than being able to
+    be overridden by one absent nested component alone.
+    """
+
+    def test_azure_vm_with_priced_parent_and_null_nested_component_is_usage_based(self):
+        """Real shape from CI: parent monthlyCost=32.768, os_disk subresource
+        contributes a null-cost "Disk operations" component."""
+        resource = ParsedResource(
+            address="azurerm_linux_virtual_machine.app",
+            resource_type="azurerm_linux_virtual_machine",
+            monthly_cost=Decimal("32.768"),
+            is_supported=True,
+            has_missing_price=True,
+        )
+        assert resource.confidence() is CostConfidence.USAGE_BASED
+
+    def test_azure_managed_disk_with_priced_parent_and_null_nested_component_is_usage_based(self):
+        resource = ParsedResource(
+            address="azurerm_managed_disk.data",
+            resource_type="azurerm_managed_disk",
+            monthly_cost=Decimal("2.40"),
+            is_supported=True,
+            has_missing_price=True,
+        )
+        assert resource.confidence() is CostConfidence.USAGE_BASED
+
+    def test_azure_storage_account_with_priced_parent_and_null_nested_component_is_usage_based(self):
+        resource = ParsedResource(
+            address="azurerm_storage_account.assets",
+            resource_type="azurerm_storage_account",
+            monthly_cost=Decimal("0.1749"),
+            is_supported=True,
+            has_missing_price=True,
+        )
+        assert resource.confidence() is CostConfidence.USAGE_BASED
+
+    def test_gcp_resource_with_no_missing_components_remains_priced(self):
+        """GCP compute resources in the same CI run had no null components
+        and must stay PRICED, not be swept into USAGE_BASED by this fix."""
+        resource = ParsedResource(
+            address="google_compute_disk.data",
+            resource_type="google_compute_disk",
+            monthly_cost=Decimal("3.20"),
+            is_supported=True,
+        )
+        assert resource.confidence() is CostConfidence.PRICED
+
+    def test_truly_unsupported_resource_stays_unsupported(self):
+        """is_supported=False must win regardless of monthly_cost/components -
+        UNSUPPORTED still means Infracost does not support the resource."""
+        resource = ParsedResource(
+            address="aws_mystery.x",
+            resource_type="aws_mystery_resource",
+            monthly_cost=None,
+            is_supported=False,
+        )
+        assert resource.confidence() is CostConfidence.UNSUPPORTED
+
+    def test_supported_resource_with_no_monthly_cost_is_no_price(self):
+        resource = ParsedResource(
+            address="aws_thing.x",
+            resource_type="aws_thing",
+            monthly_cost=None,
+            is_supported=True,
+        )
+        assert resource.confidence() is CostConfidence.NO_PRICE
+
+    def test_usage_based_flag_alone_still_classifies_as_usage_based(self):
+        resource = ParsedResource(
+            address="aws_s3_bucket.b",
+            resource_type="aws_s3_bucket",
+            monthly_cost=Decimal("5"),
+            is_supported=True,
+            has_usage_based=True,
+        )
+        assert resource.confidence() is CostConfidence.USAGE_BASED
+
+    def test_missing_price_never_promotes_an_absent_parent_cost_to_usage_based(self):
+        """The parent's monthly_cost must be PRESENT for USAGE_BASED - a
+        resource with no authoritative cost at all and a missing nested
+        component is NO_PRICE, never USAGE_BASED."""
+        resource = ParsedResource(
+            address="aws_thing.y",
+            resource_type="aws_thing",
+            monthly_cost=None,
+            is_supported=True,
+            has_missing_price=True,
+        )
+        assert resource.confidence() is CostConfidence.NO_PRICE
+
+    def test_free_resource_remains_free(self):
+        """FREE (zero-cost, no components) must not regress: monthly_cost is
+        ZERO (present, not None), so it clears the NO_PRICE/USAGE_BASED
+        checks and still lands on FREE."""
+        resource = ParsedResource(
+            address="aws_free_thing.x",
+            resource_type="aws_free_thing",
+            monthly_cost=Decimal("0"),
+            is_supported=True,
+            is_free=True,
+        )
+        assert resource.confidence() is CostConfidence.FREE

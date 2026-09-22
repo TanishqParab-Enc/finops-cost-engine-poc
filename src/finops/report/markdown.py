@@ -11,12 +11,41 @@ from .breakdown import (
     service_summary,
     top_service_drivers,
 )
+from .join import join_estimate_with_plan, views_by_address
 
 MARKER = "<!-- finops-cost-gate -->"
 
 # A PR comment with hundreds of rows is unreadable and GitHub truncates it
 # anyway. The full breakdown always lands in cost-estimate.json.
 MAX_RESOURCE_ROWS = 15
+
+# Configuration facts are Terraform's, so a long list is truncated for
+# readability rather than dropped - the artifact keeps all of them.
+MAX_CONFIG_FIELDS = 6
+
+
+def _config_cell(view) -> str:
+    """Configuration for one resource, showing before -> after where it moved."""
+    if view is None or not view.has_configuration:
+        return "—"
+
+    parts: list[str] = []
+    for label, value in list(view.configuration.items())[:MAX_CONFIG_FIELDS]:
+        moved = view.changed_fields.get(label)
+        if moved and moved[0] is not None and moved[0] != value:
+            parts.append(f"{label}: {moved[0]} → {value}")
+        else:
+            parts.append(f"{label}: {value}")
+
+    # A field that existed before and is gone now is still a change.
+    for label, (old, new) in view.changed_fields.items():
+        if new is None and old is not None and label not in view.configuration:
+            parts.append(f"{label}: {old} → removed")
+
+    hidden = len(view.configuration) - min(len(view.configuration), MAX_CONFIG_FIELDS)
+    if hidden > 0:
+        parts.append(f"+{hidden} more")
+    return "<br>".join(parts) if parts else "—"
 
 
 def _money(value: float | None, currency: str) -> str:
@@ -121,6 +150,10 @@ def render_markdown(result: GateResult) -> str:
         # unchanged resource never appears just because it costs money.
         rows = pr_changed_resources(estimate)
 
+        # Plan facts joined on Terraform address. Money still comes only from
+        # the estimate; this adds configuration, never a number.
+        views = views_by_address(join_estimate_with_plan(estimate, result.plan))
+
         lines += ["", "### Cost breakdown", ""]
         if not rows:
             lines += [
@@ -130,12 +163,15 @@ def render_markdown(result: GateResult) -> str:
         else:
             shown = rows[:MAX_RESOURCE_ROWS]
             lines += [
-                "| Resource | Service | Change | Monthly | Incremental |",
-                "|---|---|---|---|---|",
+                "| Resource | Type | Service | Change | Configuration | Monthly | Incremental |",
+                "|---|---|---|---|---|---|---|",
             ]
             for resource in shown:
+                view = views.get(resource.address)
+                service = view.service if view else resource.resource_type
                 lines.append(
-                    f"| `{resource.address}` | {resource.resource_type} | {change_label(resource)} | "
+                    f"| `{resource.address}` | {resource.resource_type} | {service} | "
+                    f"{change_label(resource)} | {_config_cell(view)} | "
                     f"{_money(as_float(resource.new_monthly_cost), currency)} | "
                     f"{_signed(as_float(resource.delta_monthly_cost), currency)} |"
                 )
@@ -187,7 +223,7 @@ def render_markdown(result: GateResult) -> str:
             for label, items in groups.items():
                 subtotal = sum((float(r.new_monthly_cost) for r in items), 0.0)
                 lines.append(f"| {label} | {len(items)} | {_money(subtotal, currency)} |")
-            unpriced = groups.get("UNSUPPORTED / UNESTIMATED", [])
+            unpriced = groups.get("UNESTIMATED", []) + groups.get("UNSUPPORTED", [])
             if unpriced:
                 lines += ["", "Not estimated because usage data or pricing coverage is "
                           "unavailable - these are **not** zero-cost:"]
